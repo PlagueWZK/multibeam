@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="uv (multibeam) (2)" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="uv (multibeam) (2)" project-jdk-type="Python SDK" />
+  <component name="TerminalProjectNonSharedOptionsProvider">
+    <envs>
+      <env key="HTTP_PROXY" value="http://127.0.0.1:7897" />
+      <env key="HTTPS_PROXY" value="http://127.0.0.1:7897" />
+    </envs>
+  </component>
+</project>
