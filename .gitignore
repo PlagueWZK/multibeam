@@ -2,6 +2,9 @@
 *.pkl
 *.xlsx
 /local/
+output/
+
+*.png
 
 __pycache__/
 

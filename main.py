@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use("Agg")
+
 from multibeam.GridCell import *
 from multibeam.Coverage import *
 from multibeam.Partition import *
