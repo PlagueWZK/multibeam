@@ -2,3 +2,9 @@
 *.pkl
 *.xlsx
 /local/
+
+__pycache__/
+
+*.pyc
+*.pyoa
+*.pyd
