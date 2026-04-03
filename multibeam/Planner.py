@@ -1,13 +1,118 @@
 import copy
+import signal
 import time
+from pathlib import Path
 
 from multibeam.Partition import *
 from tool.Data import *
 import datetime
 
+_output_dir = None
+_lines_dir = None
+_dot_dir = None
+_all_lines_ref = None
+
+
+def _save_dot_csv(all_lines, dot_dir):
+    dot_dir.mkdir(parents=True, exist_ok=True)
+    dot_path = dot_dir / "dot.csv"
+    with open(dot_path, "w", encoding="utf-8") as f:
+        f.write("line_id,x,y\n")
+        for line_id, line in enumerate(all_lines):
+            for pt in line:
+                f.write(f"{line_id},{pt[0]:.2f},{pt[1]:.2f}\n")
+    return dot_path
+
+
+def _signal_handler(signum, frame):
+    global _lines_dir, _dot_dir, _all_lines_ref
+    print("\n\n[中断] 检测到Ctrl+C，正在保存当前数据...")
+    if _all_lines_ref is not None and len(_all_lines_ref) > 0:
+        dot_path = _save_dot_csv(_all_lines_ref, _dot_dir)
+        print(f"[中断] 已保存测线点文件: {dot_path}")
+        print(f"[中断] 共保存{len(_all_lines_ref)}条测线")
+    else:
+        print("[中断] 没有测线数据需要保存")
+    exit(0)
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+
+
+def _point_to_segment_distance(px, py, x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return np.sqrt((px - x1) ** 2 + (py - y1) ** 2)
+    t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return np.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+
+def _check_line_intersection(point, line, threshold):
+    if line is None or len(line) < 2:
+        return False
+    px, py = point[0], point[1]
+    for i in range(len(line) - 1):
+        x1, y1 = line[i][0], line[i][1]
+        x2, y2 = line[i + 1][0], line[i + 1][1]
+        dist = _point_to_segment_distance(px, py, x1, y1, x2, y2)
+        if dist < threshold:
+            return True
+    return False
+
+
+def _check_short_axis_closure(line, step):
+    if len(line) < 10:
+        return False, None, None, None
+
+    line_arr = np.array(line)
+    centroid = np.mean(line_arr, axis=0)
+
+    dx_line = line_arr[-1, 0] - line_arr[0, 0]
+    dy_line = line_arr[-1, 1] - line_arr[0, 1]
+    major_len = np.sqrt(dx_line**2 + dy_line**2)
+    if major_len < 1e-6:
+        return False, None, None, None
+
+    major_dir = np.array([dx_line, dy_line]) / major_len
+    minor_dir = np.array([-major_dir[1], major_dir[0]])
+
+    projections_minor = np.dot(line_arr - centroid, minor_dir)
+    idx_min = np.argmin(projections_minor)
+    idx_max = np.argmax(projections_minor)
+
+    point_a = line_arr[idx_min]
+    point_b = line_arr[idx_max]
+    short_axis_dist = np.linalg.norm(point_b - point_a)
+
+    return True, point_a, point_b, short_axis_dist
+
+
+def _calculate_inner_coverage_width(point, centroid, step):
+    from tool.Data import get_w_left, get_w_right
+
+    x, y = point[0], point[1]
+
+    w_left = get_w_left(x, y)
+    w_right = get_w_right(x, y)
+
+    dx = centroid[0] - x
+    dy = centroid[1] - y
+    dist_to_centroid = np.sqrt(dx**2 + dy**2)
+
+    if dist_to_centroid < 1e-6:
+        return (w_left + w_right) / 2
+
+    total_width = w_left + w_right
+    inner_width = total_width * 0.5
+
+    return inner_width
+
 
 class SurveyPlanner:
-    def __init__(self, xs, ys, cluster_matrix, theta=120, n=0.1, min_depth=20):
+    def __init__(self, xs, ys, cluster_matrix, theta=120, n=0.1):
         self.xs = xs
         self.ys = ys
         self.cluster_matrix = cluster_matrix
@@ -20,67 +125,27 @@ class SurveyPlanner:
         self.y_min = ys.min()
         self.y_max = ys.max()
 
-        self.d_mask = self._calculate_mask_grid_size(min_depth)
-        self.mask_cols = int(np.ceil((self.x_max - self.x_min) / self.d_mask)) + 1
-        self.mask_rows = int(np.ceil((self.y_max - self.y_min) / self.d_mask)) + 1
-        self.global_coverage_mask = np.zeros((self.mask_rows, self.mask_cols), dtype=bool)
+        self.all_lines = []
 
-        print(f"[掩码网格] 边长 d_mask={self.d_mask:.1f}m | 维度 {self.mask_rows}×{self.mask_cols} | 总网格 {self.mask_rows * self.mask_cols}")
+    def plan_line(self, start_x, start_y, step=50):
+        global _output_dir, _lines_dir, _dot_dir, _all_lines_ref
 
-    def _calculate_mask_grid_size(self, min_depth):
-        w_min = 2 * min_depth * np.tan(self.theta_rad / 2)
-        d_mask = w_min / 4
-        print(f"[掩码网格计算] 最浅水深={min_depth}m | 最小覆盖宽度={w_min:.1f}m | 掩码网格边长={d_mask:.1f}m")
-        return d_mask
-
-    def _to_mask_idx(self, x, y):
-        c_idx = int((x - self.x_min) / self.d_mask)
-        r_idx = int((y - self.y_min) / self.d_mask)
-        c_idx = max(0, min(c_idx, self.mask_cols - 1))
-        r_idx = max(0, min(r_idx, self.mask_rows - 1))
-        return r_idx, c_idx
-
-    def _check_mask_collision(self, x, y):
-        r_idx, c_idx = self._to_mask_idx(x, y)
-        return self.global_coverage_mask[r_idx, c_idx]
-
-    def _paint_point_to_mask(self, x, y):
-        w_left = get_w_left(x, y, self.theta)
-        w_right = get_w_right(x, y, self.theta)
-        r_cover = max(w_left, w_right)
-        r_cells = int(np.ceil(r_cover / self.d_mask))
-
-        r_idx, c_idx = self._to_mask_idx(x, y)
-
-        min_r = max(0, r_idx - r_cells)
-        max_r = min(self.mask_rows - 1, r_idx + r_cells)
-        min_c = max(0, c_idx - r_cells)
-        max_c = min(self.mask_cols - 1, c_idx + r_cells)
-
-        self.global_coverage_mask[min_r:max_r + 1, min_c:max_c + 1] = True
-
-    def paint_line_to_mask(self, line):
-        if isinstance(line, np.ndarray):
-            for pt in line:
-                self._paint_point_to_mask(pt[0], pt[1])
-        else:
-            for pt in line:
-                self._paint_point_to_mask(pt[0], pt[1])
-
-    def count_covered_cells(self):
-        return np.sum(self.global_coverage_mask)
-
-    def plan_line(self, start_x, start_y, step=None):
         t0 = time.time()
         save_interval = 10
         last_save_time = t0
         snap_counter = 0
         max_perp_iters = 500
 
-        if step is None:
-            step = self.d_mask
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _output_dir = Path("./multibeam/output")
+        _lines_dir = _output_dir / "lines" / current_time
+        _dot_dir = _output_dir / "dot" / current_time
+        _lines_dir.mkdir(parents=True, exist_ok=True)
+        _dot_dir.mkdir(parents=True, exist_ok=True)
+        _all_lines_ref = self.all_lines
 
         print(f"[测线规划] 开始规划 | 起点: ({start_x}, {start_y}) | 步长: {step:.1f} | 重叠率: {self.n} | 开角: {self.theta}°")
+        print(f"[测线规划] 输出目录: lines/{current_time}, dot/{current_time}")
 
         plt.figure(figsize=(12, 10))
         plt.xlim(self.x_min, self.x_max)
@@ -114,10 +179,6 @@ class SurveyPlanner:
                 print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 超出边界，终止")
                 break
 
-            if self._check_mask_collision(curr_x, curr_y):
-                print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 撞上已覆盖区域，终止")
-                break
-
             dist_to_start = np.sqrt((curr_x - line[0][0]) ** 2 + (curr_y - line[0][1]) ** 2)
             if len(line) >= 3 and dist_to_start < 1.2 * step:
                 print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 检测到环形(距起点{dist_to_start:.1f})，终止")
@@ -126,15 +187,14 @@ class SurveyPlanner:
             line.append([curr_x, curr_y])
 
         line = np.array(line)
-        self.paint_line_to_mask(line)
-        covered_cells = self.count_covered_cells()
-        print(f"[主测线1] 完成 | 共{len(line)}个点 | 已覆盖{covered_cells}个掩码网格 | 起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})")
+        self.all_lines.append(line.copy())
+        print(f"[主测线1] 完成 | 共{len(line)}个点 | 起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})")
 
         plt.plot(line[:, 0], line[:, 1], color="b", linewidth=1.5, label="Main line")
 
         perp_iter = 0
         total_points = len(line)
-        skipped_by_collision = 0
+        prev_line = line.copy()
 
         while True:
             perp_iter += 1
@@ -179,72 +239,143 @@ class SurveyPlanner:
                 plt.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
 
             elapsed = time.time() - t0
-            covered_cells = self.count_covered_cells()
-            print(f"[垂直测线 第{perp_iter}轮] 当前{len(line)}点 -> 新增{len(t1)}有效(跳过{skipped_by_collision}已覆盖) | 已耗时{elapsed:.1f}s | 总点数{total_points} | 已覆盖{covered_cells}网格")
+            print(f"[垂直测线 第{perp_iter}轮] 当前{len(line)}点 -> 新增{len(t1)}有效点 | 已耗时{elapsed:.1f}s | 总点数{total_points}")
 
             if len(t1) == 0:
                 print(f"[垂直测线] 第{perp_iter}轮无新有效点，结束规划")
                 break
 
+            if len(t1) < 5:
+                print(f"[垂直测线] 第{perp_iter}轮仅{len(t1)}个新点(<5)，测线退化，结束规划")
+                break
+
             if time.time() - last_save_time >= save_interval:
                 snap_counter += 1
-                snap_path = f"./multibeam/output/lines/snap_{snap_counter:03d}_iter{perp_iter}.png"
+                snap_path = _lines_dir / f"snap_{snap_counter:03d}_iter{perp_iter}.png"
                 plt.savefig(snap_path, dpi=200, bbox_inches="tight")
                 last_save_time = time.time()
                 print(f"  >> 已保存快照: {snap_path}")
 
-            self.paint_line_to_mask(t1)
-
             line = copy.deepcopy(t1)
-            loc_x = line[-1][0]
-            loc_y = line[-1][1]
-            ext_step = self.d_mask
+            ext_step = step / 2
             ext_loop = 0
+            intersection_threshold = step * 0.5
+
+            front_x, front_y = line[-1][0], line[-1][1]
+            back_x, back_y = line[0][0], line[0][1]
+            front_stopped = False
+            back_stopped = False
+            extend_front = True
 
             while True:
+                if front_stopped and back_stopped:
+                    break
+
+                if extend_front and front_stopped:
+                    extend_front = False
+                    continue
+                if not extend_front and back_stopped:
+                    extend_front = True
+                    continue
+
                 ext_loop += 1
-                gx = get_gx(loc_x, loc_y)
-                gy = get_gy(loc_x, loc_y)
-                dx, dy = forward_direction(gx, gy)
-                loc_x += ext_step * dx
-                loc_y += ext_step * dy
+
+                if extend_front:
+                    gx = get_gx(front_x, front_y)
+                    gy = get_gy(front_x, front_y)
+                    dx, dy = forward_direction(gx, gy)
+                    new_x = front_x + ext_step * dx
+                    new_y = front_y + ext_step * dy
+                else:
+                    gx = get_gx(back_x, back_y)
+                    gy = get_gy(back_x, back_y)
+                    dx, dy = forward_direction(gx, gy)
+                    new_x = back_x - ext_step * dx
+                    new_y = back_y - ext_step * dy
 
                 is_in, _ = is_point_in_partition(
-                    loc_x, loc_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
+                    new_x, new_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
                 )
                 if not is_in:
-                    print(f"  [测线延伸] 延伸{ext_loop}步后超出边界")
-                    break
+                    if extend_front:
+                        print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
+                        front_stopped = True
+                    else:
+                        print(f"  [测线延伸-后端] 延伸{ext_loop}步后超出边界")
+                        back_stopped = True
+                    extend_front = not extend_front
+                    continue
 
-                if self._check_mask_collision(loc_x, loc_y):
-                    print(f"  [测线延伸] 延伸{ext_loop}步后撞上已覆盖区域")
-                    break
+                new_point = [new_x, new_y]
+                if _check_line_intersection(new_point, prev_line, intersection_threshold):
+                    if extend_front:
+                        print(f"  [测线延伸-前端] 延伸{ext_loop}步后与上一条测线相交，迷路终止")
+                        front_stopped = True
+                    else:
+                        print(f"  [测线延伸-后端] 延伸{ext_loop}步后与上一条测线相交，迷路终止")
+                        back_stopped = True
+                    extend_front = not extend_front
+                    continue
 
-                dist_to_start = np.sqrt((loc_x - line[0][0]) ** 2 + (loc_y - line[0][1]) ** 2)
-                if len(line) >= 3 and dist_to_start < 1.2 * ext_step:
-                    print(f"  [测线延伸] 延伸{ext_loop}步后检测到环形(距起点{dist_to_start:.1f})")
-                    break
+                if len(line) >= 6:
+                    if extend_front:
+                        end_dist = np.sqrt((new_x - line[0][0])**2 + (new_y - line[0][1])**2)
+                    else:
+                        end_dist = np.sqrt((new_x - line[-1][0])**2 + (new_y - line[-1][1])**2)
+                    if end_dist < step * 1.5:
+                        if extend_front:
+                            print(f"  [测线延伸-前端] 延伸{ext_loop}步后与后端点距离{end_dist:.1f}m，环形闭合")
+                        else:
+                            print(f"  [测线延伸-后端] 延伸{ext_loop}步后与前端点距离{end_dist:.1f}m，环形闭合")
+                        if extend_front:
+                            line.append(new_point)
+                            front_x, front_y = new_x, new_y
+                        else:
+                            line.insert(0, new_point)
+                            back_x, back_y = new_x, new_y
+                        break
 
-                self._paint_point_to_mask(loc_x, loc_y)
-                line.append([loc_x, loc_y])
+                if extend_front:
+                    line.append(new_point)
+                    front_x, front_y = new_x, new_y
+                else:
+                    line.insert(0, new_point)
+                    back_x, back_y = new_x, new_y
+
+                extend_front = not extend_front
 
             line = np.array(line)
+            self.all_lines.append(line.copy())
+            prev_line = line.copy()
             total_points += len(line)
 
-        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_path = f"./multibeam/output/lines/plan_line_{current_time}.png"
+            result = _check_short_axis_closure(line, step)
+            if result[0]:
+                _, point_a, point_b, short_axis_dist = result
+                centroid = np.mean(line, axis=0)
+                inner_width_a = _calculate_inner_coverage_width(point_a, centroid, step)
+                inner_width_b = _calculate_inner_coverage_width(point_b, centroid, step)
+                total_inner_width = inner_width_a + inner_width_b
+
+                if short_axis_dist <= total_inner_width:
+                    print(f"[垂直测线] 短轴距离{short_axis_dist:.1f}m ≤ 内侧覆盖宽度{total_inner_width:.1f}m，封闭区域完全覆盖，终止规划")
+                    break
+
+        final_path = _lines_dir / "plan_line_final.png"
         plt.legend()
         plt.savefig(final_path, dpi=300, bbox_inches="tight")
         plt.close()
 
+        dot_path = _save_dot_csv(self.all_lines, _dot_dir)
+
         total_elapsed = time.time() - t0
-        final_covered = self.count_covered_cells()
         print(f"\n[测线规划完成] 总耗时: {total_elapsed:.1f}s | 共{perp_iter}轮垂直测线 | 总点数约{total_points}")
-        print(f"  最终图片: {final_path} | 已覆盖掩码网格: {final_covered}/{self.mask_rows * self.mask_cols} | 累计跳过重复点: {skipped_by_collision}")
+        print(f"  最终图片: {final_path} | 共生成{len(self.all_lines)}条测线")
+        print(f"  测线点文件: {dot_path}")
         if snap_counter > 0:
             print(f"  中间快照: {snap_counter}张 (每{save_interval}s一张)")
 
 
-def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=120, min_depth=20):
-    planner = SurveyPlanner(xs, ys, cluster_matrix, theta=theta, n=n, min_depth=min_depth)
+def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
+    planner = SurveyPlanner(xs, ys, cluster_matrix, theta=theta, n=n)
     planner.plan_line(start_x, start_y, step=step)
