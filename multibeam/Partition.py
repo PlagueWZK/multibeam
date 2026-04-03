@@ -50,8 +50,8 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10):
     plt.ylabel("Inertia (WCSS)")
     plt.legend()
     plt.grid(True)
-    plt.show()
-
+    plt.savefig("./multibeam/output/elbow/elbow_method.png", dpi=300, bbox_inches="tight")
+    plt.close()
     return optimal_u
 
 
@@ -130,7 +130,8 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, k_max=10):
     # 防止坐标轴倒置（根据海图习惯，通常北向上，如果需要反转去掉此行即可）
     plt.gca().invert_yaxis()
     plt.colorbar(label="Cluster ID")
-    plt.show()
+    plt.savefig(f"./multibeam/output/partition/partition_U={optimal_u}.png", dpi=300, bbox_inches="tight")
+    plt.close()
 
     return cluster_matrix, optimal_u
 

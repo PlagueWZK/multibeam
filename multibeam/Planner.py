@@ -2,6 +2,7 @@ import copy
 
 from multibeam.Partition import *
 from tool.Data import *
+import datetime
 
 
 def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
@@ -26,6 +27,9 @@ def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=12
         )
         if not is_in:
             break  # 超出边界则退出循环
+        dist_to_start = np.sqrt((start_x - line[0][0]) ** 2 + (start_y - line[0][1]) ** 2)
+        if dist_to_start < 1.2 * step:
+            break  # 检测到环形路径则退出循环
         # 将当前位置添加到测线路径
         line.append([start_x, start_y])  # 记录路径点坐标
     # 将路径列表转换为numpy数组
@@ -57,9 +61,9 @@ def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=12
                 # 计算y方向的偏移量
                 ty = d * get_gy(x, y)  # y偏移 = 间距 * y方向梯度
                 # 更新x坐标
-                x = x + tx  # 新x坐标 = 原x坐标 + x偏移
+                x = x - tx  # 新x坐标 = 原x坐标 + x偏移
                 # 更新y坐标
-                y = y + ty  # 新y坐标 = 原y坐标 + y偏移
+                y = y - ty  # 新y坐标 = 原y坐标 + y偏移
             else:  # 如果坡度角较大（倾斜海底）
                 # 计算几何参数A
                 A = sin(90 - theta / 2 + alpha)  # 几何参数A
@@ -81,9 +85,9 @@ def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=12
                 # 计算y方向的偏移量
                 ty = (h - next_h) / tan(alpha) * get_gy(x, y)
                 # 更新x坐标
-                x = x + tx  # 新x坐标 = 原x坐标 + x偏移
+                x = x - tx  # 新x坐标 = 原x坐标 + x偏移
                 # 更新y坐标
-                y = y + ty  # 新y坐标 = 原y坐标 + y偏移
+                y = y - ty  # 新y坐标 = 原y坐标 + y偏移
             # 检查新位置是否在有效测量范围内
             is_in, _ = is_point_in_partition(
                 x, y, target_partition_id, xs, ys, cluster_matrix
@@ -129,7 +133,12 @@ def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=12
             )
             if not is_in:
                 break  # 超出边界则退出主测线生成
+            dist_to_start = np.sqrt((loc_x - line[0][0]) ** 2 + (loc_y - line[0][1]) ** 2)
+            if dist_to_start < 1.2 * step:
+                break  # 检测到环形路径则退出循环
             line.append([loc_x, loc_y])  # 记录新的路径点
         # 将路径列表转换为numpy数组
         line = np.array(line)  # 转换为numpy数组
-    plt.show()
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    plt.savefig(f"./multibeam/output/lines/plan_line_{current_time}.png", dpi=300, bbox_inches="tight")
+    plt.close()
