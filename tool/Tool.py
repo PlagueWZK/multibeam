@@ -83,3 +83,42 @@ def get_model(data):  # 输入数据，返回训练好的随机森林模型
     # 显示图表
     plt.show()  # 显示3D图表
     return rf  # 返回训练好的模型
+
+
+def plot_final_survey_lines(xs, ys, cluster_matrix, final_lines_dict):
+    """
+    将生成的测线叠加在聚类分区底图上进行可视化
+    """
+    plt.figure(figsize=(12, 10))
+
+    # 1. 画出分区背景底图
+    # extent=[左, 右, 下, 上]，确保与坐标网格严格对齐
+    plt.imshow(cluster_matrix, extent=[xs.min(), xs.max(), ys.max(), ys.min()],
+               cmap='Pastel1', aspect='auto', alpha=0.6)
+
+    # 2. 为不同分区的测线分配不同的高对比度颜色
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
+
+    # 3. 遍历每个分区及其内部的所有测线
+    for cid, lines in final_lines_dict.items():
+        color = colors[int(cid) % len(colors)]
+        for idx, line in enumerate(lines):
+            # 为了防止图例重复，只给该分区的第一条线打上 label
+            label = f"Cluster {int(cid)}" if idx == 0 else None
+            # line[:, 0] 是所有点的 X 坐标，line[:, 1] 是所有点的 Y 坐标
+            plt.plot(line[:, 0], line[:, 1], color=color, linewidth=1.5, label=label)
+
+    plt.title('Automated Multi-beam Survey Line Planning based on ML Clustering')
+    plt.xlabel('X (m)')
+    plt.ylabel('Y (m)')
+
+    # 翻转Y轴以符合通常的地图“北上南下”的视觉习惯
+    plt.gca().invert_yaxis()
+
+    # 添加图例和颜色条
+    plt.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+    plt.colorbar(label='Cluster ID', pad=0.1)
+
+    # 保证布局不被图例遮挡
+    plt.tight_layout()
+    plt.show()
