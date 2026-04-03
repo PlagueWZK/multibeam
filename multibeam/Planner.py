@@ -146,6 +146,9 @@ class SurveyPlanner:
         perp_iter = 0
         total_points = len(line)
         prev_lines = [line.copy()]
+        in_convergence_state = False
+        parent_line_length = figure_length(line)
+        ring_closed_line = None
 
         while True:
             perp_iter += 1
@@ -206,100 +209,184 @@ class SurveyPlanner:
                 print(f"  >> 已保存快照: {snap_path}")
 
             line = copy.deepcopy(t1)
-            ext_step = step / 2
-            ext_loop = 0
-            intersection_threshold = step * 0.5
+            ring_closed_saturated = False
+            ring_closed_this_round = False
 
-            front_x, front_y = line[-1][0], line[-1][1]
-            back_x, back_y = line[0][0], line[0][1]
-            front_stopped = False
-            back_stopped = False
-            extend_front = True
+            if in_convergence_state:
+                current_line_length = figure_length(line)
+                print(f"  [收敛状态] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m")
 
-            while True:
-                if front_stopped and back_stopped:
-                    break
+                line_arr = np.array(line)
+                centroid = np.mean(line_arr, axis=0)
+                dists_to_centroid = np.sqrt((line_arr[:, 0] - centroid[0])**2 + (line_arr[:, 1] - centroid[1])**2)
+                nearest_idx = np.argmin(dists_to_centroid)
+                nearest_point = line_arr[nearest_idx]
+                min_dist_to_centroid = dists_to_centroid[nearest_idx]
 
-                if extend_front and front_stopped:
-                    extend_front = False
-                    continue
-                if not extend_front and back_stopped:
-                    extend_front = True
-                    continue
-
-                ext_loop += 1
-
-                if extend_front:
-                    gx = get_gx(front_x, front_y)
-                    gy = get_gy(front_x, front_y)
-                    dx, dy = forward_direction(gx, gy)
-                    new_x = front_x + ext_step * dx
-                    new_y = front_y + ext_step * dy
+                nearest_gx = get_gx(nearest_point[0], nearest_point[1])
+                nearest_gy = get_gy(nearest_point[0], nearest_point[1])
+                grad_dir = np.array([nearest_gx, nearest_gy])
+                grad_norm = np.linalg.norm(grad_dir)
+                if grad_norm > 1e-6:
+                    grad_dir = grad_dir / grad_norm
                 else:
-                    gx = get_gx(back_x, back_y)
-                    gy = get_gy(back_x, back_y)
-                    dx, dy = forward_direction(gx, gy)
-                    new_x = back_x - ext_step * dx
-                    new_y = back_y - ext_step * dy
+                    grad_dir = np.array([0, 1])
 
-                is_in, _ = is_point_in_partition(
-                    new_x, new_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
-                )
-                if not is_in:
-                    if extend_front:
-                        print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
-                        front_stopped = True
-                    else:
-                        print(f"  [测线延伸-后端] 延伸{ext_loop}步后超出边界")
-                        back_stopped = True
-                    extend_front = not extend_front
-                    continue
+                to_centroid = np.array([centroid[0] - nearest_point[0], centroid[1] - nearest_point[1]])
+                to_centroid_norm = np.linalg.norm(to_centroid)
+                if to_centroid_norm > 1e-6:
+                    to_centroid = to_centroid / to_centroid_norm
 
-                new_point = [new_x, new_y]
-                found_intersection = False
-                for prev_idx, prev_line in enumerate(prev_lines):
-                    if _check_line_intersection(new_point, prev_line, intersection_threshold):
-                        if extend_front:
-                            print(f"  [测线延伸-前端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
-                        else:
-                            print(f"  [测线延伸-后端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
-                        found_intersection = True
+                dot_product = np.dot(grad_dir, to_centroid)
+                if dot_product > 0:
+                    inner_width = get_w_right(nearest_point[0], nearest_point[1], self.theta)
+                else:
+                    inner_width = get_w_left(nearest_point[0], nearest_point[1], self.theta)
+
+                if min_dist_to_centroid < inner_width:
+                    print(f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m < 内侧覆盖宽度{inner_width:.1f}m，测线饱和")
+                    ring_closed_saturated = True
+                else:
+                    print(f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m >= 内侧覆盖宽度{inner_width:.1f}m，继续生成")
+            else:
+                ext_step = step / 2
+                ext_loop = 0
+                intersection_threshold = step * 0.5
+
+                front_x, front_y = line[-1][0], line[-1][1]
+                back_x, back_y = line[0][0], line[0][1]
+                front_stopped = False
+                back_stopped = False
+                extend_front = True
+
+                while True:
+                    if front_stopped and back_stopped:
                         break
 
-                if found_intersection:
+                    if extend_front and front_stopped:
+                        extend_front = False
+                        continue
+                    if not extend_front and back_stopped:
+                        extend_front = True
+                        continue
+
+                    ext_loop += 1
+
                     if extend_front:
-                        front_stopped = True
+                        gx = get_gx(front_x, front_y)
+                        gy = get_gy(front_x, front_y)
+                        dx, dy = forward_direction(gx, gy)
+                        new_x = front_x + ext_step * dx
+                        new_y = front_y + ext_step * dy
                     else:
-                        back_stopped = True
+                        gx = get_gx(back_x, back_y)
+                        gy = get_gy(back_x, back_y)
+                        dx, dy = forward_direction(gx, gy)
+                        new_x = back_x - ext_step * dx
+                        new_y = back_y - ext_step * dy
+
+                    is_in, _ = is_point_in_partition(
+                        new_x, new_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
+                    )
+                    if not is_in:
+                        if extend_front:
+                            print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
+                            front_stopped = True
+                        else:
+                            print(f"  [测线延伸-后端] 延伸{ext_loop}步后超出边界")
+                            back_stopped = True
+                        extend_front = not extend_front
+                        continue
+
+                    new_point = [new_x, new_y]
+                    found_intersection = False
+                    for prev_idx, prev_line in enumerate(prev_lines):
+                        if _check_line_intersection(new_point, prev_line, intersection_threshold):
+                            if extend_front:
+                                print(f"  [测线延伸-前端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
+                            else:
+                                print(f"  [测线延伸-后端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
+                            found_intersection = True
+                            break
+
+                    if found_intersection:
+                        if extend_front:
+                            front_stopped = True
+                        else:
+                            back_stopped = True
+                        extend_front = not extend_front
+                        continue
+
+                    if len(line) >= 3:
+                        if extend_front:
+                            end_dist = np.sqrt((new_x - line[0][0])**2 + (new_y - line[0][1])**2)
+                        else:
+                            end_dist = np.sqrt((new_x - line[-1][0])**2 + (new_y - line[-1][1])**2)
+                        if end_dist < step * 1.5:
+                            if extend_front:
+                                print(f"  [测线延伸-前端] 延伸{ext_loop}步后与后端点距离{end_dist:.1f}m，环形闭合")
+                            else:
+                                print(f"  [测线延伸-后端] 延伸{ext_loop}步后与前端点距离{end_dist:.1f}m，环形闭合")
+                            if extend_front:
+                                line.append(new_point)
+                                front_x, front_y = new_x, new_y
+                            else:
+                                line.insert(0, new_point)
+                                back_x, back_y = new_x, new_y
+
+                            ring_closed_this_round = True
+                            current_line_length = figure_length(line)
+                            print(f"  [环形终止] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m")
+
+                            if current_line_length < parent_line_length:
+                                print(f"  [环形测线收敛] 当前长度 < 父测线长度，进入收敛状态")
+                                in_convergence_state = True
+
+                                line_arr = np.array(line)
+                                centroid = np.mean(line_arr, axis=0)
+                                dists_to_centroid = np.sqrt((line_arr[:, 0] - centroid[0])**2 + (line_arr[:, 1] - centroid[1])**2)
+                                nearest_idx = np.argmin(dists_to_centroid)
+                                nearest_point = line_arr[nearest_idx]
+                                min_dist_to_centroid = dists_to_centroid[nearest_idx]
+
+                                nearest_gx = get_gx(nearest_point[0], nearest_point[1])
+                                nearest_gy = get_gy(nearest_point[0], nearest_point[1])
+                                grad_dir = np.array([nearest_gx, nearest_gy])
+                                grad_norm = np.linalg.norm(grad_dir)
+                                if grad_norm > 1e-6:
+                                    grad_dir = grad_dir / grad_norm
+                                else:
+                                    grad_dir = np.array([0, 1])
+
+                                to_centroid = np.array([centroid[0] - nearest_point[0], centroid[1] - nearest_point[1]])
+                                to_centroid_norm = np.linalg.norm(to_centroid)
+                                if to_centroid_norm > 1e-6:
+                                    to_centroid = to_centroid / to_centroid_norm
+
+                                dot_product = np.dot(grad_dir, to_centroid)
+                                if dot_product > 0:
+                                    inner_width = get_w_right(nearest_point[0], nearest_point[1], self.theta)
+                                else:
+                                    inner_width = get_w_left(nearest_point[0], nearest_point[1], self.theta)
+
+                                if min_dist_to_centroid < inner_width:
+                                    print(f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m < 内侧覆盖宽度{inner_width:.1f}m，测线饱和")
+                                    ring_closed_saturated = True
+                                else:
+                                    print(f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m >= 内侧覆盖宽度{inner_width:.1f}m，继续生成")
+                            else:
+                                print(f"  [非收敛状态] 当前长度 >= 父测线长度，不进入收敛状态")
+
+                            break
+
+                    if extend_front:
+                        line.append(new_point)
+                        front_x, front_y = new_x, new_y
+                    else:
+                        line.insert(0, new_point)
+                        back_x, back_y = new_x, new_y
+
                     extend_front = not extend_front
-                    continue
-
-                if len(line) >= 3:
-                    if extend_front:
-                        end_dist = np.sqrt((new_x - line[0][0])**2 + (new_y - line[0][1])**2)
-                    else:
-                        end_dist = np.sqrt((new_x - line[-1][0])**2 + (new_y - line[-1][1])**2)
-                    if end_dist < step * 1.5:
-                        if extend_front:
-                            print(f"  [测线延伸-前端] 延伸{ext_loop}步后与后端点距离{end_dist:.1f}m，环形闭合")
-                        else:
-                            print(f"  [测线延伸-后端] 延伸{ext_loop}步后与前端点距离{end_dist:.1f}m，环形闭合")
-                        if extend_front:
-                            line.append(new_point)
-                            front_x, front_y = new_x, new_y
-                        else:
-                            line.insert(0, new_point)
-                            back_x, back_y = new_x, new_y
-                        break
-
-                if extend_front:
-                    line.append(new_point)
-                    front_x, front_y = new_x, new_y
-                else:
-                    line.insert(0, new_point)
-                    back_x, back_y = new_x, new_y
-
-                extend_front = not extend_front
 
             line = np.array(line)
             self.all_lines.append(line.copy())
@@ -307,6 +394,16 @@ class SurveyPlanner:
             if len(prev_lines) > 3:
                 prev_lines.pop(0)
             total_points += len(line)
+
+            if ring_closed_this_round:
+                plt.plot(line[:, 0], line[:, 1], color="red", linewidth=1.5, label="Ring Closed" if ring_closed_this_round and perp_iter == 1 else "")
+                ring_closed_line = line.copy()
+
+            parent_line_length = figure_length(line)
+
+            if ring_closed_saturated:
+                print(f"[垂直测线] 测线饱和，终止该区域所有测线生成")
+                break
 
         final_path = _lines_dir / "plan_line_final.png"
         plt.legend()
