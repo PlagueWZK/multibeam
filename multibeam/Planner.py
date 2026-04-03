@@ -63,54 +63,6 @@ def _check_line_intersection(point, line, threshold):
     return False
 
 
-def _check_short_axis_closure(line, step):
-    if len(line) < 10:
-        return False, None, None, None
-
-    line_arr = np.array(line)
-    centroid = np.mean(line_arr, axis=0)
-
-    dx_line = line_arr[-1, 0] - line_arr[0, 0]
-    dy_line = line_arr[-1, 1] - line_arr[0, 1]
-    major_len = np.sqrt(dx_line**2 + dy_line**2)
-    if major_len < 1e-6:
-        return False, None, None, None
-
-    major_dir = np.array([dx_line, dy_line]) / major_len
-    minor_dir = np.array([-major_dir[1], major_dir[0]])
-
-    projections_minor = np.dot(line_arr - centroid, minor_dir)
-    idx_min = np.argmin(projections_minor)
-    idx_max = np.argmax(projections_minor)
-
-    point_a = line_arr[idx_min]
-    point_b = line_arr[idx_max]
-    short_axis_dist = np.linalg.norm(point_b - point_a)
-
-    return True, point_a, point_b, short_axis_dist
-
-
-def _calculate_inner_coverage_width(point, centroid, step):
-    from tool.Data import get_w_left, get_w_right
-
-    x, y = point[0], point[1]
-
-    w_left = get_w_left(x, y)
-    w_right = get_w_right(x, y)
-
-    dx = centroid[0] - x
-    dy = centroid[1] - y
-    dist_to_centroid = np.sqrt(dx**2 + dy**2)
-
-    if dist_to_centroid < 1e-6:
-        return (w_left + w_right) / 2
-
-    total_width = w_left + w_right
-    inner_width = total_width * 0.5
-
-    return inner_width
-
-
 class SurveyPlanner:
     def __init__(self, xs, ys, cluster_matrix, theta=120, n=0.1):
         self.xs = xs
@@ -134,7 +86,6 @@ class SurveyPlanner:
         save_interval = 10
         last_save_time = t0
         snap_counter = 0
-        max_perp_iters = 500
 
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         _output_dir = Path("./multibeam/output")
@@ -194,15 +145,13 @@ class SurveyPlanner:
 
         perp_iter = 0
         total_points = len(line)
-        prev_line = line.copy()
+        prev_lines = [line.copy()]
 
         while True:
             perp_iter += 1
-            if perp_iter > max_perp_iters:
-                print(f"[垂直测线] 达到最大轮数限制({max_perp_iters})，强制终止")
-                break
 
             t1 = []
+
             for index, i in enumerate(line):
                 x = i[0]
                 y = i[1]
@@ -307,17 +256,25 @@ class SurveyPlanner:
                     continue
 
                 new_point = [new_x, new_y]
-                if _check_line_intersection(new_point, prev_line, intersection_threshold):
+                found_intersection = False
+                for prev_idx, prev_line in enumerate(prev_lines):
+                    if _check_line_intersection(new_point, prev_line, intersection_threshold):
+                        if extend_front:
+                            print(f"  [测线延伸-前端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
+                        else:
+                            print(f"  [测线延伸-后端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
+                        found_intersection = True
+                        break
+
+                if found_intersection:
                     if extend_front:
-                        print(f"  [测线延伸-前端] 延伸{ext_loop}步后与上一条测线相交，迷路终止")
                         front_stopped = True
                     else:
-                        print(f"  [测线延伸-后端] 延伸{ext_loop}步后与上一条测线相交，迷路终止")
                         back_stopped = True
                     extend_front = not extend_front
                     continue
 
-                if len(line) >= 6:
+                if len(line) >= 3:
                     if extend_front:
                         end_dist = np.sqrt((new_x - line[0][0])**2 + (new_y - line[0][1])**2)
                     else:
@@ -346,20 +303,10 @@ class SurveyPlanner:
 
             line = np.array(line)
             self.all_lines.append(line.copy())
-            prev_line = line.copy()
+            prev_lines.append(line.copy())
+            if len(prev_lines) > 3:
+                prev_lines.pop(0)
             total_points += len(line)
-
-            result = _check_short_axis_closure(line, step)
-            if result[0]:
-                _, point_a, point_b, short_axis_dist = result
-                centroid = np.mean(line, axis=0)
-                inner_width_a = _calculate_inner_coverage_width(point_a, centroid, step)
-                inner_width_b = _calculate_inner_coverage_width(point_b, centroid, step)
-                total_inner_width = inner_width_a + inner_width_b
-
-                if short_axis_dist <= total_inner_width:
-                    print(f"[垂直测线] 短轴距离{short_axis_dist:.1f}m ≤ 内侧覆盖宽度{total_inner_width:.1f}m，封闭区域完全覆盖，终止规划")
-                    break
 
         final_path = _lines_dir / "plan_line_final.png"
         plt.legend()
