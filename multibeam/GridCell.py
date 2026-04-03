@@ -4,7 +4,7 @@ import numpy as np
 from tool import Data
 from tool import Tool
 
-def calculate_optimal_mesh_size(data_path):
+def calculate_optimal_mesh_size(data_path, min_error = 0.001):
     # 读取高程/深度数据
     x, y, z = Tool.read_grid(data_path)
 
@@ -22,7 +22,7 @@ def calculate_optimal_mesh_size(data_path):
 
     print(f"xi: {xi:.2f}, A: {A:.2f}")
     # 2. 设定控制精度的目标误差阈值 (例如 1% 的相对误差)
-    error_threshold = 0.01
+    error_threshold = min_error
 
     # 3. 初始化寻优参数
     optimal_d = None

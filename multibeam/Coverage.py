@@ -1,10 +1,6 @@
 import numpy as np
 
-from Partition import partition_coverage_matrix
-from Planner import SurveyPlanner
 from tool import Data
-from tool.Data import get_height, get_gx, get_gy, get_alpha
-from tool.Tool import plot_final_survey_lines
 
 
 def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
@@ -105,32 +101,3 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
 
     print("覆盖次数矩阵计算完成！")
     return xs, ys, Z, times_mat
-
-
-if __name__ == '__main__':
-    # (前面保留你写的生成 d 和 coverage_matrix 的逻辑...)
-    optimal_d = 272.06
-
-    X_MIN, X_MAX = 0, 5 * 1852
-    Y_MIN, Y_MAX = 0, 4 * 1852
-
-    xs, ys, depth_matrix, coverage_matrix = calculate_coverage_matrix_with_ml(
-        x_min=X_MIN,
-        x_max=X_MAX,
-        y_min=Y_MIN,
-        y_max=Y_MAX,
-        d=optimal_d
-    )
-
-    # 运行分区脚本 (确保你的 partition_coverage_matrix 函数已经返回了这两个值)
-    final_cluster_matrix, U = partition_coverage_matrix(xs, ys, coverage_matrix)
-    print("分区矩阵生成完毕，开始进入后续测线布设阶段。")
-
-    # 【修复BUG】：这里第三个参数传入 final_cluster_matrix
-    planner = SurveyPlanner(xs, ys, final_cluster_matrix, get_height, get_gx, get_gy, get_alpha)
-
-    # 获取所有的测线数据字典
-    final_lines_dict = planner.plan_survey_for_all_clusters()
-
-    # 调用专门的绘图函数
-    plot_final_survey_lines(xs, ys, final_cluster_matrix, final_lines_dict)
