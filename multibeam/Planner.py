@@ -79,76 +79,17 @@ class SurveyPlanner:
 
         self.all_lines = []
 
-    def plan_line(self, start_x, start_y, step=50):
-        global _output_dir, _lines_dir, _dot_dir, _all_lines_ref
-
-        t0 = time.time()
-        save_interval = 10
-        last_save_time = t0
-        snap_counter = 0
-
-        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        _output_dir = Path("./multibeam/output")
-        _lines_dir = _output_dir / "lines" / current_time
-        _dot_dir = _output_dir / "dot" / current_time
-        _lines_dir.mkdir(parents=True, exist_ok=True)
-        _dot_dir.mkdir(parents=True, exist_ok=True)
-        _all_lines_ref = self.all_lines
-
-        print(f"[测线规划] 开始规划 | 起点: ({start_x}, {start_y}) | 步长: {step:.1f} | 重叠率: {self.n} | 开角: {self.theta}°")
-        print(f"[测线规划] 输出目录: lines/{current_time}, dot/{current_time}")
-
-        plt.figure(figsize=(12, 10))
-        plt.xlim(self.x_min, self.x_max)
-        plt.ylim(self.y_min, self.y_max)
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.xlabel("X (m)")
-        plt.ylabel("Y (m)")
-        plt.title("Survey Line Planning")
-        plt.grid(True, alpha=0.3)
-
-        line = [[start_x, start_y]]
-        target_partition_id = get_partition_for_point(
-            start_x, start_y, self.xs, self.ys, self.cluster_matrix
-        )
-        print(f"[测线规划] 目标分区ID: {target_partition_id}")
-
-        loop_count = 0
-        curr_x, curr_y = start_x, start_y
-        while True:
-            loop_count += 1
-            gx = get_gx(curr_x, curr_y)
-            gy = get_gy(curr_x, curr_y)
-            dx, dy = forward_direction(gx, gy)
-            curr_x += step * dx
-            curr_y += step * dy
-
-            is_in, _ = is_point_in_partition(
-                curr_x, curr_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
-            )
-            if not is_in:
-                print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 超出边界，终止")
-                break
-
-            dist_to_start = np.sqrt((curr_x - line[0][0]) ** 2 + (curr_y - line[0][1]) ** 2)
-            if len(line) >= 3 and dist_to_start < 1.2 * step:
-                print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 检测到环形(距起点{dist_to_start:.1f})，终止")
-                break
-
-            line.append([curr_x, curr_y])
-
-        line = np.array(line)
-        self.all_lines.append(line.copy())
-        print(f"[主测线1] 完成 | 共{len(line)}个点 | 起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})")
-
-        plt.plot(line[:, 0], line[:, 1], color="b", linewidth=1.5, label="Main line")
-
-        perp_iter = 0
-        total_points = len(line)
-        prev_lines = [line.copy()]
+    def _generate_perpendicular_lines(self, main_line, direction, target_partition_id, step, t0, save_interval, last_save_time, snap_counter):
+        line = copy.deepcopy(main_line)
+        prev_lines = [main_line.copy()]
         in_convergence_state = False
         parent_line_length = figure_length(line)
-        ring_closed_line = None
+        perp_iter = 0
+        total_points = 0
+        intersection_terminated = False
+
+        direction_name = "正向" if direction == 1 else "反向"
+        print(f"\n[{direction_name}扩展] 开始从主测线扩展...")
 
         while True:
             perp_iter += 1
@@ -164,8 +105,8 @@ class SurveyPlanner:
                     d = 2 * h * np.tan(self.theta_rad / 2) * (1 - self.n)
                     tx = d * get_gx(x, y)
                     ty = d * get_gy(x, y)
-                    new_x = x - tx
-                    new_y = y - ty
+                    new_x = x - direction * tx
+                    new_y = y - direction * ty
                 else:
                     A = np.sin(np.radians(90) - self.theta_rad / 2 + np.radians(alpha))
                     B = np.sin(np.radians(90) - self.theta_rad / 2 - np.radians(alpha))
@@ -178,8 +119,8 @@ class SurveyPlanner:
                     next_h = h * C / D
                     tx = (h - next_h) / np.tan(np.radians(alpha)) * get_gx(x, y)
                     ty = (h - next_h) / np.tan(np.radians(alpha)) * get_gy(x, y)
-                    new_x = x - tx
-                    new_y = y - ty
+                    new_x = x - direction * tx
+                    new_y = y - direction * ty
 
                 is_in, _ = is_point_in_partition(
                     new_x, new_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
@@ -191,14 +132,14 @@ class SurveyPlanner:
                 plt.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
 
             elapsed = time.time() - t0
-            print(f"[垂直测线 第{perp_iter}轮] 当前{len(line)}点 -> 新增{len(t1)}有效点 | 已耗时{elapsed:.1f}s | 总点数{total_points}")
+            print(f"[{direction_name}扩展 第{perp_iter}轮] 当前{len(line)}点 -> 新增{len(t1)}有效点 | 已耗时{elapsed:.1f}s")
 
             if len(t1) == 0:
-                print(f"[垂直测线] 第{perp_iter}轮无新有效点，结束规划")
+                print(f"[{direction_name}扩展] 第{perp_iter}轮无新有效点，结束规划")
                 break
 
             if len(t1) < 5:
-                print(f"[垂直测线] 第{perp_iter}轮仅{len(t1)}个新点(<5)，测线退化，结束规划")
+                print(f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<5)，测线退化，结束规划")
                 break
 
             if time.time() - last_save_time >= save_interval:
@@ -307,6 +248,7 @@ class SurveyPlanner:
                             else:
                                 print(f"  [测线延伸-后端] 延伸{ext_loop}步后与第{len(prev_lines)-prev_idx}条测线相交，迷路终止")
                             found_intersection = True
+                            intersection_terminated = True
                             break
 
                     if found_intersection:
@@ -396,14 +338,94 @@ class SurveyPlanner:
             total_points += len(line)
 
             if ring_closed_this_round:
-                plt.plot(line[:, 0], line[:, 1], color="red", linewidth=1.5, label="Ring Closed" if ring_closed_this_round and perp_iter == 1 else "")
-                ring_closed_line = line.copy()
+                plt.plot(line[:, 0], line[:, 1], color="red", linewidth=1.5)
+            elif intersection_terminated:
+                plt.plot(line[:, 0], line[:, 1], color="purple", linewidth=1.5)
 
             parent_line_length = figure_length(line)
 
             if ring_closed_saturated:
-                print(f"[垂直测线] 测线饱和，终止该区域所有测线生成")
+                print(f"[{direction_name}扩展] 测线饱和，终止该方向扩展")
                 break
+
+        print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | {total_points}点")
+        return total_points, snap_counter, last_save_time
+
+    def plan_line(self, start_x, start_y, step=50):
+        global _output_dir, _lines_dir, _dot_dir, _all_lines_ref
+
+        t0 = time.time()
+        save_interval = 10
+        last_save_time = t0
+        snap_counter = 0
+
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _output_dir = Path("./multibeam/output")
+        _lines_dir = _output_dir / "lines" / current_time
+        _dot_dir = _output_dir / "dot" / current_time
+        _lines_dir.mkdir(parents=True, exist_ok=True)
+        _dot_dir.mkdir(parents=True, exist_ok=True)
+        _all_lines_ref = self.all_lines
+
+        print(f"[测线规划] 开始规划 | 起点: ({start_x}, {start_y}) | 步长: {step:.1f} | 重叠率: {self.n} | 开角: {self.theta}°")
+        print(f"[测线规划] 输出目录: lines/{current_time}, dot/{current_time}")
+
+        plt.figure(figsize=(12, 10))
+        plt.xlim(self.x_min, self.x_max)
+        plt.ylim(self.y_min, self.y_max)
+        plt.gca().set_aspect("equal", adjustable="box")
+        plt.xlabel("X (m)")
+        plt.ylabel("Y (m)")
+        plt.title("Survey Line Planning")
+        plt.grid(True, alpha=0.3)
+
+        line = [[start_x, start_y]]
+        target_partition_id = get_partition_for_point(
+            start_x, start_y, self.xs, self.ys, self.cluster_matrix
+        )
+        print(f"[测线规划] 目标分区ID: {target_partition_id}")
+
+        loop_count = 0
+        curr_x, curr_y = start_x, start_y
+        while True:
+            loop_count += 1
+            gx = get_gx(curr_x, curr_y)
+            gy = get_gy(curr_x, curr_y)
+            dx, dy = forward_direction(gx, gy)
+            curr_x += step * dx
+            curr_y += step * dy
+
+            is_in, _ = is_point_in_partition(
+                curr_x, curr_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
+            )
+            if not is_in:
+                print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 超出边界，终止")
+                break
+
+            dist_to_start = np.sqrt((curr_x - line[0][0]) ** 2 + (curr_y - line[0][1]) ** 2)
+            if len(line) >= 3 and dist_to_start < 1.2 * step:
+                print(f"[主测线1] 第{loop_count}步: ({curr_x:.1f}, {curr_y:.1f}) 检测到环形(距起点{dist_to_start:.1f})，终止")
+                break
+
+            line.append([curr_x, curr_y])
+
+        line = np.array(line)
+        self.all_lines.append(line.copy())
+        print(f"[主测线1] 完成 | 共{len(line)}个点 | 起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})")
+
+        plt.plot(line[:, 0], line[:, 1], color="b", linewidth=1.5, label="Main line")
+
+        total_points1, snap_counter, last_save_time = self._generate_perpendicular_lines(
+            line, direction=1, target_partition_id=target_partition_id, step=step,
+            t0=t0, save_interval=save_interval, last_save_time=last_save_time, snap_counter=snap_counter
+        )
+
+        total_points2, snap_counter, last_save_time = self._generate_perpendicular_lines(
+            line, direction=-1, target_partition_id=target_partition_id, step=step,
+            t0=t0, save_interval=save_interval, last_save_time=last_save_time, snap_counter=snap_counter
+        )
+
+        total_points = len(line) + total_points1 + total_points2
 
         final_path = _lines_dir / "plan_line_final.png"
         plt.legend()
@@ -413,8 +435,8 @@ class SurveyPlanner:
         dot_path = _save_dot_csv(self.all_lines, _dot_dir)
 
         total_elapsed = time.time() - t0
-        print(f"\n[测线规划完成] 总耗时: {total_elapsed:.1f}s | 共{perp_iter}轮垂直测线 | 总点数约{total_points}")
-        print(f"  最终图片: {final_path} | 共生成{len(self.all_lines)}条测线")
+        print(f"\n[测线规划完成] 总耗时: {total_elapsed:.1f}s | 共生成{len(self.all_lines)}条测线 | 总点数约{total_points}")
+        print(f"  最终图片: {final_path}")
         print(f"  测线点文件: {dot_path}")
         if snap_counter > 0:
             print(f"  中间快照: {snap_counter}张 (每{save_interval}s一张)")
