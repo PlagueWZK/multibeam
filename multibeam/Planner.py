@@ -524,6 +524,112 @@ class SurveyPlanner:
         )
         return line
 
+    def _plan_partition(
+        self,
+        partition_id,
+        step,
+        lines_dir,
+        dot_dir,
+        t0,
+    ):
+        """
+        为指定分区规划测线, 结果保存到指定目录.
+        返回该分区生成的所有测线列表.
+        """
+        global _output_dir, _lines_dir, _dot_dir, _all_lines_ref
+
+        _output_dir = lines_dir.parent.parent
+        _lines_dir = lines_dir
+        _dot_dir = dot_dir
+        _lines_dir.mkdir(parents=True, exist_ok=True)
+        _dot_dir.mkdir(parents=True, exist_ok=True)
+
+        # 在分区内寻找水深最大的点作为主测线起点
+        rows, cols = self.cluster_matrix.shape
+        max_depth = -1
+        start_x, start_y = None, None
+        for r in range(rows):
+            for c in range(cols):
+                if self.cluster_matrix[r, c] == partition_id:
+                    px = self.xs[c]
+                    py = self.ys[r]
+                    h = get_height(px, py)
+                    if h > max_depth:
+                        max_depth = h
+                        start_x, start_y = px, py
+
+        if start_x is None:
+            print(f"[分区{partition_id}] 未找到有效网格点, 跳过")
+            return []
+
+        print(f"\n{'=' * 60}")
+        print(
+            f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | 最大水深: {max_depth:.1f}m"
+        )
+
+        plt.figure(figsize=(12, 10))
+        plt.xlim(self.x_min, self.x_max)
+        plt.ylim(self.y_min, self.y_max)
+        plt.gca().set_aspect("equal", adjustable="box")
+        plt.xlabel("X (m)")
+        plt.ylabel("Y (m)")
+        plt.title(f"Survey Line Planning - Partition {partition_id}")
+        plt.grid(True, alpha=0.3)
+
+        line_counter = 0
+        partition_lines = []
+
+        # 主测线: 双向延伸生成
+        print(
+            f"[分区{partition_id}] 主测线开始双向延伸 | 起点: ({start_x:.1f}, {start_y:.1f})"
+        )
+        line = self._extend_line_bidirectional(start_x, start_y, partition_id, step)
+        self.all_lines.append(line.copy())
+        partition_lines.append(line.copy())
+        line_counter += 1
+        plt.plot(line[:, 0], line[:, 1], color="b", linewidth=1.5, label="Main line")
+
+        # 保存主测线
+        snap_path = _lines_dir / f"line_{line_counter:04d}_main.png"
+        plt.savefig(snap_path, dpi=200, bbox_inches="tight")
+        print(f"  >> 已保存测线: {snap_path}")
+
+        total_points1, line_counter = self._generate_perpendicular_lines(
+            line,
+            direction=1,
+            target_partition_id=partition_id,
+            step=step,
+            t0=t0,
+            line_counter=line_counter,
+        )
+
+        total_points2, line_counter = self._generate_perpendicular_lines(
+            line,
+            direction=-1,
+            target_partition_id=partition_id,
+            step=step,
+            t0=t0,
+            line_counter=line_counter,
+        )
+
+        total_points = len(line) + total_points1 + total_points2
+
+        final_path = _lines_dir / "plan_line_final.png"
+        plt.legend()
+        plt.savefig(final_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        dot_path = _save_dot_csv(partition_lines, _dot_dir)
+
+        print(
+            f"[分区{partition_id}完成] 共生成{len(self.all_lines)}条测线 | 总点数约{total_points}"
+        )
+        print(f"  最终图片: {final_path}")
+        print(f"  测线点文件: {dot_path}")
+        print(f"  中间测线: {line_counter}张")
+
+        return self.all_lines
+
     def plan_line(self, start_x, start_y, step=50):
         global _output_dir, _lines_dir, _dot_dir, _all_lines_ref
 
@@ -610,3 +716,125 @@ class SurveyPlanner:
 def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
     planner = SurveyPlanner(xs, ys, cluster_matrix, theta=theta, n=n)
     planner.plan_line(start_x, start_y, step=step)
+
+
+def plan_all_line(xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
+    """
+    自动遍历所有分区, 每个分区以水深最大点为起点规划测线.
+
+    输出结构:
+        output/
+          lines/<timestamp>/
+            partition_0/
+              line_0001_main.png
+              line_0002_iter1.png
+              ...
+              plan_line_final.png
+            partition_1/
+              ...
+            all_partitions_final.png    <-- 所有区域合起来的最终图
+          dot/<timestamp>/
+            partition_0/
+              dot.csv
+            partition_1/
+              ...
+            dot.csv                      <-- 全部测线点
+    """
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path("./multibeam/output")
+    lines_parent = output_dir / "lines" / current_time
+    dot_parent = output_dir / "dot" / current_time
+
+    # 获取所有唯一分区ID
+    partition_ids = sorted(np.unique(cluster_matrix).astype(int))
+    print(f"[全局规划] 检测到 {len(partition_ids)} 个分区: {partition_ids}")
+    print(f"[全局规划] 输出根目录: {lines_parent}")
+
+    # 按分区顺序收集测线, 用于画总图
+    all_partition_lines = []  # list of (partition_id, lines_list)
+    total_lines_count = 0
+
+    for pid in partition_ids:
+        lines_dir = lines_parent / f"partition_{pid}"
+        dot_dir = dot_parent / f"partition_{pid}"
+
+        planner = SurveyPlanner(xs, ys, cluster_matrix, theta=theta, n=n)
+        t0 = time.time()
+        partition_lines = planner._plan_partition(
+            partition_id=pid,
+            step=step,
+            lines_dir=lines_dir,
+            dot_dir=dot_dir,
+            t0=t0,
+        )
+        all_partition_lines.append((pid, partition_lines))
+        total_lines_count += len(partition_lines)
+
+    # 绘制所有区域合起来的最终测线图
+    print(f"\n{'=' * 60}")
+    print(f"[全局规划] 正在绘制所有分区合并图...")
+
+    colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    plt.figure(figsize=(16, 12))
+    plt.xlim(xs.min(), xs.max())
+    plt.ylim(ys.min(), ys.max())
+    plt.gca().set_aspect("equal", adjustable="box")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.title("All Partitions Survey Lines")
+    plt.grid(True, alpha=0.3)
+
+    for pid, lines in all_partition_lines:
+        color = colors[int(pid) % len(colors)]
+        for line in lines:
+            plt.plot(
+                line[:, 0],
+                line[:, 1],
+                color=color,
+                linewidth=1.0,
+                alpha=0.8,
+                label=f"Partition {int(pid)}",
+            )
+        # 清除label避免图例重复
+        plt.gca().get_lines()[-1].set_label(None) if plt.gca().get_lines() else None
+
+    # 手动添加图例
+    from matplotlib.lines import Line2D
+
+    legend_elements = [
+        Line2D(
+            [0],
+            [0],
+            color=colors[int(pid) % len(colors)],
+            linewidth=2,
+            label=f"Partition {int(pid)}",
+        )
+        for pid in partition_ids
+    ]
+    plt.legend(handles=legend_elements, loc="best")
+
+    all_final_path = lines_parent / "all_partitions_final.png"
+    plt.savefig(all_final_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # 保存所有测线点
+    all_dot_dir = dot_parent
+    all_dot_dir.mkdir(parents=True, exist_ok=True)
+    flat_all_lines = [line for _, lines in all_partition_lines for line in lines]
+    _save_dot_csv(flat_all_lines, all_dot_dir)
+
+    print(f"[全局规划完成] 共 {len(partition_ids)} 个分区 | {total_lines_count} 条测线")
+    print(f"  合并最终图: {all_final_path}")
+    print(f"  全部测线点: {all_dot_dir / 'dot.csv'}")
