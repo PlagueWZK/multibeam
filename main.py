@@ -25,3 +25,7 @@ if __name__ == "__main__":
     final_cluster_matrix, U = partition_coverage_matrix(xs, ys, coverage_matrix)
 
     plan_line(1700, 10, xs, ys, final_cluster_matrix)
+    plan_line(2000, 6000, xs, ys, final_cluster_matrix)
+    plan_line(8000, 6000, xs, ys, final_cluster_matrix)
+    plan_line(6000, 10, xs, ys, final_cluster_matrix)
+    plan_line(8000, 10, xs, ys, final_cluster_matrix)
