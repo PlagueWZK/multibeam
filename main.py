@@ -1,9 +1,9 @@
 import matplotlib
+
 matplotlib.use("Agg")
 
 from multibeam.GridCell import *
 from multibeam.Coverage import *
-from multibeam.Partition import *
 from multibeam.Planner import *
 
 if __name__ == "__main__":
@@ -24,4 +24,9 @@ if __name__ == "__main__":
 
     final_cluster_matrix, U = partition_coverage_matrix(xs, ys, coverage_matrix)
 
-    plan_all_line(xs, ys, final_cluster_matrix)
+    # print(final_cluster_matrix)
+    print(f"xs:{xs}\nys:{ys}")
+    # TOTAL_AREA = (X_MAX - X_MIN) * (Y_MAX - Y_MIN)  # 5*1852 * 4*1852 = 68598080
+    #
+    # plan_all_line(xs, ys, final_cluster_matrix, total_area=TOTAL_AREA)
+

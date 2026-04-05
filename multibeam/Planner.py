@@ -39,6 +39,30 @@ def _signal_handler(signum, frame):
 signal.signal(signal.SIGINT, _signal_handler)
 
 
+def _compute_signed_angle(v1, v2):
+    """计算从向量v1到v2的带符号夹角（弧度），逆时针为正"""
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    cross = v1[0] * v2[1] - v1[1] * v2[0]
+    return np.arctan2(cross, dot)
+
+
+def _point_with_width(x, y, theta):
+    """返回 [x, y, 覆盖宽度(w_left + w_right)]，用于后续快速计算覆盖面积"""
+    return [x, y, get_w_left(x, y, theta) + get_w_right(x, y, theta)]
+
+
+def _compute_total_turning_angle(line):
+    """计算整条测线的累计偏转角（所有相邻线段夹角之和）"""
+    if len(line) < 3:
+        return 0.0
+    total = 0.0
+    for i in range(len(line) - 2):
+        v1 = np.array(line[i + 1]) - np.array(line[i])
+        v2 = np.array(line[i + 2]) - np.array(line[i + 1])
+        total += _compute_signed_angle(v1, v2)
+    return total
+
+
 def _point_to_segment_distance(px, py, x1, y1, x2, y2):
     dx = x2 - x1
     dy = y2 - y1
@@ -140,7 +164,7 @@ class SurveyPlanner:
                     self.cluster_matrix,
                 )
                 if is_in:
-                    t1.append([new_x, new_y])
+                    t1.append(_point_with_width(new_x, new_y, self.theta))
 
             if len(line) > 5:
                 plt.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
@@ -161,10 +185,11 @@ class SurveyPlanner:
                 break
 
             line = copy.deepcopy(t1)
+            turning_angle_terminated = False
             ring_closed_saturated = False
-            ring_closed_this_round = False
 
             if in_convergence_state:
+                # 收敛状态: 跳过自延伸, 直接进行饱和检查
                 current_line_length = figure_length(line)
                 print(
                     f"  [收敛状态] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m"
@@ -226,6 +251,12 @@ class SurveyPlanner:
                 back_stopped = False
                 extend_front = True
 
+                # 累计偏转角跟踪 (前端和后端独立)
+                front_turning_angle = 0.0
+                back_turning_angle = 0.0
+                front_prev_vec = None
+                back_prev_vec = None
+
                 while True:
                     if front_stopped and back_stopped:
                         break
@@ -270,7 +301,23 @@ class SurveyPlanner:
                         extend_front = not extend_front
                         continue
 
-                    new_point = [new_x, new_y]
+                    new_point = _point_with_width(new_x, new_y, self.theta)
+
+                    # 累计偏转角检测 (整条测线统一计算)
+                    if extend_front:
+                        line.append(new_point)
+                    else:
+                        line.insert(0, new_point)
+
+                    total_angle = _compute_total_turning_angle(line)
+                    if abs(total_angle) > 2 * np.pi:
+                        print(
+                            f"  [测线延伸] 累计偏转角{np.degrees(total_angle):.1f}° > 360°，螺旋终止"
+                        )
+                        turning_angle_terminated = True
+                        break
+
+                    # 相交检查
                     found_intersection = False
                     for prev_idx, prev_line in enumerate(prev_lines):
                         if _check_line_intersection(
@@ -296,104 +343,9 @@ class SurveyPlanner:
                         extend_front = not extend_front
                         continue
 
-                    # 环形闭合检查: 新增点数 >= 6 时才检测 (两端总延伸量, 而非单端计数)
-                    if len(line) - initial_len >= 6:
-                        if extend_front:
-                            end_dist = np.sqrt(
-                                (new_x - line[0][0]) ** 2 + (new_y - line[0][1]) ** 2
-                            )
-                        else:
-                            end_dist = np.sqrt(
-                                (new_x - line[-1][0]) ** 2 + (new_y - line[-1][1]) ** 2
-                            )
-                        if end_dist < step * 1.5:
-                            if extend_front:
-                                print(
-                                    f"  [测线延伸-前端] 延伸{ext_loop}步后与后端点距离{end_dist:.1f}m，环形闭合"
-                                )
-                            else:
-                                print(
-                                    f"  [测线延伸-后端] 延伸{ext_loop}步后与前端点距离{end_dist:.1f}m，环形闭合"
-                                )
-                            if extend_front:
-                                line.append(new_point)
-                                front_x, front_y = new_x, new_y
-                            else:
-                                line.insert(0, new_point)
-                                back_x, back_y = new_x, new_y
-
-                            ring_closed_this_round = True
-                            current_line_length = figure_length(line)
-                            print(
-                                f"  [环形终止] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m"
-                            )
-
-                            if current_line_length < parent_line_length:
-                                print(
-                                    f"  [环形测线收敛] 当前长度 < 父测线长度，进入收敛状态"
-                                )
-                                in_convergence_state = True
-
-                                line_arr = np.array(line)
-                                centroid = np.mean(line_arr, axis=0)
-                                dists_to_centroid = np.sqrt(
-                                    (line_arr[:, 0] - centroid[0]) ** 2
-                                    + (line_arr[:, 1] - centroid[1]) ** 2
-                                )
-                                nearest_idx = np.argmin(dists_to_centroid)
-                                nearest_point = line_arr[nearest_idx]
-                                min_dist_to_centroid = dists_to_centroid[nearest_idx]
-
-                                nearest_gx = get_gx(nearest_point[0], nearest_point[1])
-                                nearest_gy = get_gy(nearest_point[0], nearest_point[1])
-                                grad_dir = np.array([nearest_gx, nearest_gy])
-                                grad_norm = np.linalg.norm(grad_dir)
-                                if grad_norm > 1e-6:
-                                    grad_dir = grad_dir / grad_norm
-                                else:
-                                    grad_dir = np.array([0, 1])
-
-                                to_centroid = np.array(
-                                    [
-                                        centroid[0] - nearest_point[0],
-                                        centroid[1] - nearest_point[1],
-                                    ]
-                                )
-                                to_centroid_norm = np.linalg.norm(to_centroid)
-                                if to_centroid_norm > 1e-6:
-                                    to_centroid = to_centroid / to_centroid_norm
-
-                                dot_product = np.dot(grad_dir, to_centroid)
-                                if dot_product > 0:
-                                    inner_width = get_w_right(
-                                        nearest_point[0], nearest_point[1], self.theta
-                                    )
-                                else:
-                                    inner_width = get_w_left(
-                                        nearest_point[0], nearest_point[1], self.theta
-                                    )
-
-                                if min_dist_to_centroid < inner_width:
-                                    print(
-                                        f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m < 内侧覆盖宽度{inner_width:.1f}m，测线饱和"
-                                    )
-                                    ring_closed_saturated = True
-                                else:
-                                    print(
-                                        f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m >= 内侧覆盖宽度{inner_width:.1f}m，继续生成"
-                                    )
-                            else:
-                                print(
-                                    f"  [非收敛状态] 当前长度 >= 父测线长度，不进入收敛状态"
-                                )
-
-                            break
-
                     if extend_front:
-                        line.append(new_point)
                         front_x, front_y = new_x, new_y
                     else:
-                        line.insert(0, new_point)
                         back_x, back_y = new_x, new_y
 
                     extend_front = not extend_front
@@ -405,9 +357,20 @@ class SurveyPlanner:
                 prev_lines.pop(0)
             total_points += len(line)
 
-            # 每条测线完成时立即保存
-            if ring_closed_this_round:
+            # 累计偏转角触发 → 红色标记 + 收敛判定
+            if turning_angle_terminated:
                 plt.plot(line[:, 0], line[:, 1], color="red", linewidth=1.5)
+                current_line_length = figure_length(line)
+                print(
+                    f"  [螺旋终止判定] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m"
+                )
+                if current_line_length < parent_line_length:
+                    in_convergence_state = True
+                    print(
+                        f"  [进入收敛状态] 长度缩短，后续测线将跳过自延伸并进行饱和检查"
+                    )
+                else:
+                    print(f"  [保持扩展状态] 长度未缩短，继续正常扩展")
             elif intersection_terminated:
                 plt.plot(line[:, 0], line[:, 1], color="purple", linewidth=1.5)
 
@@ -428,11 +391,10 @@ class SurveyPlanner:
     def _extend_line_bidirectional(self, start_x, start_y, target_partition_id, step):
         """
         双向延伸生成主测线: 从起点向正反两个方向交替延伸,
-        使用与从测线相同的边界检查和环形闭合检查策略.
+        使用整条测线的累计偏转角法检测环形/螺旋.
         由于是第一条测线, 不进行与其他测线相交的检查.
         """
-        line = [[start_x, start_y]]
-        initial_len = len(line)  # 记录双向延伸开始时的基准长度
+        line = [_point_with_width(start_x, start_y, self.theta)]
 
         ext_step = step / 2
         ext_loop = 0
@@ -482,37 +444,25 @@ class SurveyPlanner:
                 extend_front = not extend_front
                 continue
 
-            # 环形闭合检查: 新增点数 >= 6 时才检测 (两端总延伸量, 而非单端计数)
-            if len(line) - initial_len >= 6:
-                if extend_front:
-                    end_dist = np.sqrt(
-                        (new_x - line[0][0]) ** 2 + (new_y - line[0][1]) ** 2
-                    )
-                else:
-                    end_dist = np.sqrt(
-                        (new_x - line[-1][0]) ** 2 + (new_y - line[-1][1]) ** 2
-                    )
-                if end_dist < step * 1.5:
-                    if extend_front:
-                        print(
-                            f"  [主测线延伸-前端] 延伸{ext_loop}步后与后端点距离{end_dist:.1f}m，环形闭合"
-                        )
-                    else:
-                        print(
-                            f"  [主测线延伸-后端] 延伸{ext_loop}步后与前端点距离{end_dist:.1f}m，环形闭合"
-                        )
-                    if extend_front:
-                        line.append([new_x, new_y])
-                    else:
-                        line.insert(0, [new_x, new_y])
-                    ring_closed = True
-                    break
+            # 添加到测线后再计算总偏转角
+            new_point = _point_with_width(new_x, new_y, self.theta)
+            if extend_front:
+                line.append(new_point)
+            else:
+                line.insert(0, new_point)
+
+            # 累计偏转角检测 (整条测线统一计算)
+            total_angle = _compute_total_turning_angle(line)
+            if abs(total_angle) > 2 * np.pi:
+                print(
+                    f"  [主测线延伸] 累计偏转角{np.degrees(total_angle):.1f}° > 360°，螺旋终止"
+                )
+                ring_closed = True
+                break
 
             if extend_front:
-                line.append([new_x, new_y])
                 front_x, front_y = new_x, new_y
             else:
-                line.insert(0, [new_x, new_y])
                 back_x, back_y = new_x, new_y
 
             extend_front = not extend_front
@@ -544,27 +494,18 @@ class SurveyPlanner:
         _lines_dir.mkdir(parents=True, exist_ok=True)
         _dot_dir.mkdir(parents=True, exist_ok=True)
 
-        # 在分区内寻找水深最大的点作为主测线起点
-        rows, cols = self.cluster_matrix.shape
-        max_depth = -1
-        start_x, start_y = None, None
-        for r in range(rows):
-            for c in range(cols):
-                if self.cluster_matrix[r, c] == partition_id:
-                    px = self.xs[c]
-                    py = self.ys[r]
-                    h = get_height(px, py)
-                    if h > max_depth:
-                        max_depth = h
-                        start_x, start_y = px, py
-
-        if start_x is None:
+        # 在分区内寻找几何中心位置作为主测线起点
+        rows, cols = np.where(self.cluster_matrix == partition_id)
+        if len(rows) == 0:
             print(f"[分区{partition_id}] 未找到有效网格点, 跳过")
             return []
 
+        start_x = float(np.mean(self.xs[cols]))
+        start_y = float(np.mean(self.ys[rows]))
+
         print(f"\n{'=' * 60}")
         print(
-            f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | 最大水深: {max_depth:.1f}m"
+            f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | 分区中心"
         )
 
         plt.figure(figsize=(12, 10))
@@ -718,7 +659,7 @@ def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=12
     planner.plan_line(start_x, start_y, step=step)
 
 
-def plan_all_line(xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
+def plan_all_line(xs, ys, cluster_matrix, n=0.1, step=50, theta=120, total_area=None):
     """
     自动遍历所有分区, 每个分区以水深最大点为起点规划测线.
 
@@ -838,3 +779,89 @@ def plan_all_line(xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
     print(f"[全局规划完成] 共 {len(partition_ids)} 个分区 | {total_lines_count} 条测线")
     print(f"  合并最终图: {all_final_path}")
     print(f"  全部测线点: {all_dot_dir / 'dot.csv'}")
+
+    # 保存指标统计
+    _save_metrics(
+        all_partition_lines=all_partition_lines,
+        xs=xs,
+        ys=ys,
+        cluster_matrix=cluster_matrix,
+        current_time=current_time,
+        total_area=total_area,
+    )
+
+
+def _save_metrics(
+    all_partition_lines, xs, ys, cluster_matrix, current_time, total_area=None
+):
+    """
+    统计并保存测线规划指标到 xlsx 文件.
+    覆盖宽度已在测线生成时预计算, 此处直接累加, 无需模型调用.
+    """
+    import pandas as pd
+
+    output_dir = Path("./multibeam/output")
+    metrics_dir = output_dir / "metrics" / current_time
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    # 待测海域总面积: 优先使用传入值, 否则基于网格范围计算
+    if total_area is None:
+        total_area = (xs.max() - xs.min()) * (ys.max() - ys.min())
+
+    n = 0.1
+
+    partition_rows = []
+    global_total_length = 0.0
+    global_total_coverage = 0.0
+    global_total_lines = 0
+
+    for pid, lines in all_partition_lines:
+        line_count = len(lines)
+        total_length = sum(figure_length(line) for line in lines)
+        total_coverage = sum(figure_width(line) for line in lines)
+
+        partition_rows.append(
+            {
+                "分区ID": int(pid),
+                "测线条数": line_count,
+                "测线总长度(m)": round(total_length, 2),
+                "覆盖面积(m²)": round(total_coverage, 2),
+            }
+        )
+
+        global_total_lines += line_count
+        global_total_length += total_length
+        global_total_coverage += total_coverage
+
+    # 分区统计 DataFrame
+    df_partition = pd.DataFrame(partition_rows)
+
+    # 全局指标
+    effective_coverage = global_total_coverage * (1 - n)
+    coverage_rate = effective_coverage / total_area if total_area > 0 else 0
+    miss_rate = 1 - coverage_rate
+
+    global_rows = [
+        {"指标": "测线条数", "值": global_total_lines},
+        {"指标": "测线总长度(m)", "值": round(global_total_length, 2)},
+        {"指标": "总覆盖面积(m²)", "值": round(global_total_coverage, 2)},
+        {"指标": "有效覆盖面积(m²)", "值": round(effective_coverage, 2)},
+        {"指标": "待测海域总面积(m²)", "值": round(total_area, 2)},
+        {"指标": "覆盖率", "值": f"{coverage_rate:.4%}"},
+        {"指标": "漏测率", "值": f"{miss_rate:.4%}"},
+    ]
+    df_global = pd.DataFrame(global_rows)
+
+    # 保存到 xlsx
+    metrics_path = metrics_dir / "metrics.xlsx"
+    with pd.ExcelWriter(metrics_path, engine="openpyxl") as writer:
+        df_partition.to_excel(writer, sheet_name="分区统计", index=False)
+        df_global.to_excel(writer, sheet_name="全局统计", index=False)
+
+    print(f"\n[指标统计完成] 已保存到: {metrics_path}")
+    print(f"  测线条数: {global_total_lines}")
+    print(f"  测线总长度: {global_total_length:.2f} m")
+    print(f"  总覆盖面积: {global_total_coverage:.2f} m²")
+    print(f"  有效覆盖面积: {effective_coverage:.2f} m²")
+    print(f"  覆盖率: {coverage_rate:.4%}")
+    print(f"  漏测率: {miss_rate:.4%}")
