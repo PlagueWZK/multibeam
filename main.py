@@ -35,6 +35,6 @@ if __name__ == "__main__":
     final_cluster_matrix, U = partition_coverage_matrix(xs, ys, coverage_matrix)
 
     # Phase 4: 测线规划（封装对象，即时指标）
-    planner = SurveyPlanner(xs, ys, final_cluster_matrix, depth_matrix)
+    planner = SurveyPlanner(xs, ys, final_cluster_matrix)
     planner.plan_all(output_dir="./multibeam/output")
     planner.save_metrics_excel("./multibeam/output")

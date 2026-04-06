@@ -1,7 +1,7 @@
 import copy
-import signal
+import datetime
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -22,8 +22,6 @@ from tool.Data import (
     get_w_left,
     get_w_right,
 )
-
-import datetime
 
 # ---------------------------------------------------------------------------
 # Data classes for instant metric recording
@@ -76,19 +74,17 @@ def _compute_signed_angle(v1, v2):
     return np.arctan2(cross, dot)
 
 
-def _point_with_width(x, y, theta):
-    """返回 [x, y, 覆盖宽度(w_left + w_right)]，用于后续快速计算覆盖面积"""
-    return [x, y, get_w_left(x, y, theta) + get_w_right(x, y, theta)]
-
-
-def _compute_total_turning_angle(line):
-    """计算整条测线的累计偏转角（所有相邻线段夹角之和）"""
-    if len(line) < 3:
+def _compute_total_turning_angle(line_arr):
+    """
+    计算整条测线的累计偏转角（所有相邻线段夹角之和）。
+    输入为 numpy 数组 [N, 3]，避免重复转换。
+    """
+    if len(line_arr) < 3:
         return 0.0
     total = 0.0
-    for i in range(len(line) - 2):
-        v1 = np.array(line[i + 1]) - np.array(line[i])
-        v2 = np.array(line[i + 2]) - np.array(line[i + 1])
+    for i in range(len(line_arr) - 2):
+        v1 = line_arr[i + 1] - line_arr[i]
+        v2 = line_arr[i + 2] - line_arr[i + 1]
         total += _compute_signed_angle(v1, v2)
     return total
 
@@ -125,13 +121,23 @@ def _check_line_intersection(point, line, threshold):
 class SurveyPlanner:
     """测线规划器：封装分区测线生成与即时指标记录"""
 
-    def __init__(
-        self, xs, ys, cluster_matrix, depth_matrix=None, step=50, theta=120, n=0.1
-    ):
+    PARTITION_COLORS = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    def __init__(self, xs, ys, cluster_matrix, step=50, theta=120, n=0.1):
         self.xs = xs
         self.ys = ys
         self.cluster_matrix = cluster_matrix
-        self.depth_matrix = depth_matrix
         self.step = step
         self.theta = theta
         self.theta_rad = np.radians(theta)
@@ -147,13 +153,16 @@ class SurveyPlanner:
         self.all_records: list[LineRecord] = []
         self._line_counter = 0
 
-        # For Ctrl+C emergency save
-        self._emergency_lines: list[np.ndarray] = []
-        self._emergency_dot_dir: Path | None = None
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _is_in_partition(self, x, y, partition_id):
+        """判断点 (x, y) 是否属于指定分区"""
+        is_in, _ = is_point_in_partition(
+            x, y, partition_id, self.xs, self.ys, self.cluster_matrix
+        )
+        return is_in
 
     def _record_line(self, points, partition_id, terminated_by):
         """测线生成完毕后立即计算并记录指标"""
@@ -173,15 +182,6 @@ class SurveyPlanner:
         self._line_counter += 1
         return record
 
-    def _save_emergency_dot(self):
-        """Ctrl+C 中断时保存当前测线点"""
-        if self._emergency_dot_dir and self._emergency_lines:
-            try:
-                _save_dot_csv(self._emergency_lines, self._emergency_dot_dir)
-                print(f"[中断] 已保存测线点文件: {self._emergency_dot_dir / 'dot.csv'}")
-            except Exception:
-                pass
-
     # ------------------------------------------------------------------
     # Core line generation (algorithm unchanged)
     # ------------------------------------------------------------------
@@ -192,7 +192,7 @@ class SurveyPlanner:
         使用整条测线的累计偏转角法检测环形/螺旋.
         由于是第一条测线, 不进行与其他测线相交的检查.
         """
-        line = [_point_with_width(start_x, start_y, self.theta)]
+        line = [self._point_with_width(start_x, start_y)]
 
         ext_step = step / 2
         ext_loop = 0
@@ -217,22 +217,19 @@ class SurveyPlanner:
             ext_loop += 1
 
             if extend_front:
-                gx = get_gx(front_x, front_y)
-                gy = get_gy(front_x, front_y)
-                dx, dy = forward_direction(gx, gy)
+                dx, dy = forward_direction(
+                    get_gx(front_x, front_y), get_gy(front_x, front_y)
+                )
                 new_x = front_x + ext_step * dx
                 new_y = front_y + ext_step * dy
             else:
-                gx = get_gx(back_x, back_y)
-                gy = get_gy(back_x, back_y)
-                dx, dy = forward_direction(gx, gy)
+                dx, dy = forward_direction(
+                    get_gx(back_x, back_y), get_gy(back_x, back_y)
+                )
                 new_x = back_x - ext_step * dx
                 new_y = back_y - ext_step * dy
 
-            is_in, _ = is_point_in_partition(
-                new_x, new_y, target_partition_id, self.xs, self.ys, self.cluster_matrix
-            )
-            if not is_in:
+            if not self._is_in_partition(new_x, new_y, target_partition_id):
                 if extend_front:
                     print(f"  [主测线延伸-前端] 延伸{ext_loop}步后超出边界")
                     front_stopped = True
@@ -242,13 +239,14 @@ class SurveyPlanner:
                 extend_front = not extend_front
                 continue
 
-            new_point = _point_with_width(new_x, new_y, self.theta)
+            new_point = self._point_with_width(new_x, new_y)
             if extend_front:
                 line.append(new_point)
             else:
                 line.insert(0, new_point)
 
-            total_angle = _compute_total_turning_angle(line)
+            line_arr = np.array(line)
+            total_angle = _compute_total_turning_angle(line_arr)
             if abs(total_angle) > 2 * np.pi:
                 print(
                     f"  [主测线延伸] 累计偏转角{np.degrees(total_angle):.1f}° > 360°，螺旋终止"
@@ -282,10 +280,9 @@ class SurveyPlanner:
         partition_id,
     ):
         line = copy.deepcopy(main_line)
-        initial_len = len(line)
         prev_lines = [main_line.copy()]
         in_convergence_state = False
-        parent_line_length = figure_length(line)
+        parent_line_length = figure_length(main_line)
         perp_iter = 0
         total_points = 0
         intersection_terminated = False
@@ -298,9 +295,8 @@ class SurveyPlanner:
 
             t1 = []
 
-            for index, i in enumerate(line):
-                x = i[0]
-                y = i[1]
+            for i in line:
+                x, y = i[0], i[1]
                 alpha = get_alpha(x, y)
                 h = get_height(x, y)
                 if alpha <= 0.005:
@@ -324,16 +320,8 @@ class SurveyPlanner:
                     new_x = x - direction * tx
                     new_y = y - direction * ty
 
-                is_in, _ = is_point_in_partition(
-                    new_x,
-                    new_y,
-                    target_partition_id,
-                    self.xs,
-                    self.ys,
-                    self.cluster_matrix,
-                )
-                if is_in:
-                    t1.append(_point_with_width(new_x, new_y, self.theta))
+                if self._is_in_partition(new_x, new_y, target_partition_id):
+                    t1.append(self._point_with_width(new_x, new_y))
 
             if len(line) > 5:
                 plt.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
@@ -364,7 +352,6 @@ class SurveyPlanner:
                     f"  [收敛状态] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m"
                 )
 
-                line_arr = np.array(line)
                 centroid = np.mean(line_arr, axis=0)
                 dists_to_centroid = np.sqrt(
                     (line_arr[:, 0] - centroid[0]) ** 2
@@ -383,9 +370,7 @@ class SurveyPlanner:
                 else:
                     grad_dir = np.array([0, 1])
 
-                to_centroid = np.array(
-                    [centroid[0] - nearest_point[0], centroid[1] - nearest_point[1]]
-                )
+                to_centroid = centroid[:2] - nearest_point[:2]
                 to_centroid_norm = np.linalg.norm(to_centroid)
                 if to_centroid_norm > 1e-6:
                     to_centroid = to_centroid / to_centroid_norm
@@ -434,27 +419,19 @@ class SurveyPlanner:
                     ext_loop += 1
 
                     if extend_front:
-                        gx = get_gx(front_x, front_y)
-                        gy = get_gy(front_x, front_y)
-                        dx, dy = forward_direction(gx, gy)
+                        dx, dy = forward_direction(
+                            get_gx(front_x, front_y), get_gy(front_x, front_y)
+                        )
                         new_x = front_x + ext_step * dx
                         new_y = front_y + ext_step * dy
                     else:
-                        gx = get_gx(back_x, back_y)
-                        gy = get_gy(back_x, back_y)
-                        dx, dy = forward_direction(gx, gy)
+                        dx, dy = forward_direction(
+                            get_gx(back_x, back_y), get_gy(back_x, back_y)
+                        )
                         new_x = back_x - ext_step * dx
                         new_y = back_y - ext_step * dy
 
-                    is_in, _ = is_point_in_partition(
-                        new_x,
-                        new_y,
-                        target_partition_id,
-                        self.xs,
-                        self.ys,
-                        self.cluster_matrix,
-                    )
-                    if not is_in:
+                    if not self._is_in_partition(new_x, new_y, target_partition_id):
                         if extend_front:
                             print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
                             front_stopped = True
@@ -464,14 +441,15 @@ class SurveyPlanner:
                         extend_front = not extend_front
                         continue
 
-                    new_point = _point_with_width(new_x, new_y, self.theta)
+                    new_point = self._point_with_width(new_x, new_y)
 
                     if extend_front:
                         line.append(new_point)
                     else:
                         line.insert(0, new_point)
 
-                    total_angle = _compute_total_turning_angle(line)
+                    line_arr = np.array(line)
+                    total_angle = _compute_total_turning_angle(line_arr)
                     if abs(total_angle) > 2 * np.pi:
                         print(
                             f"  [测线延伸] 累计偏转角{np.degrees(total_angle):.1f}° > 360°，螺旋终止"
@@ -524,7 +502,6 @@ class SurveyPlanner:
                 )
             )
             self._record_line(line, partition_id, terminated_by)
-            self._emergency_lines.append(line.copy())
 
             prev_lines.append(line.copy())
             if len(prev_lines) > 3:
@@ -579,8 +556,6 @@ class SurveyPlanner:
         lines_dir.mkdir(parents=True, exist_ok=True)
         dot_dir.mkdir(parents=True, exist_ok=True)
 
-        self._emergency_dot_dir = dot_dir
-
         rows, cols = np.where(self.cluster_matrix == partition_id)
         if len(rows) == 0:
             print(f"[分区{partition_id}] 未找到有效网格点, 跳过")
@@ -604,7 +579,6 @@ class SurveyPlanner:
         plt.grid(True, alpha=0.3)
 
         line_counter = 0
-        partition_lines = []
 
         # 主测线
         print(
@@ -613,9 +587,7 @@ class SurveyPlanner:
         line, main_terminated = self._extend_line_bidirectional(
             start_x, start_y, partition_id, self.step
         )
-        main_record = self._record_line(line, partition_id, main_terminated)
-        self._emergency_lines.append(line.copy())
-        partition_lines.append(line.copy())
+        self._record_line(line, partition_id, main_terminated)
         line_counter += 1
         plt.plot(line[:, 0], line[:, 1], color="b", linewidth=1.5, label="Main line")
 
@@ -650,8 +622,6 @@ class SurveyPlanner:
         plt.savefig(final_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        dot_path = _save_dot_csv(partition_lines, dot_dir)
-
         # 从全局记录中筛选该分区的完整记录（包含主测线 + 所有垂直测线）
         partition_records = [
             r for r in self.all_records if r.partition_id == partition_id
@@ -659,14 +629,17 @@ class SurveyPlanner:
         total_length = sum(r.length for r in partition_records)
         total_coverage = sum(r.coverage for r in partition_records)
 
-        # 从记录中提取完整测线列表（用于合并图和 dot.csv）
+        # 从记录中提取完整测线列表（用于绘图和 dot.csv）
         partition_all_lines = [r.points for r in partition_records]
+
+        # 保存 dot.csv
+        _save_dot_csv(partition_all_lines, dot_dir)
 
         print(
             f"[分区{partition_id}完成] 共生成{len(partition_records)}条测线 | 总点数约{total_points}"
         )
         print(f"  最终图片: {final_path}")
-        print(f"  测线点文件: {dot_path}")
+        print(f"  测线点文件: {dot_dir / 'dot.csv'}")
         print(f"  中间测线: {line_counter}张")
 
         return PartitionResult(
@@ -768,18 +741,7 @@ class SurveyPlanner:
         print(f"\n{'=' * 60}")
         print(f"[全局规划] 正在绘制所有分区合并图...")
 
-        colors = [
-            "#1f77b4",
-            "#ff7f0e",
-            "#2ca02c",
-            "#d62728",
-            "#9467bd",
-            "#8c564b",
-            "#e377c2",
-            "#7f7f7f",
-            "#bcbd22",
-            "#17becf",
-        ]
+        colors = self.PARTITION_COLORS
 
         plt.figure(figsize=(16, 12))
         plt.xlim(self.x_min, self.x_max)
@@ -928,6 +890,14 @@ class SurveyPlanner:
         print(f"  漏测率: {miss_rate:.4%}")
 
         return metrics_path
+
+    # ------------------------------------------------------------------
+    # Instance-level helper (replaces module-level _point_with_width)
+    # ------------------------------------------------------------------
+
+    def _point_with_width(self, x, y):
+        """返回 [x, y, 覆盖宽度(w_left + w_right)]，用于后续快速计算覆盖面积"""
+        return [x, y, get_w_left(x, y, self.theta) + get_w_right(x, y, self.theta)]
 
 
 # ---------------------------------------------------------------------------
