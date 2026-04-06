@@ -8,8 +8,15 @@ from sklearn.preprocessing import StandardScaler
 def find_optimal_k_elbow(features, k_min=2, k_max=10):
     """
     根据 Elbow 准则自动寻找最优的簇数目 U
-    使用“点到直线最大距离法”从数学上确定拐点
+    使用"点到直线最大距离法"从数学上确定拐点
     """
+    n_samples = len(features)
+    # KMeans 要求 n_clusters < n_samples
+    k_max = min(k_max, n_samples - 1)
+    if k_max < k_min:
+        print(f"  [警告] 数据点过少 (n={n_samples})，直接返回 k_min={k_min}")
+        return k_min
+
     inertias = []
     k_range = range(k_min, k_max + 1)
 
@@ -157,7 +164,18 @@ def _point_line_distance(p0, p1, p2):
     ) / np.linalg.norm(p2 - p1)
 
 
-def is_point_in_partition(x, y, target_partition_id, xs, ys, cluster_matrix):
+def is_point_in_partition(
+    x,
+    y,
+    target_partition_id,
+    xs,
+    ys,
+    cluster_matrix,
+    x_min=None,
+    x_max=None,
+    y_min=None,
+    y_max=None,
+):
     """
     判断点 (x, y) 是否属于指定的分区
 
@@ -168,29 +186,41 @@ def is_point_in_partition(x, y, target_partition_id, xs, ys, cluster_matrix):
         xs: x坐标数组 (一维)
         ys: y坐标数组 (一维)
         cluster_matrix: 分区矩阵 (二维，维度为 len(ys) x len(xs))
+        x_min, x_max, y_min, y_max: 真实海域边界（arange 策略下 xs[-1] 可能超出真实边界）
 
     返回:
         tuple: (bool, int)
             - bool: True表示点属于目标分区，False表示不属于或点在网格范围外
             - int: 点实际所属的分区ID，如果在范围外则返回-1
-
-    示例:
-        >>> is_in_partition, actual_id = is_point_in_partition(
-        ...     x=1000, y=2000, target_partition_id=2,
-        ...     xs=xs, ys=ys, cluster_matrix=final_cluster_matrix
-        ... )
-        >>> print(f"点是否在分区2中: {is_in_partition}, 实际分区: {actual_id}")
     """
-    # 复用 get_partition_for_point 获取实际分区ID
-    actual_partition_id = get_partition_for_point(x, y, xs, ys, cluster_matrix)
+    actual_partition_id = get_partition_for_point(
+        x,
+        y,
+        xs,
+        ys,
+        cluster_matrix,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+    )
 
-    # 判断是否属于目标分区
     is_in_target = actual_partition_id == target_partition_id
 
     return is_in_target, actual_partition_id
 
 
-def get_partition_for_point(x, y, xs, ys, cluster_matrix):
+def get_partition_for_point(
+    x,
+    y,
+    xs,
+    ys,
+    cluster_matrix,
+    x_min=None,
+    x_max=None,
+    y_min=None,
+    y_max=None,
+):
     """
     获取点 (x, y) 所属的分区ID
 
@@ -200,12 +230,19 @@ def get_partition_for_point(x, y, xs, ys, cluster_matrix):
         xs: x坐标数组 (一维)
         ys: y坐标数组 (一维)
         cluster_matrix: 分区矩阵
+        x_min, x_max, y_min, y_max: 真实海域边界（arange 策略下 xs[-1] 可能超出真实边界）
 
     返回:
         int: 分区ID (0 到 U-1)，如果点在网格范围外则返回 -1
     """
-    # 检查点是否在网格范围内
-    if x < xs.min() or x > xs.max() or y < ys.min() or y > ys.max():
+    # 使用真实海域边界（arange 策略下 xs[-1] 可能超出真实边界）
+    real_x_min = x_min if x_min is not None else xs.min()
+    real_x_max = x_max if x_max is not None else xs.max()
+    real_y_min = y_min if y_min is not None else ys.min()
+    real_y_max = y_max if y_max is not None else ys.max()
+
+    # 检查点是否在真实海域范围内
+    if x < real_x_min or x > real_x_max or y < real_y_min or y > real_y_max:
         return -1
 
     # 找到最近的网格索引

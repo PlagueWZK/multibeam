@@ -173,7 +173,16 @@ class SurveyPlanner:
     def _is_in_partition(self, x, y, partition_id):
         """判断点 (x, y) 是否属于指定分区"""
         is_in, _ = is_point_in_partition(
-            x, y, partition_id, self.xs, self.ys, self.cluster_matrix
+            x,
+            y,
+            partition_id,
+            self.xs,
+            self.ys,
+            self.cluster_matrix,
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
         )
         return is_in
 
@@ -679,7 +688,15 @@ class SurveyPlanner:
         dot_dir = Path(output_dir) / "dot" / current_time
 
         target_partition_id = get_partition_for_point(
-            start_x, start_y, self.xs, self.ys, self.cluster_matrix
+            start_x,
+            start_y,
+            self.xs,
+            self.ys,
+            self.cluster_matrix,
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
         )
         print(f"[测线规划] 目标分区ID: {target_partition_id}")
 
