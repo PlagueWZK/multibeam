@@ -149,18 +149,20 @@ def partition_coverage_matrix(
         aspect="auto",
     )
 
-    # 修复：轮廓线级别只需在簇之间绘制，避免冗余
-    levels = np.arange(0.5, optimal_u - 0.5)
-    if len(levels) > 0:  # U >= 3 时才需要边界线
-        plt.contour(
-            grid_x,
-            grid_y,
-            cluster_matrix,
-            levels=levels,
-            colors="black",
-            linewidths=1.5,
-            linestyles="dashed",
-        )
+    # 检测边界像素：任何相邻像素属于不同分区的像素即为边界
+    boundary = np.zeros_like(cluster_matrix, dtype=bool)
+    boundary[:-1, :] |= cluster_matrix[:-1, :] != cluster_matrix[1:, :]
+    boundary[1:, :] |= cluster_matrix[:-1, :] != cluster_matrix[1:, :]
+    boundary[:, :-1] |= cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
+    boundary[:, 1:] |= cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
+
+    # 用散点图绘制边界（单像素宽度，避免 contour 的多重轮廓叠加）
+    if np.any(boundary):
+        by, bx = np.where(boundary)
+        # 将网格索引转换为实际坐标
+        px = xs[0] + bx * (xs[-1] - xs[0]) / (cols - 1)
+        py = ys[0] + by * (ys[-1] - ys[0]) / (rows - 1)
+        plt.scatter(px, py, c="black", s=0.3, marker="s", linewidths=0, zorder=2)
 
     plt.title(f"K-means Spatial Partitioning (U={optimal_u}) with Boundary Lines")
     plt.xlabel("X (m)")
