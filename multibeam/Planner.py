@@ -300,6 +300,7 @@ class SurveyPlanner:
         t0,
         line_counter,
         partition_id,
+        draw_first_line=True,
     ):
         line = copy.deepcopy(main_line)
         prev_lines = [main_line.copy()]
@@ -345,7 +346,7 @@ class SurveyPlanner:
                 if self._is_in_partition(new_x, new_y, target_partition_id):
                     t1.append(self._point_with_width(new_x, new_y))
 
-            if len(line) > 5:
+            if len(line) > 5 and (draw_first_line or perp_iter > 1):
                 plt.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
 
             elapsed = time.time() - t0
@@ -625,6 +626,7 @@ class SurveyPlanner:
             t0=t0,
             line_counter=line_counter,
             partition_id=partition_id,
+            draw_first_line=False,
         )
 
         total_points2, line_counter = self._generate_perpendicular_lines(
@@ -635,6 +637,7 @@ class SurveyPlanner:
             t0=t0,
             line_counter=line_counter,
             partition_id=partition_id,
+            draw_first_line=False,
         )
 
         total_points = len(line) + total_points1 + total_points2
@@ -916,6 +919,7 @@ class SurveyPlanner:
         print(f"  测线总长度: {global_total_length:.2f} m")
         print(f"  总覆盖面积: {global_total_coverage:.2f} m²")
         print(f"  有效覆盖面积: {effective_coverage:.2f} m²")
+        print(f"  待测海域总面积: {self.total_area:.2f} m²")
         print(f"  覆盖率: {coverage_rate:.4%}")
         print(f"  漏测率: {miss_rate:.4%}")
 

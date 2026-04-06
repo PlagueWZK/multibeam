@@ -42,6 +42,6 @@ if __name__ == "__main__":
         y_min=Y_MIN,
         y_max=Y_MAX,
     )
-    planner.plan_all(output_dir="./multibeam/output")
+    planner.plan_line(output_dir="./multibeam/output")
     planner.save_metrics_excel("./multibeam/output")
 

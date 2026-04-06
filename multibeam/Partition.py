@@ -65,11 +65,18 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10):
     return optimal_u
 
 
-def partition_coverage_matrix(xs, ys, coverage_matrix, k_max=10):
+def partition_coverage_matrix(xs, ys, coverage_matrix, U=None, k_max=10):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
+
+    参数:
+        xs, ys: 坐标数组
+        coverage_matrix: 覆盖次数矩阵
+        U: 指定分区数量（可选）。若传入则直接使用，若为 None 则使用 Elbow 法则自动确定
+        k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
     """
     rows, cols = coverage_matrix.shape
+    n_samples = rows * cols
 
     # 1. 构建特征矩阵 (X坐标, Y坐标, 覆盖次数)
     # 注意：这里引入空间坐标是为了保证聚类结果在地理空间上的连续性
@@ -100,9 +107,22 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, k_max=10):
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(weighted_features)
 
-    # 3. 根据 Elbow 准则确定簇的数目 U
-    optimal_u = find_optimal_k_elbow(scaled_features, k_min=2, k_max=k_max)
-    print(f"根据 Elbow 准则确定的最优簇数目 U = {optimal_u} ")
+    # 3. 确定簇的数目 U
+    if U is not None:
+        # 验证 U 的合法性
+        if U < 2:
+            raise ValueError(f"分区数 U 必须 >= 2，当前传入 U={U}")
+        if U > n_samples - 1:
+            raise ValueError(
+                f"分区数 U={U} 超过数据点数 (n={n_samples})，"
+                f"KMeans 要求 n_clusters < n_samples"
+            )
+        optimal_u = U
+        print(f"[分区] 使用指定分区数量 U = {optimal_u}")
+    else:
+        # 使用 Elbow 法则自动确定
+        optimal_u = find_optimal_k_elbow(scaled_features, k_min=2, k_max=k_max)
+        print(f"[分区] 根据 Elbow 准则自动确定 U = {optimal_u} ")
 
     # 4. 对覆盖次数矩阵进行 K-means 空间聚类
     print(f"正在执行 K-means 聚类 (U={optimal_u})...")
