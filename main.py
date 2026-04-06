@@ -1,3 +1,4 @@
+import datetime
 import matplotlib
 
 matplotlib.use("Agg")
@@ -29,8 +30,14 @@ if __name__ == "__main__":
     )
     print(f"xs: {xs}\nys: {ys}")
 
-    # Phase 3: 分区
-    final_cluster_matrix, U = partition_coverage_matrix(xs, ys, coverage_matrix)
+    # 统一时间戳，确保所有输出在同一目录下
+    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_base = f"./multibeam/output/{current_time}"
+
+    # Phase 3: 分区（elbow 和 partition 图写入 output/<timestamp>/partition/）
+    final_cluster_matrix, U = partition_coverage_matrix(
+        xs, ys, coverage_matrix, output_dir=output_base
+    )
 
     # Phase 4: 测线规划（封装对象，即时指标）
     planner = SurveyPlanner(
@@ -42,6 +49,4 @@ if __name__ == "__main__":
         y_min=Y_MIN,
         y_max=Y_MAX,
     )
-    planner.plan_line(output_dir="./multibeam/output")
-    planner.save_metrics_excel("./multibeam/output")
-
+    planner.plan_line(8000,10,output_dir=output_base)

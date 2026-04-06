@@ -5,7 +5,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 
-def find_optimal_k_elbow(features, k_min=2, k_max=10):
+def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
     """
     根据 Elbow 准则自动寻找最优的簇数目 U
     使用"点到直线最大距离法"从数学上确定拐点
@@ -58,14 +58,17 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10):
     plt.ylabel("Inertia (WCSS)")
     plt.legend()
     plt.grid(True)
-    output_dir = Path("./multibeam/output/elbow")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_dir / "elbow_method.png", dpi=300, bbox_inches="tight")
+    if output_dir is not None:
+        elbow_dir = Path(output_dir) / "partition"
+        elbow_dir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(elbow_dir / "elbow_method.png", dpi=300, bbox_inches="tight")
     plt.close()
     return optimal_u
 
 
-def partition_coverage_matrix(xs, ys, coverage_matrix, U=None, k_max=10):
+def partition_coverage_matrix(
+    xs, ys, coverage_matrix, U=None, k_max=10, output_dir=None
+):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
 
@@ -74,6 +77,7 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, U=None, k_max=10):
         coverage_matrix: 覆盖次数矩阵
         U: 指定分区数量（可选）。若传入则直接使用，若为 None 则使用 Elbow 法则自动确定
         k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
+        output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
     """
     rows, cols = coverage_matrix.shape
     n_samples = rows * cols
@@ -121,7 +125,9 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, U=None, k_max=10):
         print(f"[分区] 使用指定分区数量 U = {optimal_u}")
     else:
         # 使用 Elbow 法则自动确定
-        optimal_u = find_optimal_k_elbow(scaled_features, k_min=2, k_max=k_max)
+        optimal_u = find_optimal_k_elbow(
+            scaled_features, k_min=2, k_max=k_max, output_dir=output_dir
+        )
         print(f"[分区] 根据 Elbow 准则自动确定 U = {optimal_u} ")
 
     # 4. 对覆盖次数矩阵进行 K-means 空间聚类
@@ -163,13 +169,14 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, U=None, k_max=10):
     # 防止坐标轴倒置（根据海图习惯，通常北向上，如果需要反转去掉此行即可）
     plt.gca().invert_yaxis()
     plt.colorbar(label="Cluster ID")
-    output_dir = Path("./multibeam/output/partition")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(
-        output_dir / f"partition_U={optimal_u}.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
+    if output_dir is not None:
+        partition_dir = Path(output_dir) / "partition"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(
+            partition_dir / f"partition_U={optimal_u}.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
     plt.close()
 
     return cluster_matrix, optimal_u

@@ -682,13 +682,42 @@ class SurveyPlanner:
     def plan_line(self, start_x, start_y, output_dir=None):
         """
         单分区测线规划（从指定起点开始）。
-        用于向后兼容旧 API。
+        根据输入点找到所属分区, 以该分区质心作为主测线实际起点。
+
+        输出结构（与 plan_all 一致）:
+            output/<timestamp>/
+              lines/
+                <partition_id>/
+                  line_0001_main.png
+                  line_0002_iter1.png
+                  ...
+                  plan_line_final.png
+                dot.csv
+              metrics/
+                metrics.xlsx
+              partition/
+                partition_U=?.png
+                elbow_method.png
         """
         if output_dir is None:
             output_dir = "./multibeam/output"
-        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        lines_dir = Path(output_dir) / "lines" / current_time
-        dot_dir = Path(output_dir) / "dot" / current_time
+
+        output_path = Path(output_dir)
+        is_timestamped = len(output_path.name) == 15 and output_path.name[8] == "_"
+
+        if is_timestamped:
+            run_dir = output_path
+        else:
+            current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = output_path / current_time
+
+        lines_dir = run_dir / "lines"
+        metrics_dir = run_dir / "metrics"
+        partition_dir = run_dir / "partition"
+
+        lines_dir.mkdir(parents=True, exist_ok=True)
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        partition_dir.mkdir(parents=True, exist_ok=True)
 
         target_partition_id = get_partition_for_point(
             start_x,
@@ -703,12 +732,34 @@ class SurveyPlanner:
         )
         print(f"[测线规划] 目标分区ID: {target_partition_id}")
 
+        # 使用分区质心作为主测线实际起点
+        rows, cols = np.where(self.cluster_matrix == target_partition_id)
+        if len(rows) == 0:
+            print(f"[分区{target_partition_id}] 未找到有效网格点, 跳过")
+            return PartitionResult(target_partition_id, [], [], 0.0, 0.0)
+        centroid_x = float(np.mean(self.xs[cols]))
+        centroid_y = float(np.mean(self.ys[rows]))
+        print(
+            f"[测线规划] 使用分区质心作为主测线起点: ({centroid_x:.1f}, {centroid_y:.1f})"
+        )
+
+        pid_dir = lines_dir / str(target_partition_id)
+        pid_dir.mkdir(parents=True, exist_ok=True)
+
         result = self._plan_partition(
             partition_id=target_partition_id,
-            lines_dir=lines_dir,
-            dot_dir=dot_dir,
+            lines_dir=pid_dir,
+            dot_dir=pid_dir,
             t0=time.time(),
         )
+
+        # 保存 dot.csv 到 lines/
+        _save_dot_csv(result.lines, lines_dir)
+
+        # 保存指标
+        self.save_metrics_excel(metrics_dir=metrics_dir)
+
+        print(f"[测线规划完成] 输出目录: {run_dir}")
         return result
 
     def plan_all(self, output_dir=None):
@@ -716,56 +767,78 @@ class SurveyPlanner:
         自动遍历所有分区, 每个分区以质心为起点规划测线.
 
         输出结构:
-            output/
-              lines/<timestamp>/
-                partition_0/
+            output/<timestamp>/
+              lines/
+                <partition_id>/
                   line_0001_main.png
                   line_0002_iter1.png
                   ...
                   plan_line_final.png
-                partition_1/
-                  ...
-                all_partitions_final.png
-              dot/<timestamp>/
-                partition_0/dot.csv
-                partition_1/dot.csv
                 dot.csv
+              metrics/
+                metrics.xlsx
+              partition/
+                partition_U=?.png
+                elbow_method.png
+
+        注意: 如果 output_dir 已包含时间戳子目录(格式 YYYYMMDD_HHMMSS),
+        则直接使用该目录作为输出根目录, 不再额外创建时间戳层.
         """
         if output_dir is None:
             output_dir = "./multibeam/output"
 
-        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = Path(output_dir)
-        lines_parent = output_path / "lines" / current_time
-        dot_parent = output_path / "dot" / current_time
+        # 检测路径末段是否已是时间戳格式
+        is_timestamped = len(output_path.name) == 15 and output_path.name[8] == "_"
+
+        if is_timestamped:
+            # 已包含时间戳, 直接作为输出根目录
+            run_dir = output_path
+        else:
+            # 未包含时间戳, 创建时间戳子目录
+            current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = output_path / current_time
+
+        lines_dir = run_dir / "lines"
+        metrics_dir = run_dir / "metrics"
+        partition_dir = run_dir / "partition"
+
+        lines_dir.mkdir(parents=True, exist_ok=True)
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        partition_dir.mkdir(parents=True, exist_ok=True)
 
         partition_ids = sorted(np.unique(self.cluster_matrix).astype(int))
         print(f"[全局规划] 检测到 {len(partition_ids)} 个分区: {partition_ids}")
-        print(f"[全局规划] 输出根目录: {lines_parent}")
+        print(f"[全局规划] 输出根目录: {run_dir}")
 
         all_partition_results: list[PartitionResult] = []
 
         for pid in partition_ids:
-            lines_dir = lines_parent / f"partition_{pid}"
-            dot_dir = dot_parent / f"partition_{pid}"
+            pid_dir = lines_dir / str(pid)
+            pid_dir.mkdir(parents=True, exist_ok=True)
 
             t0 = time.time()
             result = self._plan_partition(
                 partition_id=pid,
-                lines_dir=lines_dir,
-                dot_dir=dot_dir,
+                lines_dir=pid_dir,
+                dot_dir=pid_dir,
                 t0=t0,
             )
             all_partition_results.append(result)
 
-        # 绘制所有区域合起来的最终测线图
-        self._draw_merged_lines(all_partition_results, partition_ids, lines_parent)
+        # 合并所有分区 dot.csv 到 lines/dot.csv
+        flat_all_lines = [line for r in all_partition_results for line in r.lines]
+        _save_dot_csv(flat_all_lines, lines_dir)
 
-        # 保存所有测线点
-        self._save_all_dots(all_partition_results, dot_parent)
+        # 绘制所有区域合起来的最终测线图
+        self._draw_merged_lines(all_partition_results, partition_ids, lines_dir)
+
+        # 保存指标
+        self.save_metrics_excel(metrics_dir=metrics_dir)
 
         total_lines = sum(len(r.records) for r in all_partition_results)
         print(f"[全局规划完成] 共 {len(partition_ids)} 个分区 | {total_lines} 条测线")
+        print(f"[全局规划完成] 输出目录: {run_dir}")
 
         return all_partition_results
 
@@ -843,8 +916,7 @@ class SurveyPlanner:
         print(f"  合并最终图: {all_final_path}")
 
     def _save_all_dots(self, all_results, dot_parent):
-        """合并所有分区 dot.csv"""
-        dot_parent.mkdir(parents=True, exist_ok=True)
+        """合并所有分区 dot.csv（已废弃，dot.csv 现在直接写入 lines_dir）"""
         flat_all_lines = [line for r in all_results for line in r.lines]
         _save_dot_csv(flat_all_lines, dot_parent)
         print(f"  全部测线点: {dot_parent / 'dot.csv'}")
@@ -853,18 +925,21 @@ class SurveyPlanner:
     # Metrics output (reads from instant records, no recalculation)
     # ------------------------------------------------------------------
 
-    def save_metrics_excel(self, output_dir=None, current_time=None):
+    def save_metrics_excel(self, output_dir=None, current_time=None, metrics_dir=None):
         """
         从已记录的指标直接生成 Excel，不重新计算。
+        优先使用 metrics_dir；若未传则回退到 output_dir/current_time 结构。
         """
         import pandas as pd
 
-        if output_dir is None:
-            output_dir = "./multibeam/output"
-        if current_time is None:
-            current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        metrics_dir = Path(output_dir) / "metrics" / current_time
+        if metrics_dir is not None:
+            metrics_dir = Path(metrics_dir)
+        else:
+            if output_dir is None:
+                output_dir = "./multibeam/output"
+            if current_time is None:
+                current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            metrics_dir = Path(output_dir) / "metrics" / current_time
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
         partition_rows = []
