@@ -22,7 +22,7 @@ def calculate_optimal_mesh_size(data_path, min_error=0.001):
     A = np.pi * xi**2
 
     print(f"xi: {xi:.2f}, A: {A:.2f}")
-    # 2. 设定控制精度的目标误差阈值 (例如 1% 的相对误差)
+    # 2. 设定控制精度的目标误差阈值 (默认 0.1% 的相对误差)
     error_threshold = min_error
 
     # 3. 初始化寻优参数
@@ -72,49 +72,64 @@ def calculate_optimal_mesh_size(data_path, min_error=0.001):
     return optimal_d
 
 
-def adjust_mesh_size_to_fit_domain(d_optimal, x_range, y_range, tolerance=0.05):
+def generate_coordinate_array(x_min, x_max, y_min, y_max, d):
     """
-    找到最接近 d_optimal 且能整除海域尺寸的网格边长。
+    使用固定步长 d 生成覆盖整个海域的坐标数组。
 
-    通过调整分段数，使网格边长恰好整除 X 和 Y 方向的海域范围，
-    保证 xs[-1] == x_max, ys[-1] == y_max，面积计算精确。
+    采用 arange 策略：以 d 为步长从起点生成坐标，末端自然延伸
+    确保覆盖整个海域。超出海域边界的网格在后续计算中通过掩码过滤。
+
+    优势:
+        - 网格间距严格等于 d，几何精度不受损
+        - 天然覆盖整个海域，无需妥协 d 的值（不受质数问题影响）
+        - 末端超出的网格通过掩码自动过滤，不影响面积计算
 
     参数:
-        d_optimal: 原始最优网格边长（仅考虑几何精度）
-        x_range: X 方向海域宽度 (x_max - x_min)
-        y_range: Y 方向海域长度 (y_max - y_min)
-        tolerance: 允许偏离 d_optimal 的最大比例（默认 5%）
+        x_min, x_max: X 方向海域边界
+        y_min, y_max: Y 方向海域边界
+        d: 最优网格边长（直接使用，不做妥协调整）
 
     返回:
-        d_aligned: 对齐后的网格边长
+        xs: X 坐标数组 (一维, 间距严格等于 d)
+        ys: Y 坐标数组 (一维, 间距严格等于 d)
+        boundary_mask: 二维布尔掩码 (rows x cols), True 表示网格中心在海域内
     """
-    n_x_ideal = x_range / d_optimal
-    n_y_ideal = y_range / d_optimal
+    # arange 右端 +d 确保末端网格中心能覆盖到边界
+    xs = np.arange(x_min, x_max + d, d)
+    ys = np.arange(y_min, y_max + d, d)
 
-    candidates = []
-    for n_x in range(max(1, int(n_x_ideal) - 10), int(n_x_ideal) + 11):
-        for n_y in range(max(1, int(n_y_ideal) - 10), int(n_y_ideal) + 11):
-            # 取较小的 d 保证两个方向都能恰好覆盖
-            d = min(x_range / n_x, y_range / n_y)
-            deviation = abs(d - d_optimal) / d_optimal
-            if deviation <= tolerance:
-                candidates.append((deviation, d, n_x, n_y))
+    # 生成网格中心坐标
+    grid_x, grid_y = np.meshgrid(xs, ys)
 
-    if not candidates:
-        # 放宽 tolerance 重试
-        return adjust_mesh_size_to_fit_domain(
-            d_optimal, x_range, y_range, tolerance + 0.05
-        )
-
-    # 选偏离 optimal_d 最小的候选
-    candidates.sort()
-    _, d_best, n_x, n_y = candidates[0]
-    print(
-        f"网格对齐: d_optimal={d_optimal:.2f} → d_aligned={d_best:.2f}m "
-        f"(X分{n_x}段, Y分{n_y}段, 偏差{abs(d_best - d_optimal) / d_optimal:.2%})"
+    # 边界掩码：网格中心在海域范围内（允许半个网格的容差）
+    half_d = d / 2
+    boundary_mask = (
+        (grid_x >= x_min - half_d)
+        & (grid_x <= x_max + half_d)
+        & (grid_y >= y_min - half_d)
+        & (grid_y <= y_max + half_d)
     )
-    return d_best
+
+    effective_cells = np.sum(boundary_mask)
+    total_cells = len(xs) * len(ys)
+    print(
+        f"坐标数组: X方向{len(xs)}点, Y方向{len(ys)}点, "
+        f"有效网格{effective_cells}/{total_cells} "
+        f"(末端超出{total_cells - effective_cells}个网格将被过滤)"
+    )
+
+    return xs, ys, boundary_mask
 
 
 if __name__ == "__main__":
-    print(calculate_optimal_mesh_size(Path(__file__).parents[1] / "data" / "data.xlsx"))
+    d_optimal = calculate_optimal_mesh_size(
+        Path(__file__).parents[1] / "data" / "data.xlsx"
+    )
+
+    if d_optimal:
+        # 测试新坐标生成方案
+        X_MIN, X_MAX = 0, 5 * 1852
+        Y_MIN, Y_MAX = 0, 4 * 1852
+        xs, ys, mask = generate_coordinate_array(X_MIN, X_MAX, Y_MIN, Y_MAX, d_optimal)
+        print(f"xs 范围: [{xs[0]:.2f}, {xs[-1]:.2f}], 间距: {xs[1] - xs[0]:.2f}")
+        print(f"ys 范围: [{ys[0]:.2f}, {ys[-1]:.2f}], 间距: {ys[1] - ys[0]:.2f}")

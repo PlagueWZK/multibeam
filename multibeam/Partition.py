@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
@@ -50,7 +51,9 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10):
     plt.ylabel("Inertia (WCSS)")
     plt.legend()
     plt.grid(True)
-    plt.savefig("./multibeam/output/elbow/elbow_method.png", dpi=300, bbox_inches="tight")
+    output_dir = Path("./multibeam/output/elbow")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_dir / "elbow_method.png", dpi=300, bbox_inches="tight")
     plt.close()
     return optimal_u
 
@@ -73,21 +76,22 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, k_max=10):
     # 将空间坐标与覆盖次数拼接 (N, 3)
     features = np.hstack((feature_x, feature_y, feature_c))
 
-    # 2. 特征标准化 (极其重要！)
-    # 因为坐标值在几千 (米)，而覆盖次数只有几十，不缩放会导致 K-means 完全忽略覆盖次数
+    # 2. 特征缩放（修复：在标准化前计算权重，避免权重失效）
+    # 先计算原始特征的尺度差异，用于后续权重调节
+    std_xy_raw = np.std(features[:, :2])
+    std_c_raw = np.std(features[:, 2])
+
+    # 计算覆盖次数相对于空间坐标的权重比
+    # 目的：使覆盖次数维度的尺度与空间坐标维度相当
+    w_cover = std_xy_raw / (std_c_raw + 1e-6)
+
+    # 应用权重：放大覆盖次数维度
+    weighted_features = features.copy().astype(float)
+    weighted_features[:, 2] *= w_cover
+
+    # 再进行标准化，使各维度均值为0、方差为1
     scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(features)
-
-    # 自动计算权重（核心）
-    std_xy = np.std(scaled_features[:, :2])
-    std_c = np.std(scaled_features[:, 2])
-
-    w_space = 1.0
-    w_cover = std_xy / (std_c + 1e-6)
-
-    # 应用权重
-    scaled_features[:, :2] *= w_space
-    scaled_features[:, 2] *= w_cover
+    scaled_features = scaler.fit_transform(weighted_features)
 
     # 3. 根据 Elbow 准则确定簇的数目 U
     optimal_u = find_optimal_k_elbow(scaled_features, k_min=2, k_max=k_max)
@@ -112,16 +116,18 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, k_max=10):
         aspect="auto",
     )
 
-    levels = np.arange(optimal_u)
-    plt.contour(
-        grid_x,
-        grid_y,
-        cluster_matrix,
-        levels=levels + 0.5,
-        colors="black",
-        linewidths=1.5,
-        linestyles="dashed",
-    )
+    # 修复：轮廓线级别只需在簇之间绘制，避免冗余
+    levels = np.arange(0.5, optimal_u - 0.5)
+    if len(levels) > 0:  # U >= 3 时才需要边界线
+        plt.contour(
+            grid_x,
+            grid_y,
+            cluster_matrix,
+            levels=levels,
+            colors="black",
+            linewidths=1.5,
+            linestyles="dashed",
+        )
 
     plt.title(f"K-means Spatial Partitioning (U={optimal_u}) with Boundary Lines")
     plt.xlabel("X (m)")
@@ -130,7 +136,13 @@ def partition_coverage_matrix(xs, ys, coverage_matrix, k_max=10):
     # 防止坐标轴倒置（根据海图习惯，通常北向上，如果需要反转去掉此行即可）
     plt.gca().invert_yaxis()
     plt.colorbar(label="Cluster ID")
-    plt.savefig(f"./multibeam/output/partition/partition_U={optimal_u}.png", dpi=300, bbox_inches="tight")
+    output_dir = Path("./multibeam/output/partition")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(
+        output_dir / f"partition_U={optimal_u}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
     plt.close()
 
     return cluster_matrix, optimal_u

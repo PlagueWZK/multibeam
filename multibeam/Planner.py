@@ -134,7 +134,19 @@ class SurveyPlanner:
         "#17becf",
     ]
 
-    def __init__(self, xs, ys, cluster_matrix, step=50, theta=120, n=0.1):
+    def __init__(
+        self,
+        xs,
+        ys,
+        cluster_matrix,
+        step=50,
+        theta=120,
+        n=0.1,
+        x_min=None,
+        x_max=None,
+        y_min=None,
+        y_max=None,
+    ):
         self.xs = xs
         self.ys = ys
         self.cluster_matrix = cluster_matrix
@@ -143,10 +155,11 @@ class SurveyPlanner:
         self.theta_rad = np.radians(theta)
         self.n = n
 
-        self.x_min = float(xs[0])
-        self.x_max = float(xs[-1])
-        self.y_min = float(ys[0])
-        self.y_max = float(ys[-1])
+        # 支持传入真实海域边界（arange 策略下 xs[-1] 可能超出真实边界）
+        self.x_min = float(x_min) if x_min is not None else float(xs[0])
+        self.x_max = float(x_max) if x_max is not None else float(xs[-1])
+        self.y_min = float(y_min) if y_min is not None else float(ys[0])
+        self.y_max = float(y_max) if y_max is not None else float(ys[-1])
         self.total_area = (self.x_max - self.x_min) * (self.y_max - self.y_min)
 
         # Instant metric storage
@@ -911,7 +924,7 @@ def plan_line(start_x, start_y, xs, ys, cluster_matrix, n=0.1, step=50, theta=12
     return planner.plan_line(start_x, start_y)
 
 
-def plan_all_line(xs, ys, cluster_matrix, n=0.1, step=50, theta=120, total_area=None):
+def plan_all_line(xs, ys, cluster_matrix, n=0.1, step=50, theta=120):
     """向后兼容: 全局测线规划"""
     planner = SurveyPlanner(xs, ys, cluster_matrix, theta=theta, n=n, step=step)
     results = planner.plan_all()

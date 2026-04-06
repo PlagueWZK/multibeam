@@ -6,43 +6,59 @@ from tool import Data
 def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
     """
     根据最优网格边长 d 和预测模型，重新生成指定范围的海域深度矩阵。
-    使用 linspace 保证端点精确对齐: xs[-1] == x_max, ys[-1] == y_max
-    """
-    # 计算分段数（d 已通过 adjust_mesh_size_to_fit_domain 对齐，应恰好整除）
-    n_cols = int(round((x_max - x_min) / d))
-    n_rows = int(round((y_max - y_min) / d))
+    使用 arange 策略：以 d 为固定步长生成坐标，末端自然延伸覆盖整个海域。
 
-    xs = np.linspace(x_min, x_max, n_cols + 1)
-    ys = np.linspace(y_min, y_max, n_rows + 1)
+    优势：
+        - 网格间距严格等于 d，几何精度不受损
+        - 天然覆盖整个海域，不受质数/整除问题影响
+        - 末端超出海域的网格通过 boundary_mask 过滤
+
+    返回:
+        xs: X 坐标数组 (间距严格等于 d)
+        ys: Y 坐标数组 (间距严格等于 d)
+        Z: 深度矩阵 (rows x cols)
+        boundary_mask: 二维布尔掩码，True 表示网格在海域内
+    """
+    from multibeam.GridCell import generate_coordinate_array
+
+    xs, ys, boundary_mask = generate_coordinate_array(x_min, x_max, y_min, y_max, d)
 
     rows = len(ys)
     cols = len(xs)
     Z = np.zeros((rows, cols))
 
     print(f"正在使用模型生成重采样网格 (维度: {rows} x {cols}, 网格边长: {d:.2f}m)...")
-    print(f"  X 范围: [{xs[0]:.2f}, {xs[-1]:.2f}] ({n_cols} 段)")
-    print(f"  Y 范围: [{ys[0]:.2f}, {ys[-1]:.2f}] ({n_rows} 段)")
+    print(
+        f"  X 范围: [{xs[0]:.2f}, {xs[-1]:.2f}] (实际海域: [{x_min:.2f}, {x_max:.2f}])"
+    )
+    print(
+        f"  Y 范围: [{ys[0]:.2f}, {ys[-1]:.2f}] (实际海域: [{y_min:.2f}, {y_max:.2f}])"
+    )
 
     # 遍历所有网格中心，预测深度
     for i in range(rows):
         for j in range(cols):
             Z[i, j] = Data.get_height(xs[j], ys[i])
 
-    return xs, ys, Z
+    return xs, ys, Z, boundary_mask
 
 
 def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
     """
     结合机器学习深度预测模型和最优网格 d，计算覆盖次数矩阵。
     """
-    # 1. 调用模型重采样，获取全新的 Z 矩阵
-    xs, ys, Z = generate_resampled_grid(x_min, x_max, y_min, y_max, d)
+    # 1. 调用模型重采样，获取全新的 Z 矩阵和边界掩码
+    xs, ys, Z, boundary_mask = generate_resampled_grid(x_min, x_max, y_min, y_max, d)
 
     rows, cols = Z.shape
     times_mat = np.zeros((rows, cols), dtype=int)
 
     # 2. 获取全局最大水深，计算覆盖邻域边界
-    max_depth = np.max(Z)
+    # 仅使用海域内的有效深度
+    valid_depths = Z[boundary_mask]
+    if len(valid_depths) == 0:
+        raise ValueError("边界掩码内无有效网格，请检查坐标范围与网格边长 d 的设置。")
+    max_depth = np.max(valid_depths)
     # 根据现有测量标准考虑先验海图最大水深计算最大有效测深宽度 [cite: 38]
     w_max = max_depth * np.tan(np.radians(theta / 2)) * 2
 
@@ -56,6 +72,10 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
     # 3. 遍历每一个网格进行邻域覆盖判定
     for i in range(rows):
         for j in range(cols):
+            # 跳过海域范围外的网格
+            if not boundary_mask[i, j]:
+                continue
+
             D_center = Z[i, j]
 
             # 限定局部邻域边界 (防止搜出数组越界)
@@ -89,7 +109,7 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
                 theta_rad = np.radians(theta)
                 # 2. 计算带符号的真实坡度角 alpha_signed
                 # 使用反正切 arctan(垂直高度差 / 水平距离)
-                # 注意：前提是 Z 矩阵代表“深度”(越大越深)。若 Z 代表“海拔高度”(越小越深)，则需写成 (Z_neighbor - D_center)
+                # 注意：前提是 Z 矩阵代表"深度"(越大越深)。若 Z 代表"海拔高度"(越小越深)，则需写成 (Z_neighbor - D_center)
                 alpha_signed = np.arctan((D_center - Z_neighbor) / dis_xoy)
 
                 # 3. 统一使用一套公式，符号会自动调节加减

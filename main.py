@@ -4,7 +4,6 @@ matplotlib.use("Agg")
 
 from multibeam.GridCell import (
     calculate_optimal_mesh_size,
-    adjust_mesh_size_to_fit_domain,
 )
 from multibeam.Coverage import calculate_coverage_matrix_with_ml
 from multibeam.Planner import SurveyPlanner
@@ -17,17 +16,16 @@ if __name__ == "__main__":
     X_MIN, X_MAX = 0, 5 * 1852
     Y_MIN, Y_MAX = 0, 4 * 1852
 
-    # Phase 1: 最优网格 + 对齐
+    # Phase 1: 最优网格（arange 策略，d 保持原始值不变）
     d_optimal = calculate_optimal_mesh_size(DATA_DIR)
-    d_aligned = adjust_mesh_size_to_fit_domain(d_optimal, X_MAX - X_MIN, Y_MAX - Y_MIN)
 
-    # Phase 2: 覆盖矩阵
+    # Phase 2: 覆盖矩阵（内部使用 arange 生成坐标 + 边界掩码过滤）
     xs, ys, depth_matrix, coverage_matrix = calculate_coverage_matrix_with_ml(
         x_min=X_MIN,
         x_max=X_MAX,
         y_min=Y_MIN,
         y_max=Y_MAX,
-        d=d_aligned,
+        d=d_optimal,
     )
     print(f"xs: {xs}\nys: {ys}")
 
@@ -35,6 +33,15 @@ if __name__ == "__main__":
     final_cluster_matrix, U = partition_coverage_matrix(xs, ys, coverage_matrix)
 
     # Phase 4: 测线规划（封装对象，即时指标）
-    planner = SurveyPlanner(xs, ys, final_cluster_matrix)
+    planner = SurveyPlanner(
+        xs,
+        ys,
+        final_cluster_matrix,
+        x_min=X_MIN,
+        x_max=X_MAX,
+        y_min=Y_MIN,
+        y_max=Y_MAX,
+    )
     planner.plan_all(output_dir="./multibeam/output")
     planner.save_metrics_excel("./multibeam/output")
+
