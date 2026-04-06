@@ -1,4 +1,5 @@
 import datetime
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -36,9 +37,10 @@ if __name__ == "__main__":
 
     # Phase 3: 分区（elbow 和 partition 图写入 output/<timestamp>/partition/）
     final_cluster_matrix, U = partition_coverage_matrix(
-        xs, ys, coverage_matrix, output_dir=output_base
+        xs, ys, coverage_matrix, output_dir=output_base, U=40
     )
 
+    print(f"U= {U}")
     # Phase 4: 测线规划（封装对象，即时指标）
     planner = SurveyPlanner(
         xs,
@@ -49,4 +51,4 @@ if __name__ == "__main__":
         y_min=Y_MIN,
         y_max=Y_MAX,
     )
-    planner.plan_line(8000,10,output_dir=output_base)
+    planner.plan_line(1000, 1000, output_dir=output_base)

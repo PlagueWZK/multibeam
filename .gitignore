@@ -3,7 +3,7 @@
 *.xlsx
 /local/
 output/
-
+/outputs/
 *.png
 
 __pycache__/

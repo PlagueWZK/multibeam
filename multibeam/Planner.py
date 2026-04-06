@@ -1,16 +1,22 @@
+"""
+测线规划核心模块（重构版）
+
+本模块负责测线生成的核心调度逻辑。
+数据类、几何计算和可视化逻辑已拆分到独立模块。
+"""
+
 import copy
 import datetime
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
-from multibeam.Partition import (
-    get_partition_for_point,
-    is_point_in_partition,
-)
+# 从拆分后的模块导入
+from multibeam.models import LineRecord, PartitionResult, TerminationReason
+from multibeam.Partition import get_partition_for_point, is_point_in_partition
+from multibeam.planner_utils import compute_total_turning_angle
+from multibeam.planner_visualizer import SurveyVisualizer, save_dot_csv
 from tool.Data import (
     figure_length,
     figure_width,
@@ -22,117 +28,16 @@ from tool.Data import (
     get_w_left,
     get_w_right,
 )
-
-# ---------------------------------------------------------------------------
-# Data classes for instant metric recording
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class LineRecord:
-    """单条测线的即时指标记录"""
-
-    line_id: int
-    partition_id: int
-    points: np.ndarray  # [N, 3] = [x, y, w_total]
-    length: float
-    coverage: float
-    terminated_by: str  # "boundary" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
-
-
-@dataclass
-class PartitionResult:
-    """单个分区的规划结果"""
-
-    partition_id: int
-    lines: list[np.ndarray]  # 原始 line 数组（用于绘图）
-    records: list[LineRecord]  # 指标记录
-    total_length: float
-    total_coverage: float
+from tool.geometry import check_line_intersection_shapely
 
 
 # ---------------------------------------------------------------------------
-# Helper functions (unchanged algorithm logic)
-# ---------------------------------------------------------------------------
-
-
-def _save_dot_csv(all_lines, dot_dir):
-    dot_dir.mkdir(parents=True, exist_ok=True)
-    dot_path = dot_dir / "dot.csv"
-    with open(dot_path, "w", encoding="utf-8") as f:
-        f.write("line_id,x,y\n")
-        for line_id, line in enumerate(all_lines):
-            for pt in line:
-                f.write(f"{line_id},{pt[0]:.2f},{pt[1]:.2f}\n")
-    return dot_path
-
-
-def _compute_signed_angle(v1, v2):
-    """计算从向量v1到v2的带符号夹角（弧度），逆时针为正"""
-    dot = v1[0] * v2[0] + v1[1] * v2[1]
-    cross = v1[0] * v2[1] - v1[1] * v2[0]
-    return np.arctan2(cross, dot)
-
-
-def _compute_total_turning_angle(line_arr):
-    """
-    计算整条测线的累计偏转角（所有相邻线段夹角之和）。
-    输入为 numpy 数组 [N, 3]，避免重复转换。
-    """
-    if len(line_arr) < 3:
-        return 0.0
-    total = 0.0
-    for i in range(len(line_arr) - 2):
-        v1 = line_arr[i + 1] - line_arr[i]
-        v2 = line_arr[i + 2] - line_arr[i + 1]
-        total += _compute_signed_angle(v1, v2)
-    return total
-
-
-def _point_to_segment_distance(px, py, x1, y1, x2, y2):
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return np.sqrt((px - x1) ** 2 + (py - y1) ** 2)
-    t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
-    proj_x = x1 + t * dx
-    proj_y = y1 + t * dy
-    return np.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
-
-
-def _check_line_intersection(point, line, threshold):
-    if line is None or len(line) < 2:
-        return False
-    px, py = point[0], point[1]
-    for i in range(len(line) - 1):
-        x1, y1 = line[i][0], line[i][1]
-        x2, y2 = line[i + 1][0], line[i + 1][1]
-        dist = _point_to_segment_distance(px, py, x1, y1, x2, y2)
-        if dist < threshold:
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# SurveyPlanner — fully encapsulated
+# SurveyPlanner — 测线规划核心类
 # ---------------------------------------------------------------------------
 
 
 class SurveyPlanner:
     """测线规划器：封装分区测线生成与即时指标记录"""
-
-    PARTITION_COLORS = [
-        "#1f77b4",
-        "#ff7f0e",
-        "#2ca02c",
-        "#d62728",
-        "#9467bd",
-        "#8c564b",
-        "#e377c2",
-        "#7f7f7f",
-        "#bcbd22",
-        "#17becf",
-    ]
 
     def __init__(
         self,
@@ -155,19 +60,24 @@ class SurveyPlanner:
         self.theta_rad = np.radians(theta)
         self.n = n
 
-        # 支持传入真实海域边界（arange 策略下 xs[-1] 可能超出真实边界）
+        # 支持传入真实海域边界
         self.x_min = float(x_min) if x_min is not None else float(xs[0])
         self.x_max = float(x_max) if x_max is not None else float(xs[-1])
         self.y_min = float(y_min) if y_min is not None else float(ys[0])
         self.y_max = float(y_max) if y_max is not None else float(ys[-1])
         self.total_area = (self.x_max - self.x_min) * (self.y_max - self.y_min)
 
-        # Instant metric storage
+        # 即时指标存储
         self.all_records: list[LineRecord] = []
         self._line_counter = 0
 
+        # 初始化可视化器
+        self.visualizer = SurveyVisualizer(
+            xs, ys, cluster_matrix, self.x_min, self.x_max, self.y_min, self.y_max
+        )
+
     # ------------------------------------------------------------------
-    # Internal helpers
+    # 内部辅助方法
     # ------------------------------------------------------------------
 
     def _is_in_partition(self, x, y, partition_id):
@@ -204,15 +114,86 @@ class SurveyPlanner:
         self._line_counter += 1
         return record
 
+    def _point_with_width(self, x, y):
+        """返回 [x, y, 覆盖宽度(w_left + w_right)]，用于后续快速计算覆盖面积"""
+        return [x, y, get_w_left(x, y, self.theta) + get_w_right(x, y, self.theta)]
+
+    def _evaluate_termination(
+        self,
+        line: np.ndarray,
+        new_point: np.ndarray,
+        prev_lines: list[np.ndarray],
+        in_convergence_state: bool,
+        parent_line_length: float,
+    ) -> TerminationReason:
+        """
+        评估测线终止原因
+
+        参数:
+            line: 当前测线（包含新点）
+            new_point: 最新添加的点
+            prev_lines: 历史测线列表
+            in_convergence_state: 是否处于收敛状态
+            parent_line_length: 父测线长度
+
+        返回:
+            TerminationReason: 终止原因枚举
+        """
+        # 1. 检查累计偏转角（螺旋终止）
+        total_angle = compute_total_turning_angle(line)
+        if abs(total_angle) > 2 * np.pi:
+            return TerminationReason.SPIRAL
+
+        # 2. 检查测线相交（迷路终止）
+        if len(line) >= 2 and prev_lines:
+            # 检查最后两个点组成的线段是否与历史测线相交
+            if check_line_intersection_shapely(line[-2], line[-1], prev_lines):
+                return TerminationReason.INTERSECTION
+
+        # 3. 检查测线退化（点数过少）
+        if len(line) < 5:
+            return TerminationReason.DEGRADATION
+
+        # 4. 检查测线饱和（收敛状态下）
+        if in_convergence_state:
+            current_length = figure_length(line)
+            if current_length < parent_line_length:
+                # 计算质心到最近点的距离
+                centroid = np.mean(line, axis=0)
+                dists = np.sqrt(
+                    (line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2
+                )
+                min_dist = np.min(dists)
+                nearest_idx = np.argmin(dists)
+                nearest_point = line[nearest_idx]
+
+                # 计算内侧覆盖宽度
+                gx_val = get_gx(nearest_point[0], nearest_point[1])
+                gy_val = get_gy(nearest_point[0], nearest_point[1])
+                to_centroid = centroid[:2] - nearest_point[:2]
+                grad_dir = np.array([gx_val, gy_val])
+
+                dot_product = np.dot(grad_dir, to_centroid)
+                inner_width = (
+                    get_w_right(nearest_point[0], nearest_point[1], self.theta)
+                    if dot_product > 0
+                    else get_w_left(nearest_point[0], nearest_point[1], self.theta)
+                )
+
+                if min_dist < inner_width:
+                    return TerminationReason.SATURATION
+
+        return TerminationReason.NONE
+
     # ------------------------------------------------------------------
-    # Core line generation (algorithm unchanged)
+    # 核心测线生成算法
     # ------------------------------------------------------------------
 
     def _extend_line_bidirectional(self, start_x, start_y, target_partition_id, step):
         """
-        双向延伸生成主测线: 从起点向正反两个方向交替延伸,
-        使用整条测线的累计偏转角法检测环形/螺旋.
-        由于是第一条测线, 不进行与其他测线相交的检查.
+        双向延伸生成主测线
+
+        从起点向正反两个方向交替延伸，使用累计偏转角法检测环形/螺旋。
         """
         line = [self._point_with_width(start_x, start_y)]
 
@@ -223,7 +204,7 @@ class SurveyPlanner:
         front_stopped = False
         back_stopped = False
         extend_front = True
-        ring_closed = False
+        terminated_reason = TerminationReason.NONE
 
         while True:
             if front_stopped and back_stopped:
@@ -267,13 +248,13 @@ class SurveyPlanner:
             else:
                 line.insert(0, new_point)
 
+            # 检查终止条件
             line_arr = np.array(line)
-            total_angle = _compute_total_turning_angle(line_arr)
-            if abs(total_angle) > 2 * np.pi:
-                print(
-                    f"  [主测线延伸] 累计偏转角{np.degrees(total_angle):.1f}° > 360°，螺旋终止"
-                )
-                ring_closed = True
+            reason = self._evaluate_termination(line_arr, new_point, [], False, 0.0)
+
+            if reason == TerminationReason.SPIRAL:
+                print(f"  [主测线延伸] 累计偏转角 > 360°，螺旋终止")
+                terminated_reason = reason
                 break
 
             if extend_front:
@@ -284,10 +265,17 @@ class SurveyPlanner:
             extend_front = not extend_front
 
         line = np.array(line)
-        status = "环形闭合" if ring_closed else "边界终止"
-        terminated_by = "spiral" if ring_closed else "boundary"
+        status = (
+            "环形闭合" if terminated_reason == TerminationReason.SPIRAL else "边界终止"
+        )
+        terminated_by = (
+            terminated_reason.name.lower()
+            if terminated_reason != TerminationReason.NONE
+            else "boundary"
+        )
         print(
-            f"[主测线1] 完成 | 共{len(line)}个点 | {status} | 起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})"
+            f"[主测线1] 完成 | 共{len(line)}个点 | {status} | "
+            f"起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})"
         )
         return line, terminated_by
 
@@ -302,26 +290,27 @@ class SurveyPlanner:
         partition_id,
         draw_first_line=True,
     ):
+        """生成垂直扩展测线"""
         line = copy.deepcopy(main_line)
         prev_lines = [main_line.copy()]
         in_convergence_state = False
         parent_line_length = figure_length(main_line)
         perp_iter = 0
         total_points = 0
-        intersection_terminated = False
 
         direction_name = "正向" if direction == 1 else "反向"
         print(f"\n[{direction_name}扩展] 开始从主测线扩展...")
 
         while True:
             perp_iter += 1
-
             t1 = []
 
+            # 计算下一轮测线点
             for i in line:
                 x, y = i[0], i[1]
                 alpha = get_alpha(x, y)
                 h = get_height(x, y)
+
                 if alpha <= 0.005:
                     d = 2 * h * np.tan(self.theta_rad / 2) * (1 - self.n)
                     tx = d * get_gx(x, y)
@@ -346,18 +335,21 @@ class SurveyPlanner:
                 if self._is_in_partition(new_x, new_y, target_partition_id):
                     t1.append(self._point_with_width(new_x, new_y))
 
+            # 绘制中间过程
             if len(line) > 5 and (draw_first_line or perp_iter > 1):
-                plt.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
+                self.visualizer.draw_light_line(line)
 
             elapsed = time.time() - t0
             print(
                 f"[{direction_name}扩展 第{perp_iter}轮] 当前{len(line)}点 -> 新增{len(t1)}有效点 | 已耗时{elapsed:.1f}s"
             )
 
+            # 检查空测线
             if len(t1) == 0:
                 print(f"[{direction_name}扩展] 第{perp_iter}轮无新有效点，结束规划")
                 break
 
+            # 检查测线退化
             if len(t1) < 5:
                 print(
                     f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<5)，测线退化，结束规划"
@@ -365,62 +357,12 @@ class SurveyPlanner:
                 break
 
             line = copy.deepcopy(t1)
-            turning_angle_terminated = False
-            ring_closed_saturated = False
+            terminated_reason = TerminationReason.NONE
 
-            if in_convergence_state:
-                line_arr = np.array(line)
-                current_line_length = figure_length(line_arr)
-                print(
-                    f"  [收敛状态] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m"
-                )
-
-                centroid = np.mean(line_arr, axis=0)
-                dists_to_centroid = np.sqrt(
-                    (line_arr[:, 0] - centroid[0]) ** 2
-                    + (line_arr[:, 1] - centroid[1]) ** 2
-                )
-                nearest_idx = np.argmin(dists_to_centroid)
-                nearest_point = line_arr[nearest_idx]
-                min_dist_to_centroid = dists_to_centroid[nearest_idx]
-
-                nearest_gx = get_gx(nearest_point[0], nearest_point[1])
-                nearest_gy = get_gy(nearest_point[0], nearest_point[1])
-                grad_dir = np.array([nearest_gx, nearest_gy])
-                grad_norm = np.linalg.norm(grad_dir)
-                if grad_norm > 1e-6:
-                    grad_dir = grad_dir / grad_norm
-                else:
-                    grad_dir = np.array([0, 1])
-
-                to_centroid = centroid[:2] - nearest_point[:2]
-                to_centroid_norm = np.linalg.norm(to_centroid)
-                if to_centroid_norm > 1e-6:
-                    to_centroid = to_centroid / to_centroid_norm
-
-                dot_product = np.dot(grad_dir, to_centroid)
-                if dot_product > 0:
-                    inner_width = get_w_right(
-                        nearest_point[0], nearest_point[1], self.theta
-                    )
-                else:
-                    inner_width = get_w_left(
-                        nearest_point[0], nearest_point[1], self.theta
-                    )
-
-                if min_dist_to_centroid < inner_width:
-                    print(
-                        f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m < 内侧覆盖宽度{inner_width:.1f}m，测线饱和"
-                    )
-                    ring_closed_saturated = True
-                else:
-                    print(
-                        f"  [测线饱和检测] 最近点距质心{min_dist_to_centroid:.1f}m >= 内侧覆盖宽度{inner_width:.1f}m，继续生成"
-                    )
-            else:
+            # 主循环：自延伸和终止检测
+            if not in_convergence_state:
                 ext_step = self.step / 2
                 ext_loop = 0
-                intersection_threshold = self.step * 0.5
 
                 front_x, front_y = line[-1][0], line[-1][1]
                 back_x, back_y = line[0][0], line[0][1]
@@ -471,33 +413,24 @@ class SurveyPlanner:
                     else:
                         line.insert(0, new_point)
 
+                    # 评估终止条件
                     line_arr = np.array(line)
-                    total_angle = _compute_total_turning_angle(line_arr)
-                    if abs(total_angle) > 2 * np.pi:
-                        print(
-                            f"  [测线延伸] 累计偏转角{np.degrees(total_angle):.1f}° > 360°，螺旋终止"
-                        )
-                        turning_angle_terminated = True
+                    reason = self._evaluate_termination(
+                        line_arr,
+                        new_point,
+                        prev_lines,
+                        in_convergence_state,
+                        parent_line_length,
+                    )
+
+                    if reason == TerminationReason.SPIRAL:
+                        print(f"  [测线延伸] 累计偏转角 > 360°，螺旋终止")
+                        terminated_reason = reason
                         break
 
-                    found_intersection = False
-                    for prev_idx, prev_line in enumerate(prev_lines):
-                        if _check_line_intersection(
-                            new_point, prev_line, intersection_threshold
-                        ):
-                            if extend_front:
-                                print(
-                                    f"  [测线延伸-前端] 延伸{ext_loop}步后与第{len(prev_lines) - prev_idx}条测线相交，迷路终止"
-                                )
-                            else:
-                                print(
-                                    f"  [测线延伸-后端] 延伸{ext_loop}步后与第{len(prev_lines) - prev_idx}条测线相交，迷路终止"
-                                )
-                            found_intersection = True
-                            intersection_terminated = True
-                            break
-
-                    if found_intersection:
+                    if reason == TerminationReason.INTERSECTION:
+                        print(f"  [测线延伸] 与历史测线相交，迷路终止")
+                        terminated_reason = reason
                         if extend_front:
                             front_stopped = True
                         else:
@@ -514,16 +447,8 @@ class SurveyPlanner:
 
             line = np.array(line)
 
-            # --- Instant metric recording ---
-            terminated_by = (
-                "saturation"
-                if ring_closed_saturated
-                else (
-                    "spiral"
-                    if turning_angle_terminated
-                    else ("intersection" if intersection_terminated else "boundary")
-                )
-            )
+            # 记录指标
+            terminated_by = terminated_reason.name.lower()
             self._record_line(line, partition_id, terminated_by)
 
             prev_lines.append(line.copy())
@@ -531,51 +456,41 @@ class SurveyPlanner:
                 prev_lines.pop(0)
             total_points += len(line)
 
-            if turning_angle_terminated:
-                plt.plot(line[:, 0], line[:, 1], color="red", linewidth=1.5)
-                current_line_length = figure_length(line)
-                print(
-                    f"  [螺旋终止判定] 当前测线长度: {current_line_length:.1f}m, 父测线长度: {parent_line_length:.1f}m"
-                )
-                if current_line_length < parent_line_length:
+            # 绘制和保存
+            if terminated_reason == TerminationReason.SPIRAL:
+                self.visualizer.draw_line(line, "red", 1.5)
+                current_length = figure_length(line)
+                if current_length < parent_line_length:
                     in_convergence_state = True
-                    print(
-                        f"  [进入收敛状态] 长度缩短，后续测线将跳过自延伸并进行饱和检查"
-                    )
-                else:
-                    print(f"  [保持扩展状态] 长度未缩短，继续正常扩展")
-            elif intersection_terminated:
-                plt.plot(line[:, 0], line[:, 1], color="purple", linewidth=1.5)
+                    print(f"  [进入收敛状态] 后续将进行饱和检查")
+            elif terminated_reason == TerminationReason.INTERSECTION:
+                self.visualizer.draw_line(line, "purple", 1.5)
 
             line_counter += 1
             snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}.png"
-            plt.savefig(snap_path, dpi=200, bbox_inches="tight")
+            self.visualizer.save_snapshot(snap_path)
             print(f"  >> 已保存测线: {snap_path}")
 
             parent_line_length = figure_length(line)
 
-            if ring_closed_saturated:
-                print(f"[{direction_name}扩展] 测线饱和，终止该方向扩展")
-                break
+            # 检查饱和终止
+            if in_convergence_state:
+                reason = self._evaluate_termination(
+                    line, line[0], prev_lines, True, parent_line_length
+                )
+                if reason == TerminationReason.SATURATION:
+                    print(f"[{direction_name}扩展] 测线饱和，终止该方向扩展")
+                    break
 
         print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | {total_points}点")
         return total_points, line_counter
 
     # ------------------------------------------------------------------
-    # Partition-level planning
+    # 分区级规划
     # ------------------------------------------------------------------
 
-    def _plan_partition(
-        self,
-        partition_id,
-        lines_dir,
-        dot_dir,
-        t0,
-    ):
-        """
-        为指定分区规划测线, 结果保存到指定目录.
-        返回 PartitionResult (包含测线列表 + 即时指标).
-        """
+    def _plan_partition(self, partition_id, lines_dir, dot_dir, t0):
+        """为指定分区规划测线"""
         lines_dir.mkdir(parents=True, exist_ok=True)
         dot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -592,113 +507,68 @@ class SurveyPlanner:
             f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | 分区中心"
         )
 
-        plt.figure(figsize=(12, 10))
-        plt.xlim(self.x_min, self.x_max)
-        plt.ylim(self.y_min, self.y_max)
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.xlabel("X (m)")
-        plt.ylabel("Y (m)")
-        plt.title(f"Survey Line Planning - Partition {partition_id}")
-        plt.grid(True, alpha=0.3)
+        # 设置画布
+        self.visualizer.setup_figure(partition_id)
 
         line_counter = 0
 
         # 主测线
-        print(
-            f"[分区{partition_id}] 主测线开始双向延伸 | 起点: ({start_x:.1f}, {start_y:.1f})"
-        )
+        print(f"[分区{partition_id}] 主测线开始双向延伸")
         line, main_terminated = self._extend_line_bidirectional(
             start_x, start_y, partition_id, self.step
         )
         self._record_line(line, partition_id, main_terminated)
         line_counter += 1
-        plt.plot(line[:, 0], line[:, 1], color="b", linewidth=1.5, label="Main line")
+        self.visualizer.draw_line(line, "b", 1.5, "Main line")
 
         snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
-        plt.savefig(snap_path, dpi=200, bbox_inches="tight")
+        self.visualizer.save_snapshot(snap_path)
         print(f"  >> 已保存测线: {snap_path}")
 
+        # 正向扩展
         total_points1, line_counter = self._generate_perpendicular_lines(
-            line,
-            direction=1,
-            target_partition_id=partition_id,
-            lines_dir=lines_dir,
-            t0=t0,
-            line_counter=line_counter,
-            partition_id=partition_id,
-            draw_first_line=False,
+            line, 1, partition_id, lines_dir, t0, line_counter, partition_id, False
         )
 
+        # 反向扩展
         total_points2, line_counter = self._generate_perpendicular_lines(
-            line,
-            direction=-1,
-            target_partition_id=partition_id,
-            lines_dir=lines_dir,
-            t0=t0,
-            line_counter=line_counter,
-            partition_id=partition_id,
-            draw_first_line=False,
+            line, -1, partition_id, lines_dir, t0, line_counter, partition_id, False
         )
 
         total_points = len(line) + total_points1 + total_points2
 
+        # 保存最终图
         final_path = lines_dir / "plan_line_final.png"
-        plt.legend()
-        plt.savefig(final_path, dpi=300, bbox_inches="tight")
-        plt.close()
+        self.visualizer.ax.legend()
+        self.visualizer.save_snapshot(final_path)
+        self.visualizer.close_figure()
 
-        # 从全局记录中筛选该分区的完整记录（包含主测线 + 所有垂直测线）
+        # 收集结果
         partition_records = [
             r for r in self.all_records if r.partition_id == partition_id
         ]
-        total_length = sum(r.length for r in partition_records)
-        total_coverage = sum(r.coverage for r in partition_records)
-
-        # 从记录中提取完整测线列表（用于绘图和 dot.csv）
         partition_all_lines = [r.points for r in partition_records]
 
-        # 保存 dot.csv
-        _save_dot_csv(partition_all_lines, dot_dir)
+        save_dot_csv(partition_all_lines, dot_dir)
 
         print(
             f"[分区{partition_id}完成] 共生成{len(partition_records)}条测线 | 总点数约{total_points}"
         )
-        print(f"  最终图片: {final_path}")
-        print(f"  测线点文件: {dot_dir / 'dot.csv'}")
-        print(f"  中间测线: {line_counter}张")
 
         return PartitionResult(
             partition_id=partition_id,
             lines=partition_all_lines,
             records=partition_records,
-            total_length=total_length,
-            total_coverage=total_coverage,
+            total_length=sum(r.length for r in partition_records),
+            total_coverage=sum(r.coverage for r in partition_records),
         )
 
     # ------------------------------------------------------------------
-    # Public API
+    # 公共 API
     # ------------------------------------------------------------------
 
     def plan_line(self, start_x, start_y, output_dir=None):
-        """
-        单分区测线规划（从指定起点开始）。
-        根据输入点找到所属分区, 以该分区质心作为主测线实际起点。
-
-        输出结构（与 plan_all 一致）:
-            output/<timestamp>/
-              lines/
-                <partition_id>/
-                  line_0001_main.png
-                  line_0002_iter1.png
-                  ...
-                  plan_line_final.png
-                dot.csv
-              metrics/
-                metrics.xlsx
-              partition/
-                partition_U=?.png
-                elbow_method.png
-        """
+        """单分区测线规划"""
         if output_dir is None:
             output_dir = "./multibeam/output"
 
@@ -713,11 +583,8 @@ class SurveyPlanner:
 
         lines_dir = run_dir / "lines"
         metrics_dir = run_dir / "metrics"
-        partition_dir = run_dir / "partition"
-
         lines_dir.mkdir(parents=True, exist_ok=True)
         metrics_dir.mkdir(parents=True, exist_ok=True)
-        partition_dir.mkdir(parents=True, exist_ok=True)
 
         target_partition_id = get_partition_for_point(
             start_x,
@@ -730,206 +597,59 @@ class SurveyPlanner:
             y_min=self.y_min,
             y_max=self.y_max,
         )
-        print(f"[测线规划] 目标分区ID: {target_partition_id}")
-
-        # 使用分区质心作为主测线实际起点
-        rows, cols = np.where(self.cluster_matrix == target_partition_id)
-        if len(rows) == 0:
-            print(f"[分区{target_partition_id}] 未找到有效网格点, 跳过")
-            return PartitionResult(target_partition_id, [], [], 0.0, 0.0)
-        centroid_x = float(np.mean(self.xs[cols]))
-        centroid_y = float(np.mean(self.ys[rows]))
-        print(
-            f"[测线规划] 使用分区质心作为主测线起点: ({centroid_x:.1f}, {centroid_y:.1f})"
-        )
 
         pid_dir = lines_dir / str(target_partition_id)
-        pid_dir.mkdir(parents=True, exist_ok=True)
-
         result = self._plan_partition(
-            partition_id=target_partition_id,
-            lines_dir=pid_dir,
-            dot_dir=pid_dir,
-            t0=time.time(),
+            target_partition_id, pid_dir, pid_dir, time.time()
         )
 
-        # 保存 dot.csv 到 lines/
-        _save_dot_csv(result.lines, lines_dir)
-
-        # 保存指标
+        save_dot_csv(result.lines, lines_dir)
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
         print(f"[测线规划完成] 输出目录: {run_dir}")
         return result
 
     def plan_all(self, output_dir=None):
-        """
-        自动遍历所有分区, 每个分区以质心为起点规划测线.
-
-        输出结构:
-            output/<timestamp>/
-              lines/
-                <partition_id>/
-                  line_0001_main.png
-                  line_0002_iter1.png
-                  ...
-                  plan_line_final.png
-                dot.csv
-              metrics/
-                metrics.xlsx
-              partition/
-                partition_U=?.png
-                elbow_method.png
-
-        注意: 如果 output_dir 已包含时间戳子目录(格式 YYYYMMDD_HHMMSS),
-        则直接使用该目录作为输出根目录, 不再额外创建时间戳层.
-        """
+        """自动遍历所有分区规划测线"""
         if output_dir is None:
             output_dir = "./multibeam/output"
 
         output_path = Path(output_dir)
-        # 检测路径末段是否已是时间戳格式
         is_timestamped = len(output_path.name) == 15 and output_path.name[8] == "_"
 
         if is_timestamped:
-            # 已包含时间戳, 直接作为输出根目录
             run_dir = output_path
         else:
-            # 未包含时间戳, 创建时间戳子目录
             current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             run_dir = output_path / current_time
 
         lines_dir = run_dir / "lines"
         metrics_dir = run_dir / "metrics"
-        partition_dir = run_dir / "partition"
-
         lines_dir.mkdir(parents=True, exist_ok=True)
         metrics_dir.mkdir(parents=True, exist_ok=True)
-        partition_dir.mkdir(parents=True, exist_ok=True)
 
         partition_ids = sorted(np.unique(self.cluster_matrix).astype(int))
         print(f"[全局规划] 检测到 {len(partition_ids)} 个分区: {partition_ids}")
-        print(f"[全局规划] 输出根目录: {run_dir}")
 
-        all_partition_results: list[PartitionResult] = []
-
+        all_results = []
         for pid in partition_ids:
             pid_dir = lines_dir / str(pid)
-            pid_dir.mkdir(parents=True, exist_ok=True)
+            result = self._plan_partition(pid, pid_dir, pid_dir, time.time())
+            all_results.append(result)
 
-            t0 = time.time()
-            result = self._plan_partition(
-                partition_id=pid,
-                lines_dir=pid_dir,
-                dot_dir=pid_dir,
-                t0=t0,
-            )
-            all_partition_results.append(result)
-
-        # 合并所有分区 dot.csv 到 lines/dot.csv
-        flat_all_lines = [line for r in all_partition_results for line in r.lines]
-        _save_dot_csv(flat_all_lines, lines_dir)
-
-        # 绘制所有区域合起来的最终测线图
-        self._draw_merged_lines(all_partition_results, partition_ids, lines_dir)
-
-        # 保存指标
+        # 合并输出
+        flat_all_lines = [line for r in all_results for line in r.lines]
+        save_dot_csv(flat_all_lines, lines_dir)
+        self.visualizer.draw_merged_lines(all_results, lines_dir)
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
-        total_lines = sum(len(r.records) for r in all_partition_results)
+        total_lines = sum(len(r.records) for r in all_results)
         print(f"[全局规划完成] 共 {len(partition_ids)} 个分区 | {total_lines} 条测线")
-        print(f"[全局规划完成] 输出目录: {run_dir}")
 
-        return all_partition_results
-
-    def _draw_merged_lines(self, all_results, partition_ids, lines_parent):
-        """绘制所有分区合并的最终测线图（含分区底色 + 测线）"""
-        print(f"\n{'=' * 60}")
-        print(f"[全局规划] 正在绘制所有分区合并图...")
-
-        colors = self.PARTITION_COLORS
-
-        plt.figure(figsize=(16, 12))
-        plt.xlim(self.x_min, self.x_max)
-        plt.ylim(self.y_min, self.y_max)
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.xlabel("X (m)")
-        plt.ylabel("Y (m)")
-        plt.title("All Partitions Survey Lines")
-        plt.grid(True, alpha=0.3)
-
-        # 1. 绘制分区底色（低透明度，不遮挡测线）
-        grid_x, grid_y = np.meshgrid(self.xs, self.ys)
-        cmap = plt.cm.get_cmap("Set3", len(partition_ids))
-        plt.contourf(
-            grid_x,
-            grid_y,
-            self.cluster_matrix,
-            levels=np.arange(len(partition_ids) + 1) - 0.5,
-            cmap=cmap,
-            alpha=0.25,
-            zorder=0,
-        )
-
-        # 2. 绘制分区边界线
-        plt.contour(
-            grid_x,
-            grid_y,
-            self.cluster_matrix,
-            levels=np.arange(len(partition_ids)) + 0.5,
-            colors="gray",
-            linewidths=1.0,
-            linestyles="dashed",
-            zorder=1,
-        )
-
-        # 3. 绘制测线（在底色之上）
-        for result in all_results:
-            color = colors[int(result.partition_id) % len(colors)]
-            for line in result.lines:
-                plt.plot(
-                    line[:, 0],
-                    line[:, 1],
-                    color=color,
-                    linewidth=1.0,
-                    alpha=0.8,
-                    zorder=2,
-                )
-
-        from matplotlib.lines import Line2D
-
-        legend_elements = [
-            Line2D(
-                [0],
-                [0],
-                color=colors[int(pid) % len(colors)],
-                linewidth=2,
-                label=f"Partition {int(pid)}",
-            )
-            for pid in partition_ids
-        ]
-        plt.legend(handles=legend_elements, loc="best")
-
-        all_final_path = lines_parent / "all_partitions_final.png"
-        plt.savefig(all_final_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"  合并最终图: {all_final_path}")
-
-    def _save_all_dots(self, all_results, dot_parent):
-        """合并所有分区 dot.csv（已废弃，dot.csv 现在直接写入 lines_dir）"""
-        flat_all_lines = [line for r in all_results for line in r.lines]
-        _save_dot_csv(flat_all_lines, dot_parent)
-        print(f"  全部测线点: {dot_parent / 'dot.csv'}")
-
-    # ------------------------------------------------------------------
-    # Metrics output (reads from instant records, no recalculation)
-    # ------------------------------------------------------------------
+        return all_results
 
     def save_metrics_excel(self, output_dir=None, current_time=None, metrics_dir=None):
-        """
-        从已记录的指标直接生成 Excel，不重新计算。
-        优先使用 metrics_dir；若未传则回退到 output_dir/current_time 结构。
-        """
+        """保存指标到 Excel"""
         import pandas as pd
 
         if metrics_dir is not None:
@@ -971,7 +691,6 @@ class SurveyPlanner:
         coverage_rate = (
             effective_coverage / self.total_area if self.total_area > 0 else 0
         )
-        miss_rate = 1 - coverage_rate
 
         global_rows = [
             {"指标": "测线条数", "值": global_total_lines},
@@ -980,7 +699,7 @@ class SurveyPlanner:
             {"指标": "有效覆盖面积(m²)", "值": round(effective_coverage, 2)},
             {"指标": "待测海域总面积(m²)", "值": round(self.total_area, 2)},
             {"指标": "覆盖率", "值": f"{coverage_rate:.4%}"},
-            {"指标": "漏测率", "值": f"{miss_rate:.4%}"},
+            {"指标": "漏测率", "值": f"{1 - coverage_rate:.4%}"},
         ]
         df_global = pd.DataFrame(global_rows)
 
@@ -990,27 +709,11 @@ class SurveyPlanner:
             df_global.to_excel(writer, sheet_name="全局统计", index=False)
 
         print(f"\n[指标统计完成] 已保存到: {metrics_path}")
-        print(f"  测线条数: {global_total_lines}")
-        print(f"  测线总长度: {global_total_length:.2f} m")
-        print(f"  总覆盖面积: {global_total_coverage:.2f} m²")
-        print(f"  有效覆盖面积: {effective_coverage:.2f} m²")
-        print(f"  待测海域总面积: {self.total_area:.2f} m²")
-        print(f"  覆盖率: {coverage_rate:.4%}")
-        print(f"  漏测率: {miss_rate:.4%}")
-
         return metrics_path
-
-    # ------------------------------------------------------------------
-    # Instance-level helper (replaces module-level _point_with_width)
-    # ------------------------------------------------------------------
-
-    def _point_with_width(self, x, y):
-        """返回 [x, y, 覆盖宽度(w_left + w_right)]，用于后续快速计算覆盖面积"""
-        return [x, y, get_w_left(x, y, self.theta) + get_w_right(x, y, self.theta)]
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible module-level functions
+# 向后兼容接口
 # ---------------------------------------------------------------------------
 
 

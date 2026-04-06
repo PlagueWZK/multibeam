@@ -1,22 +1,65 @@
+"""
+数据处理与模型推理模块
+
+提供深度、梯度、坡度角、覆盖宽度等查询接口。
+采用单例模式的懒加载机制，仅在首次调用时加载模型。
+"""
+
 import numpy as np
 
 from tool.Tool import load_model
 
-height_rf, gx_rf, gy_rf = load_model()
+
+class ModelManager:
+    """
+    模型管理器（单例模式）
+
+    采用懒加载策略，仅在首次调用 get_models() 时加载模型，
+    避免 import 时即触发耗时的模型加载操作。
+    """
+
+    _height_rf = None
+    _gx_rf = None
+    _gy_rf = None
+    _loaded = False
+
+    @classmethod
+    def get_models(cls):
+        """
+        获取模型实例（懒加载）
+
+        返回:
+            tuple: (height_rf, gx_rf, gy_rf)
+        """
+        if not cls._loaded:
+            print("[ModelManager] 首次调用，正在加载模型...")
+            cls._height_rf, cls._gx_rf, cls._gy_rf = load_model()
+            cls._loaded = True
+            print("[ModelManager] 模型加载完成")
+        return cls._height_rf, cls._gx_rf, cls._gy_rf
+
+    @classmethod
+    def is_loaded(cls):
+        """检查模型是否已加载"""
+        return cls._loaded
 
 
-def get_height(x, y):  # 输入x、y坐标，返回该位置的深度
-    return float(height_rf.predict([[x, y]])[0])  # 使用深度预测模型预测深度
+def get_height(x, y):
+    """输入x、y坐标，返回该位置的深度"""
+    height_rf, _, _ = ModelManager.get_models()
+    return float(height_rf.predict([[x, y]])[0])
 
 
-# 定义获取指定位置x方向梯度的函数
-def get_gx(x, y):  # 输入x、y坐标，返回该位置的x方向梯度
-    return float(gx_rf.predict([[x, y]])[0])  # 使用x方向梯度预测模型预测梯度
+def get_gx(x, y):
+    """输入x、y坐标，返回该位置的x方向梯度"""
+    _, gx_rf, _ = ModelManager.get_models()
+    return float(gx_rf.predict([[x, y]])[0])
 
 
-# 定义获取指定位置y方向梯度的函数
-def get_gy(x, y):  # 输入x、y坐标，返回该位置的y方向梯度
-    return float(gy_rf.predict([[x, y]])[0])  # 使用y方向梯度预测模型预测梯度
+def get_gy(x, y):
+    """输入x、y坐标，返回该位置的y方向梯度"""
+    _, _, gy_rf = ModelManager.get_models()
+    return float(gy_rf.predict([[x, y]])[0])
 
 
 def get_alpha(x, y, microstep=35):  # 输入x、y坐标，返回该位置的坡度角
@@ -92,4 +135,3 @@ def figure_width(line):
     """
     dists = np.sqrt(np.diff(line[:, 0]) ** 2 + np.diff(line[:, 1]) ** 2)
     return float(np.sum(dists * line[:-1, 2]))
-
