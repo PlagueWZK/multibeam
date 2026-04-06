@@ -4,7 +4,7 @@
 """
 
 import numpy as np
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 
 
 def check_line_intersection_shapely(
@@ -68,3 +68,49 @@ def _point_to_segment_distance(
     proj_x = x1 + t * dx
     proj_y = y1 + t * dy
     return np.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+
+def check_self_intersection(
+    line: np.ndarray, min_points: int = 10, proximity_threshold: float = 15.0
+) -> bool:
+    """
+    检测测线是否与自身相交（混合方案）
+
+    策略：
+    1. 先用 Shapely is_simple 检测精确交叉（快速，O(n log n)）
+    2. 再用端点接近检测处理"接近但未交叉"的情况（O(n)）
+
+    参数:
+        line: 测线点数组 [N, 2] 或 [N, 3]
+        min_points: 最少点数，低于此值不检测
+        proximity_threshold: 端点接近阈值（米），默认15m
+
+    返回:
+        bool: True 表示自交
+    """
+    if line is None or len(line) < min_points:
+        return False
+
+    line_xy = line[:, :2]
+    ls = LineString(line_xy)
+
+    # 第一层：精确自交检测
+    if not ls.is_simple:
+        return True
+
+    # 第二层：端点接近检测
+    # 检测最后一个点是否靠近非相邻线段（跳过最后3个相邻段）
+    last_pt = line_xy[-1]
+    for i in range(len(line_xy) - 4):
+        seg = LineString([line_xy[i], line_xy[i + 1]])
+        if seg.distance(Point(last_pt)) < proximity_threshold:
+            return True
+
+    # 第三层：起点接近检测（处理闭合环形）
+    first_pt = line_xy[0]
+    for i in range(max(0, len(line_xy) - 4), len(line_xy) - 1):
+        seg = LineString([line_xy[i], line_xy[i + 1]])
+        if seg.distance(Point(first_pt)) < proximity_threshold:
+            return True
+
+    return False

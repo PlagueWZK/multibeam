@@ -15,7 +15,6 @@ import numpy as np
 # 从拆分后的模块导入
 from multibeam.models import LineRecord, PartitionResult, TerminationReason
 from multibeam.Partition import get_partition_for_point, is_point_in_partition
-from multibeam.planner_utils import compute_total_turning_angle
 from multibeam.planner_visualizer import SurveyVisualizer, save_dot_csv
 from tool.Data import (
     figure_length,
@@ -96,6 +95,37 @@ class SurveyPlanner:
         )
         return is_in
 
+    def _is_converging(self, line: np.ndarray, parent_line: np.ndarray) -> bool:
+        """
+        判断测线是否在收敛（收缩）
+
+        算法：计算当前测线质心，比较质心到自身和到父测线的平均距离。
+        若前者小，说明测线在收缩，视为收敛状态。
+
+        参数:
+            line: 当前测线 [N, 3] 或 [N, 2]
+            parent_line: 父测线 [M, 3] 或 [M, 2]
+
+        返回:
+            bool: True 表示收敛
+        """
+        centroid = np.mean(line[:, :2], axis=0)
+
+        # 当前测线到自身质心的平均距离
+        dist_current = np.mean(
+            np.sqrt((line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2)
+        )
+
+        # 父测线到当前测线质心的平均距离
+        dist_parent = np.mean(
+            np.sqrt(
+                (parent_line[:, 0] - centroid[0]) ** 2
+                + (parent_line[:, 1] - centroid[1]) ** 2
+            )
+        )
+
+        return dist_current < dist_parent
+
     def _record_line(self, points, partition_id, terminated_by):
         """测线生成完毕后立即计算并记录指标"""
         pts = np.array(points)
@@ -139,9 +169,10 @@ class SurveyPlanner:
         返回:
             TerminationReason: 终止原因枚举
         """
-        # 1. 检查累计偏转角（螺旋终止）
-        total_angle = compute_total_turning_angle(line)
-        if abs(total_angle) > 2 * np.pi:
+        from tool.geometry import check_self_intersection
+
+        # 1. 检查测线自交（螺旋终止）
+        if check_self_intersection(line, min_points=10):
             return TerminationReason.SPIRAL
 
         # 2. 检查测线相交（迷路终止）
@@ -156,32 +187,14 @@ class SurveyPlanner:
 
         # 4. 检查测线饱和（收敛状态下）
         if in_convergence_state:
-            current_length = figure_length(line)
-            if current_length < parent_line_length:
-                # 计算质心到最近点的距离
-                centroid = np.mean(line, axis=0)
-                dists = np.sqrt(
-                    (line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2
-                )
-                min_dist = np.min(dists)
-                nearest_idx = np.argmin(dists)
-                nearest_point = line[nearest_idx]
+            centroid = np.mean(line, axis=0)
+            dists = np.sqrt(
+                (line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2
+            )
+            min_dist = np.min(dists)
 
-                # 计算内侧覆盖宽度
-                gx_val = get_gx(nearest_point[0], nearest_point[1])
-                gy_val = get_gy(nearest_point[0], nearest_point[1])
-                to_centroid = centroid[:2] - nearest_point[:2]
-                grad_dir = np.array([gx_val, gy_val])
-
-                dot_product = np.dot(grad_dir, to_centroid)
-                inner_width = (
-                    get_w_right(nearest_point[0], nearest_point[1], self.theta)
-                    if dot_product > 0
-                    else get_w_left(nearest_point[0], nearest_point[1], self.theta)
-                )
-
-                if min_dist < inner_width:
-                    return TerminationReason.SATURATION
+            if min_dist < self.step * 2:
+                return TerminationReason.SATURATION
 
         return TerminationReason.NONE
 
@@ -253,7 +266,7 @@ class SurveyPlanner:
             reason = self._evaluate_termination(line_arr, new_point, [], False, 0.0)
 
             if reason == TerminationReason.SPIRAL:
-                print(f"  [主测线延伸] 累计偏转角 > 360°，螺旋终止")
+                print(f"  [主测线延伸] 检测到自交，螺旋终止")
                 terminated_reason = reason
                 break
 
@@ -424,7 +437,7 @@ class SurveyPlanner:
                     )
 
                     if reason == TerminationReason.SPIRAL:
-                        print(f"  [测线延伸] 累计偏转角 > 360°，螺旋终止")
+                        print(f"  [测线延伸] 检测到自交，螺旋终止")
                         terminated_reason = reason
                         break
 
@@ -459,12 +472,17 @@ class SurveyPlanner:
             # 绘制和保存
             if terminated_reason == TerminationReason.SPIRAL:
                 self.visualizer.draw_line(line, "red", 1.5)
-                current_length = figure_length(line)
-                if current_length < parent_line_length:
+                # 使用质心距离比较判断收敛状态
+                if self._is_converging(line, main_line):
                     in_convergence_state = True
-                    print(f"  [进入收敛状态] 后续将进行饱和检查")
+                    print(f"  [向内螺旋] 进入收敛状态，后续将进行饱和检查")
+                else:
+                    print(f"  [向外螺旋] 继续正常扩展")
             elif terminated_reason == TerminationReason.INTERSECTION:
                 self.visualizer.draw_line(line, "purple", 1.5)
+            elif in_convergence_state:
+                # 收敛状态下的测线用黄色表示
+                self.visualizer.draw_line(line, "orange", 1.5)
 
             line_counter += 1
             snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}.png"
@@ -475,11 +493,21 @@ class SurveyPlanner:
 
             # 检查饱和终止
             if in_convergence_state:
-                reason = self._evaluate_termination(
-                    line, line[0], prev_lines, True, parent_line_length
+                centroid = np.mean(line, axis=0)
+                dists = np.sqrt(
+                    (line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2
                 )
-                if reason == TerminationReason.SATURATION:
-                    print(f"[{direction_name}扩展] 测线饱和，终止该方向扩展")
+                min_dist = np.min(dists)
+                threshold = self.step * 2
+
+                print(
+                    f"  [饱和检查] min_dist={min_dist:.2f} < threshold={threshold:.2f}?"
+                )
+
+                if min_dist < threshold:
+                    print(
+                        f"[{direction_name}扩展] 测线饱和（最近点距质心{min_dist:.2f}m < {threshold:.2f}m），终止该方向扩展"
+                    )
                     break
 
         print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | {total_points}点")
