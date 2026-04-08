@@ -4,7 +4,20 @@
 """
 
 import numpy as np
-from shapely.geometry import LineString, Point
+
+try:
+    from shapely.geometry import LineString, Point
+except ImportError:  # pragma: no cover - optional dependency fallback
+    LineString = None
+    Point = None
+
+
+def _ccw(a, b, c) -> bool:
+    return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segments_intersect(p1, p2, q1, q2) -> bool:
+    return _ccw(p1, q1, q2) != _ccw(p2, q1, q2) and _ccw(p1, p2, q1) != _ccw(p1, p2, q2)
 
 
 def check_line_intersection_shapely(
@@ -28,6 +41,20 @@ def check_line_intersection_shapely(
         bool: True 表示相交，False 表示不相交
     """
     # 提取前两列 (x, y)，忽略第三列 (覆盖宽度)
+    if LineString is None:
+        p1 = np.asarray(new_pt_start[:2], dtype=float)
+        p2 = np.asarray(new_pt_end[:2], dtype=float)
+        for prev_line in prev_lines:
+            if prev_line is None or len(prev_line) < 2:
+                continue
+            prev_xy = np.asarray(prev_line[:, :2], dtype=float)
+            for i in range(len(prev_xy) - 1):
+                q1 = prev_xy[i]
+                q2 = prev_xy[i + 1]
+                if _segments_intersect(p1, p2, q1, q2):
+                    return True
+        return False
+
     new_segment = LineString([new_pt_start[:2], new_pt_end[:2]])
 
     for prev_line in prev_lines:
@@ -92,6 +119,27 @@ def check_self_intersection(
         return False
 
     line_xy = line[:, :2]
+    if LineString is None or Point is None:
+        last_pt = line_xy[-1]
+        for i in range(len(line_xy) - 4):
+            x1, y1 = line_xy[i]
+            x2, y2 = line_xy[i + 1]
+            if (
+                _point_to_segment_distance(last_pt[0], last_pt[1], x1, y1, x2, y2)
+                < proximity_threshold
+            ):
+                return True
+        first_pt = line_xy[0]
+        for i in range(max(0, len(line_xy) - 4), len(line_xy) - 1):
+            x1, y1 = line_xy[i]
+            x2, y2 = line_xy[i + 1]
+            if (
+                _point_to_segment_distance(first_pt[0], first_pt[1], x1, y1, x2, y2)
+                < proximity_threshold
+            ):
+                return True
+        return False
+
     ls = LineString(line_xy)
 
     # 第一层：精确自交检测
