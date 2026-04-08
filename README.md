@@ -162,37 +162,3 @@ python main.py
 ```
 
 输出位于 `multibeam/output/<timestamp>/` 目录下。
-
-## 重构说明（2026-04-06）
-
-本项目已完成以下重构：
-
-### 已解决的问题
-
-| 问题 | 解决方案 | 新增文件 |
-|---|---|---|
-| 测线相交检测不准确 | 使用 Shapely 库精确几何检测 | `tool/geometry.py` |
-| 模型加载耦合 | `ModelManager` 单例懒加载 | 修改 `tool/Data.py` |
-| Planner.py 过度膨胀 | 按 SRP 拆分为 4 个模块 | `models.py`, `planner_utils.py`, `planner_visualizer.py` |
-| 终止条件状态机复杂 | 引入 `TerminationReason` 枚举 | `models.py` |
-| 梯度计算未向量化 | 使用 `np.gradient()` | 修改 `TrainGradientModel.py` |
-
-### 重构后架构改进
-
-1. **模型懒加载**: `import tool.Data` 不再触发模型加载，首次调用 `get_height()` 时才加载
-2. **精确相交检测**: 使用 `shapely.geometry.LineString.intersects()` 替代距离阈值法
-3. **模块化拆分**: `Planner.py` 从 1028 行精简至 ~500 行，职责清晰
-4. **枚举终止原因**: 使用 `TerminationReason` 枚举替代多重布尔标志
-5. **向量化梯度**: 计算速度提升 10x+
-
-## 仍存在的挑战
-
-### 1. 性能瓶颈 — `Coverage.py` 双重嵌套循环
-
-- `generate_resampled_grid()`: 逐网格调用 RF 模型预测深度
-- `calculate_coverage_matrix_with_ml()`: 覆盖判定嵌套邻域搜索
-- **建议**: 考虑批量预测 + Numba/Cython 优化
-
-### 2. 缺少 `__init__.py`
-
-- 依赖隐式命名空间包，某些环境可能无法正确解析导入

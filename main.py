@@ -37,7 +37,7 @@ if __name__ == "__main__":
 
     # Phase 3: 分区（elbow 和 partition 图写入 output/<timestamp>/partition/）
     final_cluster_matrix, U = partition_coverage_matrix(
-        xs, ys, coverage_matrix, output_dir=output_base, U=40
+        xs, ys, coverage_matrix, output_dir=output_base, U=20
     )
 
     print(f"U= {U}")
@@ -51,4 +51,5 @@ if __name__ == "__main__":
         y_min=Y_MIN,
         y_max=Y_MAX,
     )
-    planner.plan_line(1000, 1000, output_dir=output_base)
+    # planner.plan_line(1000, 1000, output_dir=output_base)
+    planner.plan_all(output_dir=output_base)

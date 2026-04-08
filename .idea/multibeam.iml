@@ -3,6 +3,23 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/local" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_174811" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_175409" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_180350" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_180839" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_181153" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_205754" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_211404" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_224346" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_010719" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_014313" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_015442" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_015837" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/dot" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/lines" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/metrics" />
+      <excludeFolder url="file://$MODULE_DIR$/outputs" />
     </content>
     <orderEntry type="jdk" jdkName="uv (multibeam) (2)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
