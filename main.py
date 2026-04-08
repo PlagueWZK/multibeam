@@ -29,7 +29,6 @@ if __name__ == "__main__":
         y_max=Y_MAX,
         d=d_optimal,
     )
-    print(f"xs: {xs}\nys: {ys}")
 
     # 统一时间戳，确保所有输出在同一目录下
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -37,7 +36,7 @@ if __name__ == "__main__":
 
     # Phase 3: 分区（elbow 和 partition 图写入 output/<timestamp>/partition/）
     final_cluster_matrix, U = partition_coverage_matrix(
-        xs, ys, coverage_matrix, output_dir=output_base, U=20
+        xs, ys, coverage_matrix, output_dir=output_base
     )
 
     print(f"U= {U}")

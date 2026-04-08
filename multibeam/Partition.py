@@ -4,6 +4,8 @@ from pathlib import Path
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
+from tool.Data import get_gx, get_gy
+
 
 def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
     """
@@ -82,30 +84,44 @@ def partition_coverage_matrix(
     rows, cols = coverage_matrix.shape
     n_samples = rows * cols
 
-    # 1. 构建特征矩阵 (X坐标, Y坐标, 覆盖次数)
+    # 1. 构建特征矩阵 (X坐标, Y坐标, 覆盖次数, 梯度x, 梯度y)
     # 注意：这里引入空间坐标是为了保证聚类结果在地理空间上的连续性
+    # 引入梯度方向是为了在地形剧变区域（如海沟、峡谷）形成分区边界，避免环形测线
     grid_x, grid_y = np.meshgrid(xs, ys)
+
+    # 获取每个网格点的梯度（用于识别地形剧变区域）
+    print("[分区] 正在计算网格点梯度方向...")
+    gx_flat = np.array(
+        [get_gx(x, y) for x, y in zip(grid_x.flatten(), grid_y.flatten())]
+    ).reshape(-1, 1)
+    gy_flat = np.array(
+        [get_gy(x, y) for x, y in zip(grid_x.flatten(), grid_y.flatten())]
+    ).reshape(-1, 1)
 
     # 将二维矩阵展平为一维特征向量
     feature_x = grid_x.flatten().reshape(-1, 1)
     feature_y = grid_y.flatten().reshape(-1, 1)
     feature_c = coverage_matrix.flatten().reshape(-1, 1)
 
-    # 将空间坐标与覆盖次数拼接 (N, 3)
-    features = np.hstack((feature_x, feature_y, feature_c))
+    # 将空间坐标、覆盖次数与梯度方向拼接 (N, 5)
+    features = np.hstack((feature_x, feature_y, feature_c, gx_flat, gy_flat))
 
     # 2. 特征缩放（修复：在标准化前计算权重，避免权重失效）
     # 先计算原始特征的尺度差异，用于后续权重调节
     std_xy_raw = np.std(features[:, :2])
     std_c_raw = np.std(features[:, 2])
+    std_g_raw = np.std(features[:, 3:5])
 
     # 计算覆盖次数相对于空间坐标的权重比
     # 目的：使覆盖次数维度的尺度与空间坐标维度相当
     w_cover = std_xy_raw / (std_c_raw + 1e-6)
+    # 计算梯度相对于空间坐标的权重比（梯度值通常较小，需要适当放大）
+    w_grad = std_xy_raw / (std_g_raw + 1e-6)
 
-    # 应用权重：放大覆盖次数维度
+    # 应用权重
     weighted_features = features.copy().astype(float)
     weighted_features[:, 2] *= w_cover
+    weighted_features[:, 3:5] *= w_grad
 
     # 再进行标准化，使各维度均值为0、方差为1
     scaler = StandardScaler()
