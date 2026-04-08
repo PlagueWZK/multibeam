@@ -55,7 +55,7 @@ multibeam/
 | **`GridCell`** | 网格参数优化 | 计算最优网格边长 `d` |
 | **`Coverage`** | 覆盖矩阵计算 | ML 预测深度 + 邻域覆盖判定 |
 | **`Partition`** | 空间聚类分区 | K-means 聚类 + Elbow 法 |
-| **`Planner`** | 测线规划引擎 | 核心调度，使用枚举管理终止条件 |
+| **`Planner`** | 测线规划引擎 | 核心调度，使用枚举管理终止条件，并基于综合评分筛选候选测线 |
 
 ## 核心业务流（四阶段流水线）
 
@@ -92,9 +92,11 @@ data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
                    │  对每个分区:
                    │    1. 主测线: 从质心双向延伸（沿梯度垂直方向）
                    │    2. 垂直扩展: 正向/反向逐轮生成垂直测线
-                   │    3. 终止条件: boundary / spiral / intersection /
-                   │                saturation / degradation / empty
-                   │  输出: 测线图 + dot.csv + metrics.xlsx
+                    │    3. 终止条件: boundary / spiral / intersection /
+                    │                saturation / degradation / empty
+                    │    4. 候选评分: 新增唯一覆盖 - 重叠惩罚 - 长度惩罚 - 弯折惩罚
+                    │    5. 补洞 pass: 针对漏测区域追加种子测线
+                    │  输出: 测线图 + dot.csv + metrics.xlsx
                    ▼
               output/<timestamp>/
                 ├── lines/<pid>/*.png, dot.csv
@@ -142,6 +144,8 @@ data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
 | `theta` | 120° | 多处 | 换能器开角 |
 | `n` | 0.1 | Planner.py | 重叠率 |
 | `step` | 50 | Planner.py | 测线延伸步长 |
+| `score_weights` | `{gain:1.0, overlap:1.4, length:0.015, bend:8.0}` | main.py | 综合评分权重 |
+| `hole_fill_limit` | 1 | main.py | 每次全局规划最多补洞次数 |
 | `min_error` | 0.001 | GridCell.py | 网格拟合误差阈值 |
 | `U` | None (自动) | main.py | 分区数量（可手动指定） |
 | `microstep` | 35 | Data.py | 坡度角计算的微步长 |
@@ -162,3 +166,10 @@ python main.py
 ```
 
 输出位于 `multibeam/output/<timestamp>/` 目录下。
+
+## 指标口径
+
+- `总扫测面积`：各条测线条带面积直接累计，反映实际扫测工作量。
+- `唯一覆盖面积`：基于网格唯一覆盖统计，只计算一次，作为真实覆盖主指标。
+- `重复覆盖面积`：已覆盖网格再次被扫到的面积。
+- `漏测率`：按 `1 - 唯一覆盖面积 / 待测海域面积` 计算，并限制在合法范围内。

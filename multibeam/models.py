@@ -31,6 +31,9 @@ class LineRecord:
     length: float
     coverage: float
     terminated_by: str  # "boundary" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
+    unique_gain_area: float = 0.0
+    overlap_area: float = 0.0
+    score: float = 0.0
 
 
 @dataclass
@@ -42,3 +45,26 @@ class PartitionResult:
     records: list[LineRecord]  # 指标记录
     total_length: float
     total_coverage: float
+
+
+@dataclass
+class ScoreBreakdown:
+    """候选测线评分拆解"""
+
+    unique_gain_cells: int
+    overlap_cells: int
+    length: float
+    bend: float
+    score: float
+
+
+@dataclass
+class CoverageSummary:
+    """全局覆盖统计摘要"""
+
+    total_area: float
+    raw_coverage_area: float
+    unique_coverage_area: float
+    overlap_area: float
+    coverage_rate: float
+    leakage_rate: float
