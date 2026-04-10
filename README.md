@@ -4,17 +4,17 @@
 
 ## 技术栈
 
-| 组件 | 版本/说明 |
-|---|---|
-| **Python** | >= 3.12 |
-| **NumPy** | >= 2.4 — 核心数值计算 |
-| **Pandas** | >= 3.0 — Excel 读写、指标统计 |
-| **scikit-learn** | >= 1.8 — RandomForestRegressor、KMeans、StandardScaler |
-| **Matplotlib / Seaborn** | >= 3.10 / 0.13 — 可视化输出 |
-| **OpenPyXL** | >= 3.1 — Excel 引擎 |
-| **Joblib** | >= 1.4 — 模型序列化 (pkl) |
-| **Shapely** | >= 2.0 — 精确几何相交检测 |
-| **包管理** | `uv` (pyproject.toml + uv.lock) |
+| 组件                       | 版本/说明                                                |
+| ------------------------ | ---------------------------------------------------- |
+| **Python**               | >= 3.12                                              |
+| **NumPy**                | >= 2.4 — 核心数值计算                                      |
+| **Pandas**               | >= 3.0 — Excel 读写、指标统计                               |
+| **scikit-learn**         | >= 1.8 — RandomForestRegressor、KMeans、StandardScaler |
+| **Matplotlib / Seaborn** | >= 3.10 / 0.13 — 可视化输出                               |
+| **OpenPyXL**             | >= 3.1 — Excel 引擎                                    |
+| **Joblib**               | >= 1.4 — 模型序列化 (pkl)                                 |
+| **Shapely**              | >= 2.0 — 精确几何相交检测                                    |
+| **包管理**                  | `uv` (pyproject.toml + uv.lock)                      |
 
 ## 包结构
 
@@ -43,19 +43,19 @@ multibeam/
 
 ### 各模块职责
 
-| 包/模块 | 职责 | 业务划分 |
-|---|---|---|
-| **`model/`** | 离线训练脚本 | 从 `data.xlsx` 提取数据，训练 RF 模型并序列化 |
-| **`tool.Tool`** | I/O 与模型管理 | Excel 解析、pkl 加载、训练辅助 |
-| **`tool.Data`** | 推理门面 | `ModelManager` 单例懒加载，首次调用时才加载模型 |
-| **`tool.geometry`** | 几何计算 | Shapely 精确相交检测，解决穿越穿模问题 |
-| **`multibeam.models`** | 数据模型定义 | `LineRecord`, `PartitionResult`, `TerminationReason` 枚举 |
-| **`multibeam.planner_utils`** | 几何工具 | 角度计算、累计偏转角计算 |
-| **`multibeam.planner_visualizer`** | 可视化 | `SurveyVisualizer` 类，封装所有 matplotlib 绘图 |
-| **`GridCell`** | 网格参数优化 | 计算最优网格边长 `d` |
-| **`Coverage`** | 覆盖矩阵计算 | ML 预测深度 + 邻域覆盖判定 |
-| **`Partition`** | 空间聚类分区 | K-means 聚类 + Elbow 法 |
-| **`Planner`** | 测线规划引擎 | 核心调度，使用枚举管理终止条件，并基于综合评分筛选候选测线 |
+| 包/模块                               | 职责        | 业务划分                                                    |
+| ---------------------------------- | --------- | ------------------------------------------------------- |
+| **`model/`**                       | 离线训练脚本    | 从 `data.xlsx` 提取数据，训练 RF 模型并序列化                         |
+| **`tool.Tool`**                    | I/O 与模型管理 | Excel 解析、pkl 加载、训练辅助                                    |
+| **`tool.Data`**                    | 推理门面      | `ModelManager` 单例懒加载，首次调用时才加载模型                         |
+| **`tool.geometry`**                | 几何计算      | Shapely 精确相交检测，解决穿越穿模问题                                 |
+| **`multibeam.models`**             | 数据模型定义    | `LineRecord`, `PartitionResult`, `TerminationReason` 枚举 |
+| **`multibeam.planner_utils`**      | 几何工具      | 角度计算、累计偏转角计算                                            |
+| **`multibeam.planner_visualizer`** | 可视化       | `SurveyVisualizer` 类，封装所有 matplotlib 绘图                 |
+| **`GridCell`**                     | 网格参数优化    | 计算最优网格边长 `d`                                            |
+| **`Coverage`**                     | 覆盖矩阵计算    | ML 预测深度 + 邻域覆盖判定                                        |
+| **`Partition`**                    | 空间聚类分区    | K-means 聚类 + Elbow 法                                    |
+| **`Planner`**                      | 测线规划引擎    | 核心调度，使用枚举管理终止条件                                         |
 
 ## 核心业务流（四阶段流水线）
 
@@ -92,11 +92,9 @@ data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
                    │  对每个分区:
                    │    1. 主测线: 从质心双向延伸（沿梯度垂直方向）
                    │    2. 垂直扩展: 正向/反向逐轮生成垂直测线
-                    │    3. 终止条件: boundary / spiral / intersection /
-                    │                saturation / degradation / empty
-                    │    4. 候选评分: 新增唯一覆盖 - 重叠惩罚 - 长度惩罚 - 弯折惩罚
-                    │    5. 补洞 pass: 针对漏测区域追加种子测线
-                    │  输出: 测线图 + dot.csv + metrics.xlsx
+                   │    3. 终止条件: boundary / spiral / intersection /
+                   │                saturation / degradation / empty
+                   │  输出: 测线图 + dot.csv + metrics.xlsx
                    ▼
               output/<timestamp>/
                 ├── lines/<pid>/*.png, dot.csv
@@ -108,22 +106,22 @@ data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
 
 ### 数据模型
 
-| 实体 | 结构 | 说明 |
-|---|---|---|
-| **`LineRecord`** (dataclass) | `line_id, partition_id, points[N,3], length, coverage, terminated_by` | 单条测线的即时指标 |
-| **`PartitionResult`** (dataclass) | `partition_id, lines[], records[], total_length, total_coverage` | 单个分区的规划结果 |
-| **`TerminationReason`** (Enum) | `NONE, BOUNDARY, SPIRAL, INTERSECTION, SATURATION, DEGRADATION, EMPTY` | 测线终止原因枚举 |
-| **覆盖次数矩阵** | `int[rows, cols]` | 每个网格被覆盖的次数 |
-| **聚类矩阵** | `int[rows, cols]` | 每个网格所属的分区 ID |
-| **测线点数组** | `float[N, 3]` | `[x, y, w_total]`，第三列为预计算覆盖宽度 |
+| 实体                                | 结构                                                                     | 说明                            |
+| --------------------------------- | ---------------------------------------------------------------------- | ----------------------------- |
+| **`LineRecord`** (dataclass)      | `line_id, partition_id, points[N,3], length, coverage, terminated_by`  | 单条测线的即时指标                     |
+| **`PartitionResult`** (dataclass) | `partition_id, lines[], records[], total_length, total_coverage`       | 单个分区的规划结果                     |
+| **`TerminationReason`** (Enum)    | `NONE, BOUNDARY, SPIRAL, INTERSECTION, SATURATION, DEGRADATION, EMPTY` | 测线终止原因枚举                      |
+| **覆盖次数矩阵**                        | `int[rows, cols]`                                                      | 每个网格被覆盖的次数                    |
+| **聚类矩阵**                          | `int[rows, cols]`                                                      | 每个网格所属的分区 ID                  |
+| **测线点数组**                         | `float[N, 3]`                                                          | `[x, y, w_total]`，第三列为预计算覆盖宽度 |
 
 ### 预训练模型（3 个 RandomForest）
 
-| 模型文件 | 预测目标 | 特征 | 训练数据源 |
-|---|---|---|---|
-| `height_random_forest_model.pkl` | 深度 (z) | (x, y) | `data.xlsx` 深度矩阵 |
-| `gx_random_forest_model.pkl` | X 方向归一化梯度 | (x, y) | 深度矩阵的中心差分归一化 |
-| `gy_random_forest_model.pkl` | Y 方向归一化梯度 | (x, y) | 深度矩阵的中心差分归一化 |
+| 模型文件                             | 预测目标      | 特征     | 训练数据源            |
+| -------------------------------- | --------- | ------ | ---------------- |
+| `height_random_forest_model.pkl` | 深度 (z)    | (x, y) | `data.xlsx` 深度矩阵 |
+| `gx_random_forest_model.pkl`     | X 方向归一化梯度 | (x, y) | 深度矩阵的中心差分归一化     |
+| `gy_random_forest_model.pkl`     | Y 方向归一化梯度 | (x, y) | 深度矩阵的中心差分归一化     |
 
 ### 输入数据格式 (`data.xlsx`)
 
@@ -139,17 +137,15 @@ data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
 
 所有参数硬编码在代码中，无外部配置文件。
 
-| 参数 | 默认值 | 所在文件 | 说明 |
-|---|---|---|---|
-| `theta` | 120° | 多处 | 换能器开角 |
-| `n` | 0.1 | Planner.py | 重叠率 |
-| `step` | 50 | Planner.py | 测线延伸步长 |
-| `score_weights` | `{gain:1.0, overlap:1.4, length:0.015, bend:8.0}` | main.py | 综合评分权重 |
-| `hole_fill_limit` | 1 | main.py | 每次全局规划最多补洞次数 |
-| `min_error` | 0.001 | GridCell.py | 网格拟合误差阈值 |
-| `U` | None (自动) | main.py | 分区数量（可手动指定） |
-| `microstep` | 35 | Data.py | 坡度角计算的微步长 |
-| 海域范围 | 0~5×1852, 0~4×1852 | main.py | X/Y 边界（米） |
+| 参数          | 默认值                  | 所在文件        | 说明          |
+| ----------- | -------------------- | ----------- | ----------- |
+| `theta`     | 120°                 | 多处          | 换能器开角       |
+| `n`         | 0.1                  | Planner.py  | 重叠率         |
+| `step`      | 50                   | Planner.py  | 测线延伸步长      |
+| `min_error` | 0.001                | GridCell.py | 网格拟合误差阈值    |
+| `U`         | None (自动)            | main.py     | 分区数量（可手动指定） |
+| `microstep` | 35                   | Data.py     | 坡度角计算的微步长   |
+| 海域范围        | 0~~5×1852, 0~~4×1852 | main.py     | X/Y 边界（米）   |
 
 ## 快速开始
 
@@ -166,10 +162,3 @@ python main.py
 ```
 
 输出位于 `multibeam/output/<timestamp>/` 目录下。
-
-## 指标口径
-
-- `总扫测面积`：各条测线条带面积直接累计，反映实际扫测工作量。
-- `唯一覆盖面积`：基于网格唯一覆盖统计，只计算一次，作为真实覆盖主指标。
-- `重复覆盖面积`：已覆盖网格再次被扫到的面积。
-- `漏测率`：按 `1 - 唯一覆盖面积 / 待测海域面积` 计算，并限制在合法范围内。

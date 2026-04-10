@@ -22,14 +22,23 @@ if __name__ == "__main__":
     d_optimal = calculate_optimal_mesh_size(DATA_DIR)
 
     # Phase 2: 覆盖矩阵（内部使用 arange 生成坐标 + 边界掩码过滤）
-    xs, ys, depth_matrix, coverage_matrix = calculate_coverage_matrix_with_ml(
+    (
+        xs,
+        ys,
+        depth_matrix,
+        coverage_matrix,
+        coarse_boundary_mask,
+        coarse_cell_effective_area,
+        coarse_cell_area_ratio,
+    ) = calculate_coverage_matrix_with_ml(
         x_min=X_MIN,
         x_max=X_MAX,
         y_min=Y_MIN,
         y_max=Y_MAX,
         d=d_optimal,
     )
-    print(f"xs: {xs}\nys: {ys}")
+
+    _ = coarse_boundary_mask, coarse_cell_effective_area, coarse_cell_area_ratio
 
     # 统一时间戳，确保所有输出在同一目录下
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -37,7 +46,7 @@ if __name__ == "__main__":
 
     # Phase 3: 分区（elbow 和 partition 图写入 output/<timestamp>/partition/）
     final_cluster_matrix, U = partition_coverage_matrix(
-        xs, ys, coverage_matrix, output_dir=output_base, U=20
+        xs, ys, coverage_matrix, output_dir=output_base
     )
 
     print(f"U= {U}")

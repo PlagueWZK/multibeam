@@ -5,6 +5,27 @@ from tool import Data
 from tool import Tool
 
 
+def compute_axis_effective_lengths(centers, cell_size, lower, upper):
+    """计算一维均匀网格在矩形边界内的有效长度。"""
+    half = cell_size / 2
+    left = centers - half
+    right = centers + half
+    return np.maximum(0.0, np.minimum(right, upper) - np.maximum(left, lower))
+
+
+def compute_effective_cell_area_matrix(xs, ys, d, x_min, x_max, y_min, y_max):
+    """计算二维均匀网格在矩形海域内的有效面积矩阵。"""
+    x_lengths = compute_axis_effective_lengths(
+        np.asarray(xs, dtype=float), d, x_min, x_max
+    )
+    y_lengths = compute_axis_effective_lengths(
+        np.asarray(ys, dtype=float), d, y_min, y_max
+    )
+    cell_effective_area = np.outer(y_lengths, x_lengths)
+    cell_area_ratio = cell_effective_area / (d**2)
+    return x_lengths, y_lengths, cell_effective_area, cell_area_ratio
+
+
 def calculate_optimal_mesh_size(data_path, min_error=0.001):
     # 读取高程/深度数据
     x, y, z = Tool.read_grid(data_path)
@@ -92,33 +113,47 @@ def generate_coordinate_array(x_min, x_max, y_min, y_max, d):
     返回:
         xs: X 坐标数组 (一维, 间距严格等于 d)
         ys: Y 坐标数组 (一维, 间距严格等于 d)
-        boundary_mask: 二维布尔掩码 (rows x cols), True 表示网格中心在海域内
+        boundary_mask: 二维布尔掩码 (rows x cols), True 表示网格与海域有重叠面积
+        cell_effective_area: 二维有效面积矩阵
+        cell_area_ratio: 二维面积比例矩阵，相对于满格 d² 的比例
     """
     # arange 右端 +d 确保末端网格中心能覆盖到边界
     xs = np.arange(x_min, x_max + d, d)
     ys = np.arange(y_min, y_max + d, d)
 
-    # 生成网格中心坐标
-    grid_x, grid_y = np.meshgrid(xs, ys)
+    (
+        x_effective_lengths,
+        y_effective_lengths,
+        cell_effective_area,
+        cell_area_ratio,
+    ) = compute_effective_cell_area_matrix(xs, ys, d, x_min, x_max, y_min, y_max)
 
-    # 边界掩码：网格中心在海域范围内（允许半个网格的容差）
-    half_d = d / 2
-    boundary_mask = (
-        (grid_x >= x_min - half_d)
-        & (grid_x <= x_max + half_d)
-        & (grid_y >= y_min - half_d)
-        & (grid_y <= y_max + half_d)
-    )
+    # 边界掩码：只要该格与矩形海域有正面积重叠，就视为有效格
+    boundary_mask = cell_effective_area > 0
+
+    # 数值保护：边界上的极小浮点误差直接截断
+    cell_effective_area = np.where(boundary_mask, cell_effective_area, 0.0)
+    cell_area_ratio = np.where(boundary_mask, cell_area_ratio, 0.0)
+
+    effective_total_area = float(np.sum(cell_effective_area))
+    target_total_area = float((x_max - x_min) * (y_max - y_min))
+    area_error = effective_total_area - target_total_area
+
+    _ = x_effective_lengths, y_effective_lengths
 
     effective_cells = np.sum(boundary_mask)
     total_cells = len(xs) * len(ys)
     print(
         f"坐标数组: X方向{len(xs)}点, Y方向{len(ys)}点, "
         f"有效网格{effective_cells}/{total_cells} "
-        f"(末端超出{total_cells - effective_cells}个网格将被过滤)"
+        f"(末端超出{total_cells - effective_cells}个网格被裁剪)"
+    )
+    print(
+        f"边界修正后总面积: {effective_total_area:.2f} m² | "
+        f"理论矩形面积: {target_total_area:.2f} m² | 偏差: {area_error:.6f}"
     )
 
-    return xs, ys, boundary_mask
+    return xs, ys, boundary_mask, cell_effective_area, cell_area_ratio
 
 
 if __name__ == "__main__":
@@ -130,6 +165,11 @@ if __name__ == "__main__":
         # 测试新坐标生成方案
         X_MIN, X_MAX = 0, 5 * 1852
         Y_MIN, Y_MAX = 0, 4 * 1852
-        xs, ys, mask = generate_coordinate_array(X_MIN, X_MAX, Y_MIN, Y_MAX, d_optimal)
+        xs, ys, mask, area_mat, area_ratio = generate_coordinate_array(
+            X_MIN, X_MAX, Y_MIN, Y_MAX, d_optimal
+        )
         print(f"xs 范围: [{xs[0]:.2f}, {xs[-1]:.2f}], 间距: {xs[1] - xs[0]:.2f}")
         print(f"ys 范围: [{ys[0]:.2f}, {ys[-1]:.2f}], 间距: {ys[1] - ys[0]:.2f}")
+        print(
+            f"有效面积总和: {np.sum(area_mat):.2f}, 平均面积比例: {np.mean(area_ratio):.4f}"
+        )

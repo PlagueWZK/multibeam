@@ -8,15 +8,16 @@
 import copy
 import datetime
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
 # 从拆分后的模块导入
+from multibeam.coverage_state_grid import PartitionCoverageStateGrid
 from multibeam.models import LineRecord, PartitionResult, TerminationReason
 from multibeam.Partition import get_partition_for_point, is_point_in_partition
 from multibeam.planner_visualizer import SurveyVisualizer, save_dot_csv
-from multibeam.planner_utils import build_coverage_summary, evaluate_candidate_line
 from tool.Data import (
     figure_length,
     figure_width,
@@ -25,8 +26,7 @@ from tool.Data import (
     get_gx,
     get_gy,
     get_height,
-    get_w_left,
-    get_w_right,
+    get_total_width,
 )
 from tool.geometry import check_line_intersection_shapely
 
@@ -47,10 +47,6 @@ class SurveyPlanner:
         step=50,
         theta=120,
         n=0.1,
-        score_weights=None,
-        score_threshold=0.0,
-        hole_fill_enabled=True,
-        hole_fill_limit=1,
         x_min=None,
         x_max=None,
         y_min=None,
@@ -59,19 +55,25 @@ class SurveyPlanner:
         self.xs = xs
         self.ys = ys
         self.cluster_matrix = cluster_matrix
-        self.step = step
+        self.default_step = float(step)
+        self.step = float(step)
         self.theta = theta
         self.theta_rad = np.radians(theta)
         self.n = n
-        self.score_weights = score_weights or {
-            "gain": 1.0,
-            "overlap": 1.4,
-            "length": 0.015,
-            "bend": 8.0,
-        }
-        self.score_threshold = score_threshold
-        self.hole_fill_enabled = hole_fill_enabled
-        self.hole_fill_limit = hole_fill_limit
+
+        # 双网格细网格参数（按冻结方案设置默认值）
+        self.fine_grid_scale = 1.5
+        self.max_cells_per_partition = 100000
+        self.fine_grid_sampling_points = 9
+        self.fine_grid_full_threshold = 0.9
+        self.step_scale = 1.0
+        self.microstep_min = 10.0
+        self.microstep_max = 70.0
+        self.legacy_microstep = 35.0
+        self.current_microstep = self.legacy_microstep
+        self.current_partition_grid = None
+        self.partition_state_grids = {}
+        self.partition_coverage_summaries = {}
 
         # 支持传入真实海域边界
         self.x_min = float(x_min) if x_min is not None else float(xs[0])
@@ -79,19 +81,6 @@ class SurveyPlanner:
         self.y_min = float(y_min) if y_min is not None else float(ys[0])
         self.y_max = float(y_max) if y_max is not None else float(ys[-1])
         self.total_area = (self.x_max - self.x_min) * (self.y_max - self.y_min)
-
-        self.grid_x, self.grid_y = np.meshgrid(self.xs, self.ys)
-        self.valid_mask = (
-            (self.grid_x >= self.x_min)
-            & (self.grid_x <= self.x_max)
-            & (self.grid_y >= self.y_min)
-            & (self.grid_y <= self.y_max)
-        )
-        self.valid_cell_count = int(np.sum(self.valid_mask))
-        self.cell_area = (
-            self.total_area / self.valid_cell_count if self.valid_cell_count > 0 else 0.0
-        )
-        self.coverage_counts = np.zeros_like(self.cluster_matrix, dtype=int)
 
         # 即时指标存储
         self.all_records: list[LineRecord] = []
@@ -153,22 +142,11 @@ class SurveyPlanner:
 
         return dist_current < dist_parent
 
-    def _record_line(self, points, partition_id, terminated_by, score_data=None, line_mask=None):
+    def _record_line(self, points, partition_id, terminated_by):
         """测线生成完毕后立即计算并记录指标"""
         pts = np.array(points)
         length = figure_length(pts)
         coverage = figure_width(pts)
-        unique_gain_area = 0.0
-        overlap_area = 0.0
-        score = 0.0
-
-        if score_data is not None:
-            unique_gain_area = score_data.unique_gain_cells * self.cell_area
-            overlap_area = score_data.overlap_cells * self.cell_area
-            score = score_data.score
-
-        if line_mask is not None:
-            self.coverage_counts[line_mask] += 1
 
         record = LineRecord(
             line_id=self._line_counter,
@@ -177,81 +155,41 @@ class SurveyPlanner:
             length=length,
             coverage=coverage,
             terminated_by=terminated_by,
-            unique_gain_area=unique_gain_area,
-            overlap_area=overlap_area,
-            score=score,
         )
         self.all_records.append(record)
         self._line_counter += 1
         return record
 
-    def _score_candidate_line(self, line: np.ndarray):
-        """计算候选测线评分及覆盖掩码。"""
-        return evaluate_candidate_line(
-            line=line,
-            coverage_counts=self.coverage_counts,
-            grid_x=self.grid_x,
-            grid_y=self.grid_y,
-            valid_mask=self.valid_mask,
-            cell_area=self.cell_area,
-            score_weights=self.score_weights,
+    def _point_with_width(self, x, y):
+        """返回 [x, y, 覆盖宽度(w_total)]。"""
+        return [
+            x,
+            y,
+            get_total_width(
+                x,
+                y,
+                theta=self.theta,
+                microstep=self.current_microstep,
+            ),
+        ]
+
+    def _get_alpha(self, x, y):
+        """使用当前分区的差分步长计算坡度角。"""
+        return get_alpha(x, y, microstep=self.current_microstep)
+
+    def _update_current_partition_grid_with_segment(self, start_point, end_point):
+        """将新线段写入当前分区细网格状态。"""
+        if self.current_partition_grid is None:
+            return
+        self.current_partition_grid.update_segment(
+            np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
         )
 
-    def _should_accept_candidate(self, score_data, candidate_size: int) -> bool:
-        """根据综合评分判断是否接受候选测线。"""
-        if candidate_size < 5:
-            return False
-        if score_data.unique_gain_cells <= 0:
-            return False
-        return score_data.score >= self.score_threshold
-
-    def _run_hole_filling_pass(self, partition_ids, lines_dir, t0):
-        """对剩余漏测区域执行一次补洞。"""
-        if not self.hole_fill_enabled:
+    def _update_current_partition_grid_with_polyline(self, points):
+        """将整条折线写入当前分区细网格状态。"""
+        if self.current_partition_grid is None:
             return
-
-        uncovered_mask = (self.coverage_counts == 0) & self.valid_mask
-        if not np.any(uncovered_mask):
-            print("[补洞] 无漏测区域，跳过")
-            return
-
-        print("[补洞] 开始针对漏测区域执行补洞 pass...")
-        repairs = 0
-        for pid in partition_ids:
-            if repairs >= self.hole_fill_limit:
-                break
-
-            partition_uncovered = uncovered_mask & (self.cluster_matrix == pid)
-            if not np.any(partition_uncovered):
-                continue
-
-            rows, cols = np.where(partition_uncovered)
-            seed_x = float(np.mean(self.xs[cols]))
-            seed_y = float(np.mean(self.ys[rows]))
-            line, terminated = self._extend_line_bidirectional(seed_x, seed_y, pid, self.step)
-            line_arr = np.array(line)
-            score_data, line_mask = self._score_candidate_line(line_arr)
-            if not self._should_accept_candidate(score_data, len(line_arr)):
-                print(
-                    f"[补洞] 分区{pid} 候选线得分不足，跳过 | score={score_data.score:.2f}"
-                )
-                continue
-
-            self._record_line(
-                line_arr,
-                pid,
-                f"hole_fill_{terminated}",
-                score_data=score_data,
-                line_mask=line_mask,
-            )
-            print(
-                f"[补洞] 分区{pid} 新增补洞测线 | unique_gain={score_data.unique_gain_cells}格 | score={score_data.score:.2f}"
-            )
-            repairs += 1
-
-    def _point_with_width(self, x, y):
-        """返回 [x, y, 覆盖宽度(w_left + w_right)]，用于后续快速计算覆盖面积"""
-        return [x, y, get_w_left(x, y, self.theta) + get_w_right(x, y, self.theta)]
+        self.current_partition_grid.update_polyline(points)
 
     def _evaluate_termination(
         self,
@@ -362,13 +300,15 @@ class SurveyPlanner:
 
             new_point = self._point_with_width(new_x, new_y)
             if extend_front:
+                self._update_current_partition_grid_with_segment(line[-1], new_point)
                 line.append(new_point)
             else:
+                self._update_current_partition_grid_with_segment(new_point, line[0])
                 line.insert(0, new_point)
 
             # 检查终止条件
             line_arr = np.array(line)
-            reason = self._evaluate_termination(line_arr, np.array(new_point), [], False, 0.0)
+            reason = self._evaluate_termination(line_arr, new_point, [], False, 0.0)
 
             if reason == TerminationReason.SPIRAL:
                 print(f"  [主测线延伸] 检测到自交，螺旋终止")
@@ -426,7 +366,7 @@ class SurveyPlanner:
             # 计算下一轮测线点
             for i in line:
                 x, y = i[0], i[1]
-                alpha = get_alpha(x, y)
+                alpha = self._get_alpha(x, y)
                 h = get_height(x, y)
 
                 if alpha <= 0.005:
@@ -474,16 +414,8 @@ class SurveyPlanner:
                 )
                 break
 
-            candidate_arr = np.array(t1)
-            candidate_score, _ = self._score_candidate_line(candidate_arr)
-            if not self._should_accept_candidate(candidate_score, len(candidate_arr)):
-                print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮候选线得分不足，停止该方向扩展 | "
-                    f"score={candidate_score.score:.2f}, unique_gain={candidate_score.unique_gain_cells}格"
-                )
-                break
-
             line = copy.deepcopy(t1)
+            self._update_current_partition_grid_with_polyline(line)
             terminated_reason = TerminationReason.NONE
 
             # 主循环：自延伸和终止检测
@@ -536,15 +468,21 @@ class SurveyPlanner:
                     new_point = self._point_with_width(new_x, new_y)
 
                     if extend_front:
+                        self._update_current_partition_grid_with_segment(
+                            line[-1], new_point
+                        )
                         line.append(new_point)
                     else:
+                        self._update_current_partition_grid_with_segment(
+                            new_point, line[0]
+                        )
                         line.insert(0, new_point)
 
                     # 评估终止条件
                     line_arr = np.array(line)
                     reason = self._evaluate_termination(
                         line_arr,
-                        np.array(new_point),
+                        new_point,
                         prev_lines,
                         in_convergence_state,
                         parent_line_length,
@@ -573,22 +511,10 @@ class SurveyPlanner:
                     extend_front = not extend_front
 
             line = np.array(line)
-            score_data, line_mask = self._score_candidate_line(line)
-            if not self._should_accept_candidate(score_data, len(line)):
-                print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮延伸后测线得分不足，丢弃 | score={score_data.score:.2f}"
-                )
-                break
 
             # 记录指标
             terminated_by = terminated_reason.name.lower()
-            self._record_line(
-                line,
-                partition_id,
-                terminated_by,
-                score_data=score_data,
-                line_mask=line_mask,
-            )
+            self._record_line(line, partition_id, terminated_by)
 
             prev_lines.append(line.copy())
             if len(prev_lines) > 3:
@@ -661,70 +587,109 @@ class SurveyPlanner:
             f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | 分区中心"
         )
 
-        # 设置画布
-        self.visualizer.setup_figure(partition_id)
-
-        line_counter = 0
-
-        # 主测线
-        print(f"[分区{partition_id}] 主测线开始双向延伸")
-        line, main_terminated = self._extend_line_bidirectional(
-            start_x, start_y, partition_id, self.step
-        )
-        main_line_arr = np.array(line)
-        main_score, main_mask = self._score_candidate_line(main_line_arr)
-        self._record_line(
-            main_line_arr,
+        state_grid = PartitionCoverageStateGrid(
             partition_id,
-            main_terminated,
-            score_data=main_score,
-            line_mask=main_mask,
+            self.xs,
+            self.ys,
+            self.cluster_matrix,
+            theta=self.theta,
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
+            cell_size_scale=self.fine_grid_scale,
+            max_cells=self.max_cells_per_partition,
+            sampling_points=self.fine_grid_sampling_points,
+            full_threshold=self.fine_grid_full_threshold,
+            step_scale=self.step_scale,
+            microstep_min=self.microstep_min,
+            microstep_max=self.microstep_max,
+            legacy_microstep=self.legacy_microstep,
         )
-        line_counter += 1
-        self.visualizer.draw_line(main_line_arr, "b", 1.5, "Main line")
+        self.partition_state_grids[partition_id] = state_grid
 
-        snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
-        self.visualizer.save_snapshot(snap_path)
-        print(f"  >> 已保存测线: {snap_path}")
-
-        # 正向扩展
-        total_points1, line_counter = self._generate_perpendicular_lines(
-            main_line_arr, 1, partition_id, lines_dir, t0, line_counter, partition_id, False
-        )
-
-        # 反向扩展
-        total_points2, line_counter = self._generate_perpendicular_lines(
-            main_line_arr, -1, partition_id, lines_dir, t0, line_counter, partition_id, False
-        )
-
-        total_points = len(main_line_arr) + total_points1 + total_points2
-
-        # 保存最终图
-        final_path = lines_dir / "plan_line_final.png"
-        if self.visualizer.ax is not None:
-            self.visualizer.ax.legend()
-        self.visualizer.save_snapshot(final_path)
-        self.visualizer.close_figure()
-
-        # 收集结果
-        partition_records = [
-            r for r in self.all_records if r.partition_id == partition_id
-        ]
-        partition_all_lines = [r.points for r in partition_records]
-
-        save_dot_csv(partition_all_lines, dot_dir)
+        previous_step = self.step
+        previous_microstep = self.current_microstep
+        previous_partition_grid = self.current_partition_grid
+        self.step = state_grid.planning_step
+        self.current_microstep = state_grid.microstep
+        self.current_partition_grid = state_grid
 
         print(
-            f"[分区{partition_id}完成] 共生成{len(partition_records)}条测线 | 总点数约{total_points}"
+            f"[分区{partition_id}] 细网格初始化 | l={state_grid.cell_size:.2f}m | "
+            f"step={self.step:.2f}m | microstep={self.current_microstep:.2f}m | "
+            f"cells={state_grid.total_cells}"
+            + (" | 已触发cells上限保护" if state_grid.max_cells_guard_triggered else "")
         )
 
-        return PartitionResult(
-            partition_id=partition_id,
-            lines=partition_all_lines,
-            records=partition_records,
-            total_length=sum(r.length for r in partition_records),
-            total_coverage=sum(r.coverage for r in partition_records),
-        )
+        try:
+            # 设置画布
+            self.visualizer.setup_figure(partition_id)
+
+            line_counter = 0
+
+            # 主测线
+            print(f"[分区{partition_id}] 主测线开始双向延伸")
+            line, main_terminated = self._extend_line_bidirectional(
+                start_x, start_y, partition_id, self.step
+            )
+            self._record_line(line, partition_id, main_terminated)
+            line_counter += 1
+            self.visualizer.draw_line(line, "b", 1.5, "Main line")
+
+            snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
+            self.visualizer.save_snapshot(snap_path)
+            print(f"  >> 已保存测线: {snap_path}")
+
+            # 正向扩展
+            total_points1, line_counter = self._generate_perpendicular_lines(
+                line, 1, partition_id, lines_dir, t0, line_counter, partition_id, False
+            )
+
+            # 反向扩展
+            total_points2, line_counter = self._generate_perpendicular_lines(
+                line, -1, partition_id, lines_dir, t0, line_counter, partition_id, False
+            )
+
+            total_points = len(line) + total_points1 + total_points2
+
+            # 保存最终图
+            overlay_legend = self.visualizer.draw_fine_grid_overlay(
+                state_grid, show_legend=True
+            )
+            final_path = lines_dir / "plan_line_final.png"
+            handles, labels = self.visualizer.ax.get_legend_handles_labels()
+            self.visualizer.ax.legend(handles=handles + overlay_legend)
+            self.visualizer.save_snapshot(final_path)
+            self.visualizer.close_figure()
+
+            # 收集结果
+            partition_records = [
+                r for r in self.all_records if r.partition_id == partition_id
+            ]
+            partition_all_lines = [r.points for r in partition_records]
+
+            save_dot_csv(partition_all_lines, dot_dir)
+
+            coverage_summary = state_grid.summarize()
+            self.partition_coverage_summaries[partition_id] = coverage_summary
+
+            print(
+                f"[分区{partition_id}完成] 共生成{len(partition_records)}条测线 | 总点数约{total_points} | "
+                f"细网格覆盖率={coverage_summary.coverage_rate:.2%}"
+            )
+
+            return PartitionResult(
+                partition_id=partition_id,
+                lines=partition_all_lines,
+                records=partition_records,
+                total_length=sum(r.length for r in partition_records),
+                total_coverage=sum(r.coverage for r in partition_records),
+            )
+        finally:
+            self.step = previous_step
+            self.current_microstep = previous_microstep
+            self.current_partition_grid = previous_partition_grid
 
     # ------------------------------------------------------------------
     # 公共 API
@@ -791,7 +756,11 @@ class SurveyPlanner:
         lines_dir.mkdir(parents=True, exist_ok=True)
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
-        partition_ids = sorted(np.unique(self.cluster_matrix).astype(int))
+        partition_ids = [
+            int(pid)
+            for pid in sorted(np.unique(self.cluster_matrix).astype(int))
+            if pid >= 0
+        ]
         print(f"[全局规划] 检测到 {len(partition_ids)} 个分区: {partition_ids}")
 
         all_results = []
@@ -800,22 +769,12 @@ class SurveyPlanner:
             result = self._plan_partition(pid, pid_dir, pid_dir, time.time())
             all_results.append(result)
 
-        self._run_hole_filling_pass(partition_ids, lines_dir, time.time())
-        all_results = [
-            PartitionResult(
-                partition_id=pid,
-                lines=[r.points for r in self.all_records if r.partition_id == pid],
-                records=[r for r in self.all_records if r.partition_id == pid],
-                total_length=sum(r.length for r in self.all_records if r.partition_id == pid),
-                total_coverage=sum(r.coverage for r in self.all_records if r.partition_id == pid),
-            )
-            for pid in partition_ids
-        ]
-
         # 合并输出
         flat_all_lines = [line for r in all_results for line in r.lines]
         save_dot_csv(flat_all_lines, lines_dir)
-        self.visualizer.draw_merged_lines(all_results, lines_dir)
+        self.visualizer.draw_merged_lines(
+            all_results, lines_dir, self.partition_state_grids
+        )
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
         total_lines = sum(len(r.records) for r in all_results)
@@ -839,46 +798,144 @@ class SurveyPlanner:
 
         partition_rows = []
         global_total_length = 0.0
-        global_total_coverage = 0.0
+        global_old_proxy_coverage = 0.0
         global_total_lines = 0
+        global_new_partition_area = 0.0
+        global_new_covered_area = 0.0
 
-        for pid in sorted(set(r.partition_id for r in self.all_records)):
+        partition_ids = sorted(
+            set(r.partition_id for r in self.all_records)
+            | set(self.partition_coverage_summaries.keys())
+        )
+
+        for pid in partition_ids:
             recs = [r for r in self.all_records if r.partition_id == pid]
             total_length = sum(r.length for r in recs)
-            total_coverage = sum(r.coverage for r in recs)
+            proxy_coverage = sum(r.coverage for r in recs)
+            coverage_summary = self.partition_coverage_summaries.get(pid)
 
             partition_rows.append(
                 {
                     "分区ID": int(pid),
                     "测线条数": len(recs),
                     "测线总长度(m)": round(total_length, 2),
-                    "覆盖面积(m²)": round(total_coverage, 2),
+                    "积分覆盖面积-旧口径(m²)": round(proxy_coverage, 2),
+                    "细网格待测面积-新口径(m²)": round(
+                        coverage_summary.total_area if coverage_summary else 0.0, 2
+                    ),
+                    "细网格覆盖面积-新口径(m²)": round(
+                        coverage_summary.covered_area if coverage_summary else 0.0, 2
+                    ),
+                    "细网格覆盖率-新口径": (
+                        f"{coverage_summary.coverage_rate:.4%}"
+                        if coverage_summary
+                        else "0.0000%"
+                    ),
+                    "细网格漏测率-新口径": (
+                        f"{coverage_summary.miss_rate:.4%}"
+                        if coverage_summary
+                        else "100.0000%"
+                    ),
+                    "细网格边长l(m)": round(
+                        coverage_summary.cell_size if coverage_summary else 0.0, 2
+                    ),
+                    "规划步长step(m)": round(
+                        coverage_summary.planning_step if coverage_summary else 0.0, 2
+                    ),
+                    "坡度差分microstep(m)": round(
+                        coverage_summary.microstep if coverage_summary else 0.0, 2
+                    ),
+                    "full_cells": coverage_summary.full_cells
+                    if coverage_summary
+                    else 0,
+                    "partial_cells": coverage_summary.partial_cells
+                    if coverage_summary
+                    else 0,
+                    "uncovered_cells": (
+                        coverage_summary.uncovered_cells if coverage_summary else 0
+                    ),
                 }
             )
 
             global_total_lines += len(recs)
             global_total_length += total_length
-            global_total_coverage += total_coverage
+            global_old_proxy_coverage += proxy_coverage
+            if coverage_summary is not None:
+                global_new_partition_area += coverage_summary.total_area
+                global_new_covered_area += coverage_summary.covered_area
 
         df_partition = pd.DataFrame(partition_rows)
 
-        coverage_summary = build_coverage_summary(
-            coverage_counts=self.coverage_counts,
-            valid_mask=self.valid_mask,
-            cell_area=self.cell_area,
-            raw_coverage_area=global_total_coverage,
+        old_effective_coverage = global_old_proxy_coverage * (1 - self.n)
+        old_coverage_rate = (
+            old_effective_coverage / self.total_area if self.total_area > 0 else 0
         )
+        global_new_covered_area = min(
+            max(global_new_covered_area, 0.0), self.total_area
+        )
+        new_coverage_rate = (
+            global_new_covered_area / self.total_area if self.total_area > 0 else 0.0
+        )
+        new_coverage_rate = min(max(new_coverage_rate, 0.0), 1.0)
+        new_miss_rate = 1.0 - new_coverage_rate
 
         global_rows = [
             {"指标": "测线条数", "值": global_total_lines},
             {"指标": "测线总长度(m)", "值": round(global_total_length, 2)},
-            {"指标": "总扫测面积(m²)", "值": round(coverage_summary.raw_coverage_area, 2)},
-            {"指标": "唯一覆盖面积(m²)", "值": round(coverage_summary.unique_coverage_area, 2)},
-            {"指标": "重复覆盖面积(m²)", "值": round(coverage_summary.overlap_area, 2)},
-            {"指标": "待测海域总面积(m²)", "值": round(coverage_summary.total_area, 2)},
-            {"指标": "覆盖率", "值": f"{coverage_summary.coverage_rate:.4%}"},
-            {"指标": "漏测率", "值": f"{coverage_summary.leakage_rate:.4%}"},
+            {"指标": "矩形海域总面积-旧分母(m²)", "值": round(self.total_area, 2)},
+            {
+                "指标": "积分总覆盖面积-旧口径(m²)",
+                "值": round(global_old_proxy_coverage, 2),
+            },
+            {
+                "指标": "积分有效覆盖面积-旧口径(m²)",
+                "值": round(old_effective_coverage, 2),
+            },
+            {"指标": "积分覆盖率-旧口径", "值": f"{old_coverage_rate:.4%}"},
+            {
+                "指标": "积分漏测率-旧口径(可能为负)",
+                "值": f"{1 - old_coverage_rate:.4%}",
+            },
+            {
+                "指标": "固定矩形海域总面积-新分母(m²)",
+                "值": round(self.total_area, 2),
+            },
+            {
+                "指标": "细网格分区待测面积汇总-诊断值(m²)",
+                "值": round(global_new_partition_area, 2),
+            },
+            {
+                "指标": "细网格待测面积偏差-诊断值(m²)",
+                "值": round(global_new_partition_area - self.total_area, 2),
+            },
+            {
+                "指标": "细网格真实覆盖面积-新口径(m²)",
+                "值": round(global_new_covered_area, 2),
+            },
+            {"指标": "细网格覆盖率-新口径", "值": f"{new_coverage_rate:.4%}"},
+            {"指标": "细网格漏测率-新口径", "值": f"{new_miss_rate:.4%}"},
         ]
+
+        for pid in partition_ids:
+            coverage_summary = self.partition_coverage_summaries.get(pid)
+            if coverage_summary is None:
+                continue
+            summary_dict = asdict(coverage_summary)
+            for key in ("partition_id",):
+                summary_dict.pop(key, None)
+            for metric_name, metric_value in summary_dict.items():
+                display_value = (
+                    round(metric_value, 4)
+                    if isinstance(metric_value, float)
+                    else metric_value
+                )
+                global_rows.append(
+                    {
+                        "指标": f"分区{pid}-{metric_name}",
+                        "值": display_value,
+                    }
+                )
+
         df_global = pd.DataFrame(global_rows)
 
         metrics_path = metrics_dir / "metrics.xlsx"
