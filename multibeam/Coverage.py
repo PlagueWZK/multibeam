@@ -17,11 +17,15 @@ def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
         xs: X 坐标数组 (间距严格等于 d)
         ys: Y 坐标数组 (间距严格等于 d)
         Z: 深度矩阵 (rows x cols)
-        boundary_mask: 二维布尔掩码，True 表示网格在海域内
+        boundary_mask: 二维布尔掩码，True 表示网格与海域有正面积重叠
+        cell_effective_area: 二维有效面积矩阵
+        cell_area_ratio: 二维面积比例矩阵
     """
     from multibeam.GridCell import generate_coordinate_array
 
-    xs, ys, boundary_mask = generate_coordinate_array(x_min, x_max, y_min, y_max, d)
+    xs, ys, boundary_mask, cell_effective_area, cell_area_ratio = (
+        generate_coordinate_array(x_min, x_max, y_min, y_max, d)
+    )
 
     rows = len(ys)
     cols = len(xs)
@@ -40,7 +44,7 @@ def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
         for j in range(cols):
             Z[i, j] = Data.get_height(xs[j], ys[i])
 
-    return xs, ys, Z, boundary_mask
+    return xs, ys, Z, boundary_mask, cell_effective_area, cell_area_ratio
 
 
 def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
@@ -48,7 +52,9 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
     结合机器学习深度预测模型和最优网格 d，计算覆盖次数矩阵。
     """
     # 1. 调用模型重采样，获取全新的 Z 矩阵和边界掩码
-    xs, ys, Z, boundary_mask = generate_resampled_grid(x_min, x_max, y_min, y_max, d)
+    xs, ys, Z, boundary_mask, cell_effective_area, cell_area_ratio = (
+        generate_resampled_grid(x_min, x_max, y_min, y_max, d)
+    )
 
     rows, cols = Z.shape
     times_mat = np.zeros((rows, cols), dtype=int)
@@ -127,4 +133,4 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
             times_mat[min_row : max_row + 1, min_col : max_col + 1] += valid_mask
 
     print("覆盖次数矩阵计算完成！")
-    return xs, ys, Z, times_mat
+    return xs, ys, Z, times_mat, boundary_mask, cell_effective_area, cell_area_ratio

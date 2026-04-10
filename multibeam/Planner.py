@@ -654,8 +654,12 @@ class SurveyPlanner:
             total_points = len(line) + total_points1 + total_points2
 
             # 保存最终图
+            overlay_legend = self.visualizer.draw_fine_grid_overlay(
+                state_grid, show_legend=True
+            )
             final_path = lines_dir / "plan_line_final.png"
-            self.visualizer.ax.legend()
+            handles, labels = self.visualizer.ax.get_legend_handles_labels()
+            self.visualizer.ax.legend(handles=handles + overlay_legend)
             self.visualizer.save_snapshot(final_path)
             self.visualizer.close_figure()
 
@@ -768,7 +772,9 @@ class SurveyPlanner:
         # 合并输出
         flat_all_lines = [line for r in all_results for line in r.lines]
         save_dot_csv(flat_all_lines, lines_dir)
-        self.visualizer.draw_merged_lines(all_results, lines_dir)
+        self.visualizer.draw_merged_lines(
+            all_results, lines_dir, self.partition_state_grids
+        )
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
         total_lines = sum(len(r.records) for r in all_results)
@@ -794,7 +800,7 @@ class SurveyPlanner:
         global_total_length = 0.0
         global_old_proxy_coverage = 0.0
         global_total_lines = 0
-        global_new_total_area = 0.0
+        global_new_partition_area = 0.0
         global_new_covered_area = 0.0
 
         partition_ids = sorted(
@@ -855,7 +861,7 @@ class SurveyPlanner:
             global_total_length += total_length
             global_old_proxy_coverage += proxy_coverage
             if coverage_summary is not None:
-                global_new_total_area += coverage_summary.total_area
+                global_new_partition_area += coverage_summary.total_area
                 global_new_covered_area += coverage_summary.covered_area
 
         df_partition = pd.DataFrame(partition_rows)
@@ -864,10 +870,11 @@ class SurveyPlanner:
         old_coverage_rate = (
             old_effective_coverage / self.total_area if self.total_area > 0 else 0
         )
+        global_new_covered_area = min(
+            max(global_new_covered_area, 0.0), self.total_area
+        )
         new_coverage_rate = (
-            global_new_covered_area / global_new_total_area
-            if global_new_total_area > 0
-            else 0.0
+            global_new_covered_area / self.total_area if self.total_area > 0 else 0.0
         )
         new_coverage_rate = min(max(new_coverage_rate, 0.0), 1.0)
         new_miss_rate = 1.0 - new_coverage_rate
@@ -890,8 +897,16 @@ class SurveyPlanner:
                 "值": f"{1 - old_coverage_rate:.4%}",
             },
             {
-                "指标": "细网格待测总面积-新口径(m²)",
-                "值": round(global_new_total_area, 2),
+                "指标": "固定矩形海域总面积-新分母(m²)",
+                "值": round(self.total_area, 2),
+            },
+            {
+                "指标": "细网格分区待测面积汇总-诊断值(m²)",
+                "值": round(global_new_partition_area, 2),
+            },
+            {
+                "指标": "细网格待测面积偏差-诊断值(m²)",
+                "值": round(global_new_partition_area - self.total_area, 2),
             },
             {
                 "指标": "细网格真实覆盖面积-新口径(m²)",

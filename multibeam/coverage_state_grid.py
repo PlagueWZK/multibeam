@@ -124,15 +124,31 @@ class PartitionCoverageStateGrid:
         self.reference_point_y = 0.0
         self.reference_depth = 0.0
         self.reference_width = 0.0
+        self.domain_area = (
+            float((self.x_max - self.x_min) * (self.y_max - self.y_min))
+            if None not in (self.x_min, self.x_max, self.y_min, self.y_max)
+            else 0.0
+        )
 
         self.partition_sample_mask = None
         self.covered_sample_mask = None
         self.partition_sample_counts = None
+        self.covered_sample_counts = None
+        self.partition_area_ratio_matrix = None
+        self.coverage_ratio_matrix = None
+        self.state_code_matrix = None
         self.sample_x = None
         self.sample_y = None
         self.sample_count = len(self.SAMPLE_LAYOUTS[self.sampling_points])
         self.x_centers = None
         self.y_centers = None
+        self.domain_x_min = None
+        self.domain_x_max = None
+        self.domain_y_min = None
+        self.domain_y_max = None
+        self.domain_x_effective_lengths = None
+        self.domain_y_effective_lengths = None
+        self.cell_domain_area = None
 
         self._build()
 
@@ -161,6 +177,14 @@ class PartitionCoverageStateGrid:
             get_w_left(x, y, self.theta, microstep=microstep)
             + get_w_right(x, y, self.theta, microstep=microstep)
         )
+
+    def _compute_axis_effective_lengths(
+        self, centers: np.ndarray, cell_size: float, lower: float, upper: float
+    ) -> np.ndarray:
+        half = cell_size / 2.0
+        left = centers - half
+        right = centers + half
+        return np.maximum(0.0, np.minimum(right, upper) - np.maximum(left, lower))
 
     def _select_reference_point(self) -> tuple[float, float, float]:
         rows, cols = np.where(self.cluster_matrix == self.partition_id)
@@ -217,6 +241,22 @@ class PartitionCoverageStateGrid:
         self.partition_x_max = float(np.max(partition_x))
         self.partition_y_min = float(np.min(partition_y))
         self.partition_y_max = float(np.max(partition_y))
+        self.domain_x_min = float(
+            self.x_min if self.x_min is not None else np.min(self.xs)
+        )
+        self.domain_x_max = float(
+            self.x_max if self.x_max is not None else np.max(self.xs)
+        )
+        self.domain_y_min = float(
+            self.y_min if self.y_min is not None else np.min(self.ys)
+        )
+        self.domain_y_max = float(
+            self.y_max if self.y_max is not None else np.max(self.ys)
+        )
+        self.domain_area = float(
+            (self.domain_x_max - self.domain_x_min)
+            * (self.domain_y_max - self.domain_y_min)
+        )
 
         ref_x, ref_y, ref_depth = self._select_reference_point()
         bootstrap_width = self._compute_total_width(ref_x, ref_y, self.legacy_microstep)
@@ -250,6 +290,15 @@ class PartitionCoverageStateGrid:
         )
         self.planning_step = self.step_scale * self.cell_size
         self.reference_width = self._compute_total_width(ref_x, ref_y, self.microstep)
+        self.domain_x_effective_lengths = self._compute_axis_effective_lengths(
+            self.x_centers, self.cell_size, self.domain_x_min, self.domain_x_max
+        )
+        self.domain_y_effective_lengths = self._compute_axis_effective_lengths(
+            self.y_centers, self.cell_size, self.domain_y_min, self.domain_y_max
+        )
+        self.cell_domain_area = np.outer(
+            self.domain_y_effective_lengths, self.domain_x_effective_lengths
+        )
 
         offsets = self.SAMPLE_LAYOUTS[self.sampling_points] * self.cell_size
         row_count = len(self.y_centers)
@@ -272,9 +321,12 @@ class PartitionCoverageStateGrid:
 
         self.covered_sample_mask = np.zeros_like(self.partition_sample_mask, dtype=bool)
         self.partition_sample_counts = np.sum(self.partition_sample_mask, axis=2)
+        self.partition_area_ratio_matrix = (
+            self.partition_sample_counts / self.sample_count
+        )
         self.total_cells = int(np.sum(self.partition_sample_counts > 0))
         self.total_partition_area = float(
-            np.sum(self.partition_sample_counts / self.sample_count) * self.cell_area
+            np.sum(self.partition_area_ratio_matrix * self.cell_domain_area)
         )
 
     def _candidate_index_range(
@@ -359,18 +411,77 @@ class PartitionCoverageStateGrid:
         for start, end in zip(line_arr[:-1], line_arr[1:]):
             self.update_segment(start, end)
 
-    def summarize(self) -> PartitionCoverageSummary:
-        covered_sample_counts = np.sum(
+    def _compute_state_matrices(self):
+        self.covered_sample_counts = np.sum(
             self.partition_sample_mask & self.covered_sample_mask, axis=2
         )
-        coverage_ratios = np.zeros_like(self.partition_sample_counts, dtype=float)
+        self.coverage_ratio_matrix = np.zeros_like(
+            self.partition_sample_counts, dtype=float
+        )
         valid_mask = self.partition_sample_counts > 0
-        coverage_ratios[valid_mask] = (
-            covered_sample_counts[valid_mask] / self.partition_sample_counts[valid_mask]
+        self.coverage_ratio_matrix[valid_mask] = (
+            self.covered_sample_counts[valid_mask]
+            / self.partition_sample_counts[valid_mask]
         )
 
+        self.state_code_matrix = np.full_like(
+            self.partition_sample_counts, -1, dtype=int
+        )
+        self.state_code_matrix[valid_mask & (self.coverage_ratio_matrix == 0.0)] = 0
+        self.state_code_matrix[
+            valid_mask
+            & (self.coverage_ratio_matrix > 0.0)
+            & (self.coverage_ratio_matrix < self.full_threshold)
+        ] = 1
+        self.state_code_matrix[
+            valid_mask & (self.coverage_ratio_matrix >= self.full_threshold)
+        ] = 2
+        return valid_mask
+
+    def iter_render_cells(self):
+        """生成用于绘图的细网格 cell 渲染数据。"""
+        valid_mask = self._compute_state_matrices()
+        half = self.cell_size / 2.0
+        for i in range(len(self.y_centers)):
+            for j in range(len(self.x_centers)):
+                if not valid_mask[i, j]:
+                    continue
+                x0 = max(float(self.x_centers[j] - half), self.domain_x_min)
+                x1 = min(float(self.x_centers[j] + half), self.domain_x_max)
+                y0 = max(float(self.y_centers[i] - half), self.domain_y_min)
+                y1 = min(float(self.y_centers[i] + half), self.domain_y_max)
+                width = x1 - x0
+                height = y1 - y0
+                if width <= 0 or height <= 0:
+                    continue
+
+                state_code = int(self.state_code_matrix[i, j])
+                state_name = {0: "uncovered", 1: "partial", 2: "full"}.get(
+                    state_code, "invalid"
+                )
+                if state_name == "invalid":
+                    continue
+
+                yield {
+                    "x": x0,
+                    "y": y0,
+                    "width": width,
+                    "height": height,
+                    "state": state_name,
+                    "partition_area_ratio": float(
+                        self.partition_area_ratio_matrix[i, j]
+                    ),
+                    "coverage_ratio": float(self.coverage_ratio_matrix[i, j]),
+                    "effective_area": float(self.cell_domain_area[i, j]),
+                }
+
+    def summarize(self) -> PartitionCoverageSummary:
+        valid_mask = self._compute_state_matrices()
+
         covered_area = float(
-            np.sum(covered_sample_counts / self.sample_count) * self.cell_area
+            np.sum(
+                (self.covered_sample_counts / self.sample_count) * self.cell_domain_area
+            )
         )
         covered_area = min(covered_area, self.total_partition_area)
         uncovered_area = max(self.total_partition_area - covered_area, 0.0)
@@ -383,15 +494,17 @@ class PartitionCoverageStateGrid:
         coverage_rate = self._clip(coverage_rate, 0.0, 1.0)
         miss_rate = 1.0 - coverage_rate
 
-        full_cells = int(np.sum(valid_mask & (coverage_ratios >= self.full_threshold)))
+        full_cells = int(
+            np.sum(valid_mask & (self.coverage_ratio_matrix >= self.full_threshold))
+        )
         partial_cells = int(
             np.sum(
                 valid_mask
-                & (coverage_ratios > 0.0)
-                & (coverage_ratios < self.full_threshold)
+                & (self.coverage_ratio_matrix > 0.0)
+                & (self.coverage_ratio_matrix < self.full_threshold)
             )
         )
-        uncovered_cells = int(np.sum(valid_mask & (coverage_ratios == 0.0)))
+        uncovered_cells = int(np.sum(valid_mask & (self.coverage_ratio_matrix == 0.0)))
 
         return PartitionCoverageSummary(
             partition_id=self.partition_id,
