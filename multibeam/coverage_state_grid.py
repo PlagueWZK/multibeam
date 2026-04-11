@@ -411,6 +411,83 @@ class PartitionCoverageStateGrid:
         for start, end in zip(line_arr[:-1], line_arr[1:]):
             self.update_segment(start, end)
 
+    def _estimate_swath_gain(self, start: np.ndarray, end: np.ndarray) -> dict:
+        start = np.asarray(start, dtype=float)
+        end = np.asarray(end, dtype=float)
+        radius = max(float(start[2]), float(end[2])) / 2.0
+        if radius <= 0:
+            return {
+                "candidate_cells": 0,
+                "nonfull_cells_touched": 0,
+                "new_samples_in_nonfull_cells": 0,
+            }
+
+        valid_mask = self._compute_state_matrices()
+        x_low = min(float(start[0]), float(end[0])) - radius
+        x_high = max(float(start[0]), float(end[0])) + radius
+        y_low = min(float(start[1]), float(end[1])) - radius
+        y_high = max(float(start[1]), float(end[1])) + radius
+
+        row_start, row_end = self._candidate_index_range(self.y_centers, y_low, y_high)
+        col_start, col_end = self._candidate_index_range(self.x_centers, x_low, x_high)
+        if row_end < row_start or col_end < col_start:
+            return {
+                "candidate_cells": 0,
+                "nonfull_cells_touched": 0,
+                "new_samples_in_nonfull_cells": 0,
+            }
+
+        candidate_cells = 0
+        nonfull_cells_touched = 0
+        new_samples_in_nonfull_cells = 0
+
+        for i in range(row_start, row_end + 1):
+            for j in range(col_start, col_end + 1):
+                if not valid_mask[i, j]:
+                    continue
+
+                sample_indices = np.where(self.partition_sample_mask[i, j])[0]
+                if len(sample_indices) == 0:
+                    continue
+
+                covered_now = self._points_within_segment_swath(
+                    self.sample_x[i, j, sample_indices],
+                    self.sample_y[i, j, sample_indices],
+                    start,
+                    end,
+                )
+                if not np.any(covered_now):
+                    continue
+
+                candidate_cells += 1
+                current_ratio = float(self.coverage_ratio_matrix[i, j])
+                if current_ratio >= self.full_threshold:
+                    continue
+
+                nonfull_cells_touched += 1
+                candidate_sample_indices = sample_indices[covered_now]
+                uncovered_mask = ~self.covered_sample_mask[
+                    i, j, candidate_sample_indices
+                ]
+                new_samples_in_nonfull_cells += int(np.count_nonzero(uncovered_mask))
+
+        return {
+            "candidate_cells": candidate_cells,
+            "nonfull_cells_touched": nonfull_cells_touched,
+            "new_samples_in_nonfull_cells": new_samples_in_nonfull_cells,
+        }
+
+    def would_segment_add_value(self, start: np.ndarray, end: np.ndarray) -> bool:
+        gain = self._estimate_swath_gain(start, end)
+        # 放宽停止标准：
+        # 只要候选线段仍触达任何 non-full cell，就允许继续，
+        # 避免低覆盖宽度区域因采样过严而被过早终止。
+        return gain["nonfull_cells_touched"] > 0
+
+    def would_point_add_value(self, point: np.ndarray) -> bool:
+        point_arr = np.asarray(point, dtype=float)
+        return self.would_segment_add_value(point_arr, point_arr)
+
     def _compute_state_matrices(self):
         self.covered_sample_counts = np.sum(
             self.partition_sample_mask & self.covered_sample_mask, axis=2

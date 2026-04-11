@@ -28,7 +28,6 @@ from tool.Data import (
     get_height,
     get_total_width,
 )
-from tool.geometry import check_line_intersection_shapely
 
 
 # ---------------------------------------------------------------------------
@@ -111,36 +110,30 @@ class SurveyPlanner:
         )
         return is_in
 
-    def _is_converging(self, line: np.ndarray, parent_line: np.ndarray) -> bool:
-        """
-        判断测线是否在收敛（收缩）
-
-        算法：计算当前测线质心，比较质心到自身和到父测线的平均距离。
-        若前者小，说明测线在收缩，视为收敛状态。
-
-        参数:
-            line: 当前测线 [N, 3] 或 [N, 2]
-            parent_line: 父测线 [M, 3] 或 [M, 2]
-
-        返回:
-            bool: True 表示收敛
-        """
-        centroid = np.mean(line[:, :2], axis=0)
-
-        # 当前测线到自身质心的平均距离
-        dist_current = np.mean(
-            np.sqrt((line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2)
+    def _candidate_point_has_value(self, point) -> bool:
+        """细网格状态驱动的点保留判断。"""
+        if self.current_partition_grid is None:
+            return True
+        return self.current_partition_grid.would_point_add_value(
+            np.asarray(point, dtype=float)
         )
 
-        # 父测线到当前测线质心的平均距离
-        dist_parent = np.mean(
-            np.sqrt(
-                (parent_line[:, 0] - centroid[0]) ** 2
-                + (parent_line[:, 1] - centroid[1]) ** 2
-            )
+    def _candidate_segment_has_value(self, start_point, end_point) -> bool:
+        """细网格状态驱动的线段保留判断。"""
+        if self.current_partition_grid is None:
+            return True
+        return self.current_partition_grid.would_segment_add_value(
+            np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
         )
 
-        return dist_current < dist_parent
+    @staticmethod
+    def _resolve_line_termination(front_reason, back_reason) -> TerminationReason:
+        reasons = {front_reason, back_reason}
+        if TerminationReason.LOW_VALUE in reasons:
+            return TerminationReason.LOW_VALUE
+        if TerminationReason.BOUNDARY in reasons:
+            return TerminationReason.BOUNDARY
+        return TerminationReason.NONE
 
     def _record_line(self, points, partition_id, terminated_by):
         """测线生成完毕后立即计算并记录指标"""
@@ -191,56 +184,6 @@ class SurveyPlanner:
             return
         self.current_partition_grid.update_polyline(points)
 
-    def _evaluate_termination(
-        self,
-        line: np.ndarray,
-        new_point: np.ndarray,
-        prev_lines: list[np.ndarray],
-        in_convergence_state: bool,
-        parent_line_length: float,
-    ) -> TerminationReason:
-        """
-        评估测线终止原因
-
-        参数:
-            line: 当前测线（包含新点）
-            new_point: 最新添加的点
-            prev_lines: 历史测线列表
-            in_convergence_state: 是否处于收敛状态
-            parent_line_length: 父测线长度
-
-        返回:
-            TerminationReason: 终止原因枚举
-        """
-        from tool.geometry import check_self_intersection
-
-        # 1. 检查测线自交（螺旋终止）
-        if check_self_intersection(line, min_points=10):
-            return TerminationReason.SPIRAL
-
-        # 2. 检查测线相交（迷路终止）
-        if len(line) >= 2 and prev_lines:
-            # 检查最后两个点组成的线段是否与历史测线相交
-            if check_line_intersection_shapely(line[-2], line[-1], prev_lines):
-                return TerminationReason.INTERSECTION
-
-        # 3. 检查测线退化（点数过少）
-        if len(line) < 5:
-            return TerminationReason.DEGRADATION
-
-        # 4. 检查测线饱和（收敛状态下）
-        if in_convergence_state:
-            centroid = np.mean(line, axis=0)
-            dists = np.sqrt(
-                (line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2
-            )
-            min_dist = np.min(dists)
-
-            if min_dist < self.step * 2:
-                return TerminationReason.SATURATION
-
-        return TerminationReason.NONE
-
     # ------------------------------------------------------------------
     # 核心测线生成算法
     # ------------------------------------------------------------------
@@ -249,7 +192,7 @@ class SurveyPlanner:
         """
         双向延伸生成主测线
 
-        从起点向正反两个方向交替延伸，使用累计偏转角法检测环形/螺旋。
+        从起点向正反两个方向交替延伸，按边界与细网格收益决定是否继续。
         """
         line = [self._point_with_width(start_x, start_y)]
 
@@ -259,6 +202,8 @@ class SurveyPlanner:
         back_x, back_y = start_x, start_y
         front_stopped = False
         back_stopped = False
+        front_stop_reason = TerminationReason.NONE
+        back_stop_reason = TerminationReason.NONE
         extend_front = True
         terminated_reason = TerminationReason.NONE
 
@@ -292,28 +237,34 @@ class SurveyPlanner:
                 if extend_front:
                     print(f"  [主测线延伸-前端] 延伸{ext_loop}步后超出边界")
                     front_stopped = True
+                    front_stop_reason = TerminationReason.BOUNDARY
                 else:
                     print(f"  [主测线延伸-后端] 延伸{ext_loop}步后超出边界")
                     back_stopped = True
+                    back_stop_reason = TerminationReason.BOUNDARY
                 extend_front = not extend_front
                 continue
 
             new_point = self._point_with_width(new_x, new_y)
+            anchor_point = line[-1] if extend_front else line[0]
+            if not self._candidate_segment_has_value(anchor_point, new_point):
+                if extend_front:
+                    print(f"  [主测线延伸-前端] 新线段对应细网格收益不足，停止该端")
+                    front_stopped = True
+                    front_stop_reason = TerminationReason.LOW_VALUE
+                else:
+                    print(f"  [主测线延伸-后端] 新线段对应细网格收益不足，停止该端")
+                    back_stopped = True
+                    back_stop_reason = TerminationReason.LOW_VALUE
+                extend_front = not extend_front
+                continue
+
             if extend_front:
                 self._update_current_partition_grid_with_segment(line[-1], new_point)
                 line.append(new_point)
             else:
                 self._update_current_partition_grid_with_segment(new_point, line[0])
                 line.insert(0, new_point)
-
-            # 检查终止条件
-            line_arr = np.array(line)
-            reason = self._evaluate_termination(line_arr, new_point, [], False, 0.0)
-
-            if reason == TerminationReason.SPIRAL:
-                print(f"  [主测线延伸] 检测到自交，螺旋终止")
-                terminated_reason = reason
-                break
 
             if extend_front:
                 front_x, front_y = new_x, new_y
@@ -323,8 +274,13 @@ class SurveyPlanner:
             extend_front = not extend_front
 
         line = np.array(line)
+        terminated_reason = self._resolve_line_termination(
+            front_stop_reason, back_stop_reason
+        )
         status = (
-            "环形闭合" if terminated_reason == TerminationReason.SPIRAL else "边界终止"
+            "细网格收益终止"
+            if terminated_reason == TerminationReason.LOW_VALUE
+            else "边界终止"
         )
         terminated_by = (
             terminated_reason.name.lower()
@@ -350,9 +306,6 @@ class SurveyPlanner:
     ):
         """生成垂直扩展测线"""
         line = copy.deepcopy(main_line)
-        prev_lines = [main_line.copy()]
-        in_convergence_state = False
-        parent_line_length = figure_length(main_line)
         perp_iter = 0
         total_points = 0
 
@@ -362,6 +315,8 @@ class SurveyPlanner:
         while True:
             perp_iter += 1
             t1 = []
+            boundary_rejects = 0
+            low_value_rejects = 0
 
             # 计算下一轮测线点
             for i in line:
@@ -391,7 +346,13 @@ class SurveyPlanner:
                     new_y = y - direction * ty
 
                 if self._is_in_partition(new_x, new_y, target_partition_id):
-                    t1.append(self._point_with_width(new_x, new_y))
+                    candidate_point = self._point_with_width(new_x, new_y)
+                    if self._candidate_point_has_value(candidate_point):
+                        t1.append(candidate_point)
+                    else:
+                        low_value_rejects += 1
+                else:
+                    boundary_rejects += 1
 
             # 绘制中间过程
             if len(line) > 5 and (draw_first_line or perp_iter > 1):
@@ -404,13 +365,17 @@ class SurveyPlanner:
 
             # 检查空测线
             if len(t1) == 0:
-                print(f"[{direction_name}扩展] 第{perp_iter}轮无新有效点，结束规划")
+                print(
+                    f"[{direction_name}扩展] 第{perp_iter}轮无新有效点，结束规划 | "
+                    f"边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
+                )
                 break
 
             # 检查测线退化
             if len(t1) < 5:
                 print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<5)，测线退化，结束规划"
+                    f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<5)，"
+                    f"按从测线停止规则终止该方向 | 边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
                 )
                 break
 
@@ -418,149 +383,108 @@ class SurveyPlanner:
             self._update_current_partition_grid_with_polyline(line)
             terminated_reason = TerminationReason.NONE
 
-            # 主循环：自延伸和终止检测
-            if not in_convergence_state:
-                ext_step = self.step / 2
-                ext_loop = 0
+            # 主循环：两端按边界 + 细网格收益进行自延伸
+            ext_step = self.step / 2
+            ext_loop = 0
 
-                front_x, front_y = line[-1][0], line[-1][1]
-                back_x, back_y = line[0][0], line[0][1]
-                front_stopped = False
-                back_stopped = False
-                extend_front = True
+            front_x, front_y = line[-1][0], line[-1][1]
+            back_x, back_y = line[0][0], line[0][1]
+            front_stopped = False
+            back_stopped = False
+            front_stop_reason = TerminationReason.NONE
+            back_stop_reason = TerminationReason.NONE
+            extend_front = True
 
-                while True:
-                    if front_stopped and back_stopped:
-                        break
+            while True:
+                if front_stopped and back_stopped:
+                    break
 
-                    if extend_front and front_stopped:
-                        extend_front = False
-                        continue
-                    if not extend_front and back_stopped:
-                        extend_front = True
-                        continue
+                if extend_front and front_stopped:
+                    extend_front = False
+                    continue
+                if not extend_front and back_stopped:
+                    extend_front = True
+                    continue
 
-                    ext_loop += 1
+                ext_loop += 1
 
-                    if extend_front:
-                        dx, dy = forward_direction(
-                            get_gx(front_x, front_y), get_gy(front_x, front_y)
-                        )
-                        new_x = front_x + ext_step * dx
-                        new_y = front_y + ext_step * dy
-                    else:
-                        dx, dy = forward_direction(
-                            get_gx(back_x, back_y), get_gy(back_x, back_y)
-                        )
-                        new_x = back_x - ext_step * dx
-                        new_y = back_y - ext_step * dy
-
-                    if not self._is_in_partition(new_x, new_y, target_partition_id):
-                        if extend_front:
-                            print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
-                            front_stopped = True
-                        else:
-                            print(f"  [测线延伸-后端] 延伸{ext_loop}步后超出边界")
-                            back_stopped = True
-                        extend_front = not extend_front
-                        continue
-
-                    new_point = self._point_with_width(new_x, new_y)
-
-                    if extend_front:
-                        self._update_current_partition_grid_with_segment(
-                            line[-1], new_point
-                        )
-                        line.append(new_point)
-                    else:
-                        self._update_current_partition_grid_with_segment(
-                            new_point, line[0]
-                        )
-                        line.insert(0, new_point)
-
-                    # 评估终止条件
-                    line_arr = np.array(line)
-                    reason = self._evaluate_termination(
-                        line_arr,
-                        new_point,
-                        prev_lines,
-                        in_convergence_state,
-                        parent_line_length,
+                if extend_front:
+                    dx, dy = forward_direction(
+                        get_gx(front_x, front_y), get_gy(front_x, front_y)
                     )
+                    new_x = front_x + ext_step * dx
+                    new_y = front_y + ext_step * dy
+                else:
+                    dx, dy = forward_direction(
+                        get_gx(back_x, back_y), get_gy(back_x, back_y)
+                    )
+                    new_x = back_x - ext_step * dx
+                    new_y = back_y - ext_step * dy
 
-                    if reason == TerminationReason.SPIRAL:
-                        print(f"  [测线延伸] 检测到自交，螺旋终止")
-                        terminated_reason = reason
-                        break
-
-                    if reason == TerminationReason.INTERSECTION:
-                        print(f"  [测线延伸] 与历史测线相交，迷路终止")
-                        terminated_reason = reason
-                        if extend_front:
-                            front_stopped = True
-                        else:
-                            back_stopped = True
-                        extend_front = not extend_front
-                        continue
-
+                if not self._is_in_partition(new_x, new_y, target_partition_id):
                     if extend_front:
-                        front_x, front_y = new_x, new_y
+                        print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
+                        front_stopped = True
+                        front_stop_reason = TerminationReason.BOUNDARY
                     else:
-                        back_x, back_y = new_x, new_y
-
+                        print(f"  [测线延伸-后端] 延伸{ext_loop}步后超出边界")
+                        back_stopped = True
+                        back_stop_reason = TerminationReason.BOUNDARY
                     extend_front = not extend_front
+                    continue
+
+                new_point = self._point_with_width(new_x, new_y)
+                anchor_point = line[-1] if extend_front else line[0]
+                if not self._candidate_segment_has_value(anchor_point, new_point):
+                    if extend_front:
+                        print(f"  [测线延伸-前端] 新线段对应细网格收益不足，停止该端")
+                        front_stopped = True
+                        front_stop_reason = TerminationReason.LOW_VALUE
+                    else:
+                        print(f"  [测线延伸-后端] 新线段对应细网格收益不足，停止该端")
+                        back_stopped = True
+                        back_stop_reason = TerminationReason.LOW_VALUE
+                    extend_front = not extend_front
+                    continue
+
+                if extend_front:
+                    self._update_current_partition_grid_with_segment(
+                        line[-1], new_point
+                    )
+                    line.append(new_point)
+                    front_x, front_y = new_x, new_y
+                else:
+                    self._update_current_partition_grid_with_segment(new_point, line[0])
+                    line.insert(0, new_point)
+                    back_x, back_y = new_x, new_y
+
+                extend_front = not extend_front
 
             line = np.array(line)
+            terminated_reason = self._resolve_line_termination(
+                front_stop_reason, back_stop_reason
+            )
 
             # 记录指标
-            terminated_by = terminated_reason.name.lower()
+            terminated_by = (
+                terminated_reason.name.lower()
+                if terminated_reason != TerminationReason.NONE
+                else "boundary"
+            )
             self._record_line(line, partition_id, terminated_by)
 
-            prev_lines.append(line.copy())
-            if len(prev_lines) > 3:
-                prev_lines.pop(0)
             total_points += len(line)
 
             # 绘制和保存
-            if terminated_reason == TerminationReason.SPIRAL:
-                self.visualizer.draw_line(line, "red", 1.5)
-                # 使用质心距离比较判断收敛状态
-                if self._is_converging(line, main_line):
-                    in_convergence_state = True
-                    print(f"  [向内螺旋] 进入收敛状态，后续将进行饱和检查")
-                else:
-                    print(f"  [向外螺旋] 继续正常扩展")
-            elif terminated_reason == TerminationReason.INTERSECTION:
-                self.visualizer.draw_line(line, "purple", 1.5)
-            elif in_convergence_state:
-                # 收敛状态下的测线用黄色表示
+            if terminated_reason == TerminationReason.LOW_VALUE:
                 self.visualizer.draw_line(line, "orange", 1.5)
+            else:
+                self.visualizer.draw_line(line, "purple", 1.5)
 
             line_counter += 1
             snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}.png"
             self.visualizer.save_snapshot(snap_path)
             print(f"  >> 已保存测线: {snap_path}")
-
-            parent_line_length = figure_length(line)
-
-            # 检查饱和终止
-            if in_convergence_state:
-                centroid = np.mean(line, axis=0)
-                dists = np.sqrt(
-                    (line[:, 0] - centroid[0]) ** 2 + (line[:, 1] - centroid[1]) ** 2
-                )
-                min_dist = np.min(dists)
-                threshold = self.step * 2
-
-                print(
-                    f"  [饱和检查] min_dist={min_dist:.2f} < threshold={threshold:.2f}?"
-                )
-
-                if min_dist < threshold:
-                    print(
-                        f"[{direction_name}扩展] 测线饱和（最近点距质心{min_dist:.2f}m < {threshold:.2f}m），终止该方向扩展"
-                    )
-                    break
 
         print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | {total_points}点")
         return total_points, line_counter

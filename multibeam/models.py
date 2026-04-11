@@ -14,6 +14,7 @@ class TerminationReason(Enum):
 
     NONE = auto()  # 未终止
     BOUNDARY = auto()  # 超出分区边界
+    LOW_VALUE = auto()  # 细网格收益不足
     SPIRAL = auto()  # 累计偏转角 > 360°
     INTERSECTION = auto()  # 与已有测线相交
     SATURATION = auto()  # 测线收缩至质心内侧覆盖范围内
@@ -30,7 +31,7 @@ class LineRecord:
     points: np.ndarray  # [N, 3] = [x, y, w_total]
     length: float
     coverage: float
-    terminated_by: str  # "boundary" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
+    terminated_by: str  # "boundary" / "low_value" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
 
 
 @dataclass
