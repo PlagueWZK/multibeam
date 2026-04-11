@@ -371,10 +371,10 @@ class SurveyPlanner:
                 )
                 break
 
-            # 检查测线退化
-            if len(t1) < 5:
+            # 检查测线退化：只丢弃长度不足以形成线段的情况
+            if len(t1) <= 1:
                 print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<5)，"
+                    f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<=1)，"
                     f"按从测线停止规则终止该方向 | 边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
                 )
                 break
