@@ -61,7 +61,7 @@ class SurveyPlanner:
         self.n = n
 
         # 双网格细网格参数（按冻结方案设置默认值）
-        self.fine_grid_scale = 1.5
+        self.fine_grid_scale = 1.0
         self.max_cells_per_partition = 100000
         self.fine_grid_sampling_points = 9
         self.fine_grid_full_threshold = 0.9

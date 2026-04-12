@@ -81,7 +81,7 @@ class PartitionCoverageStateGrid:
         x_max: float | None = None,
         y_min: float | None = None,
         y_max: float | None = None,
-        cell_size_scale: float = 1.5,
+        cell_size_scale: float = 1.0,
         max_cells: int = 100000,
         sampling_points: int = 9,
         full_threshold: float = 0.9,
