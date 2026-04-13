@@ -114,14 +114,21 @@ class SurveyVisualizer:
     def draw_partition_background(self):
         """绘制分区背景"""
         grid_x, grid_y = np.meshgrid(self.xs, self.ys)
-        partition_ids = sorted(np.unique(self.cluster_matrix).astype(int))
+        partition_ids = [
+            int(pid)
+            for pid in sorted(np.unique(self.cluster_matrix).astype(int))
+            if int(pid) >= 0
+        ]
+        display_matrix = np.ma.masked_where(
+            self.cluster_matrix < 0, self.cluster_matrix
+        )
 
         # 绘制底色
         cmap = plt.cm.get_cmap("Set3", len(partition_ids))
         self.ax.contourf(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids) + 1) - 0.5,
             cmap=cmap,
             alpha=0.25,
@@ -132,7 +139,7 @@ class SurveyVisualizer:
         self.ax.contour(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids)) + 0.5,
             colors="gray",
             linewidths=1.0,
@@ -190,10 +197,13 @@ class SurveyVisualizer:
     def _draw_partition_background_on_ax(self, ax, partition_ids):
         grid_x, grid_y = np.meshgrid(self.xs, self.ys)
         cmap = plt.cm.get_cmap("Set3", len(partition_ids))
+        display_matrix = np.ma.masked_where(
+            self.cluster_matrix < 0, self.cluster_matrix
+        )
         ax.contourf(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids) + 1) - 0.5,
             cmap=cmap,
             alpha=0.25,
@@ -202,10 +212,13 @@ class SurveyVisualizer:
 
     def _draw_partition_boundaries_on_ax(self, ax, partition_ids):
         grid_x, grid_y = np.meshgrid(self.xs, self.ys)
+        display_matrix = np.ma.masked_where(
+            self.cluster_matrix < 0, self.cluster_matrix
+        )
         ax.contour(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids)) + 0.5,
             colors="gray",
             linewidths=1.0,

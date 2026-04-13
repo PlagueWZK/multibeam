@@ -14,7 +14,10 @@ from pathlib import Path
 import numpy as np
 
 # 从拆分后的模块导入
-from multibeam.coverage_state_grid import PartitionCoverageStateGrid
+from multibeam.coverage_state_grid import (
+    PartitionCoverageStateGrid,
+    infer_uniform_cell_size,
+)
 from multibeam.models import LineRecord, PartitionResult, TerminationReason
 from multibeam.Partition import get_partition_for_point, is_point_in_partition
 from multibeam.planner_visualizer import SurveyVisualizer, save_dot_csv
@@ -50,6 +53,9 @@ class SurveyPlanner:
         x_max=None,
         y_min=None,
         y_max=None,
+        boundary_mask=None,
+        cell_effective_area=None,
+        grid_cell_size=None,
     ):
         self.xs = xs
         self.ys = ys
@@ -60,11 +66,9 @@ class SurveyPlanner:
         self.theta_rad = np.radians(theta)
         self.n = n
 
-        # 双网格细网格参数（按冻结方案设置默认值）
-        self.fine_grid_scale = 1.0
-        self.max_cells_per_partition = 100000
+        # 统一网格参数（直接复用 Coverage 阶段网格）
         self.fine_grid_sampling_points = 9
-        self.fine_grid_full_threshold = 0.9
+        self.fine_grid_full_threshold = 1.0
         self.step_scale = 1.0
         self.microstep_min = 10.0
         self.microstep_max = 70.0
@@ -80,6 +84,21 @@ class SurveyPlanner:
         self.y_min = float(y_min) if y_min is not None else float(ys[0])
         self.y_max = float(y_max) if y_max is not None else float(ys[-1])
         self.total_area = (self.x_max - self.x_min) * (self.y_max - self.y_min)
+        self.boundary_mask = (
+            np.asarray(boundary_mask, dtype=bool)
+            if boundary_mask is not None
+            else np.ones_like(self.cluster_matrix, dtype=bool)
+        )
+        self.cell_effective_area = (
+            np.asarray(cell_effective_area, dtype=float)
+            if cell_effective_area is not None
+            else None
+        )
+        self.grid_cell_size = (
+            float(grid_cell_size)
+            if grid_cell_size is not None
+            else infer_uniform_cell_size(self.xs, self.ys)
+        )
 
         # 即时指标存储
         self.all_records: list[LineRecord] = []
@@ -521,8 +540,9 @@ class SurveyPlanner:
             x_max=self.x_max,
             y_min=self.y_min,
             y_max=self.y_max,
-            cell_size_scale=self.fine_grid_scale,
-            max_cells=self.max_cells_per_partition,
+            boundary_mask=self.boundary_mask,
+            cell_effective_area=self.cell_effective_area,
+            cell_size=self.grid_cell_size,
             sampling_points=self.fine_grid_sampling_points,
             full_threshold=self.fine_grid_full_threshold,
             step_scale=self.step_scale,
@@ -540,10 +560,9 @@ class SurveyPlanner:
         self.current_partition_grid = state_grid
 
         print(
-            f"[分区{partition_id}] 细网格初始化 | l={state_grid.cell_size:.2f}m | "
+            f"[分区{partition_id}] 统一网格初始化 | d={state_grid.cell_size:.2f}m | "
             f"step={self.step:.2f}m | microstep={self.current_microstep:.2f}m | "
             f"cells={state_grid.total_cells}"
-            + (" | 已触发cells上限保护" if state_grid.max_cells_guard_triggered else "")
         )
 
         try:

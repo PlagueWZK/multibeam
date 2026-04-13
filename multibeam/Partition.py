@@ -69,7 +69,7 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
 
 
 def partition_coverage_matrix(
-    xs, ys, coverage_matrix, U=None, k_max=10, output_dir=None
+    xs, ys, coverage_matrix, U=None, k_max=10, output_dir=None, boundary_mask=None
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
@@ -80,9 +80,9 @@ def partition_coverage_matrix(
         U: 指定分区数量（可选）。若传入则直接使用，若为 None 则使用 Elbow 法则自动确定
         k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
+        boundary_mask: 有效海域掩码。若提供，则仅对有效格聚类，其余位置标记为 -1
     """
     rows, cols = coverage_matrix.shape
-    n_samples = rows * cols
 
     # 1. 构建特征矩阵 (X坐标, Y坐标, 覆盖次数, 梯度x, 梯度y)
     # 注意：这里引入空间坐标是为了保证聚类结果在地理空间上的连续性
@@ -106,11 +106,21 @@ def partition_coverage_matrix(
     # 将空间坐标、覆盖次数与梯度方向拼接 (N, 5)
     features = np.hstack((feature_x, feature_y, feature_c, gx_flat, gy_flat))
 
+    if boundary_mask is None:
+        valid_mask_1d = np.ones(rows * cols, dtype=bool)
+    else:
+        valid_mask_1d = np.asarray(boundary_mask, dtype=bool).reshape(-1)
+
+    valid_features = features[valid_mask_1d]
+    n_samples = len(valid_features)
+    if n_samples == 0:
+        raise ValueError("无有效海域网格可用于聚类，请检查 boundary_mask。")
+
     # 2. 特征缩放（修复：在标准化前计算权重，避免权重失效）
     # 先计算原始特征的尺度差异，用于后续权重调节
-    std_xy_raw = np.std(features[:, :2])
-    std_c_raw = np.std(features[:, 2])
-    std_g_raw = np.std(features[:, 3:5])
+    std_xy_raw = np.std(valid_features[:, :2])
+    std_c_raw = np.std(valid_features[:, 2])
+    std_g_raw = np.std(valid_features[:, 3:5])
 
     # 计算覆盖次数相对于空间坐标的权重比
     # 目的：使覆盖次数维度的尺度与空间坐标维度相当
@@ -119,7 +129,7 @@ def partition_coverage_matrix(
     w_grad = std_xy_raw / (std_g_raw + 1e-6)
 
     # 应用权重
-    weighted_features = features.copy().astype(float)
+    weighted_features = valid_features.copy().astype(float)
     weighted_features[:, 2] *= w_cover
     weighted_features[:, 3:5] *= w_grad
 
@@ -149,35 +159,43 @@ def partition_coverage_matrix(
     # 4. 对覆盖次数矩阵进行 K-means 空间聚类
     print(f"正在执行 K-means 聚类 (U={optimal_u})...")
     final_kmeans = KMeans(n_clusters=optimal_u, random_state=42, n_init=10)
-    cluster_labels_1d = final_kmeans.fit_predict(scaled_features)
+    cluster_labels_valid = final_kmeans.fit_predict(scaled_features)
 
     # 5. 将一维的聚类标签还原为二维矩阵
+    cluster_labels_1d = np.full(rows * cols, -1, dtype=int)
+    cluster_labels_1d[valid_mask_1d] = cluster_labels_valid
     cluster_matrix = cluster_labels_1d.reshape(rows, cols)
 
     # 6. 可视化分区结果并确定每个区域的边界线
     plt.figure(figsize=(10, 8))
 
     # 绘制底图分区颜色
+    display_matrix = np.ma.masked_where(cluster_matrix < 0, cluster_matrix)
     plt.imshow(
-        cluster_matrix,
+        display_matrix,
         extent=[xs.min(), xs.max(), ys.max(), ys.min()],
         cmap="Set3",
         aspect="auto",
     )
 
     # 检测边界像素：任何相邻像素属于不同分区的像素即为边界
+    valid_matrix = cluster_matrix >= 0
     boundary = np.zeros_like(cluster_matrix, dtype=bool)
-    boundary[:-1, :] |= cluster_matrix[:-1, :] != cluster_matrix[1:, :]
-    boundary[1:, :] |= cluster_matrix[:-1, :] != cluster_matrix[1:, :]
-    boundary[:, :-1] |= cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
-    boundary[:, 1:] |= cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
+    vertical_diff = cluster_matrix[:-1, :] != cluster_matrix[1:, :]
+    vertical_valid = valid_matrix[:-1, :] | valid_matrix[1:, :]
+    horizontal_diff = cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
+    horizontal_valid = valid_matrix[:, :-1] | valid_matrix[:, 1:]
+    boundary[:-1, :] |= vertical_diff & vertical_valid
+    boundary[1:, :] |= vertical_diff & vertical_valid
+    boundary[:, :-1] |= horizontal_diff & horizontal_valid
+    boundary[:, 1:] |= horizontal_diff & horizontal_valid
 
     # 用散点图绘制边界（单像素宽度，避免 contour 的多重轮廓叠加）
     if np.any(boundary):
         by, bx = np.where(boundary)
         # 将网格索引转换为实际坐标
-        px = xs[0] + bx * (xs[-1] - xs[0]) / (cols - 1)
-        py = ys[0] + by * (ys[-1] - ys[0]) / (rows - 1)
+        px = xs[bx]
+        py = ys[by]
         plt.scatter(px, py, c="black", s=0.3, marker="s", linewidths=0, zorder=2)
 
     plt.title(f"K-means Spatial Partitioning (U={optimal_u}) with Boundary Lines")
