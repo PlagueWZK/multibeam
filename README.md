@@ -62,7 +62,8 @@ multibeam/
 ```
 data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
                    │  输入: 原始 Excel 深度矩阵
-                   │  算法: 圆面积拟合误差 < 0.1% 的最优网格边长 d
+                   │  算法: 基于专利误差项 E(d,ξ) 的最优网格边长 d
+                   │        且候选 d 严格小于原始数据网格边长
                    ▼
               d_optimal
                    │
@@ -142,7 +143,7 @@ data.xlsx ──► [Phase 1] GridCell.calculate_optimal_mesh_size()
 | `theta`     | 120°                 | 多处          | 换能器开角       |
 | `n`         | 0.1                  | Planner.py  | 重叠率         |
 | `step`      | 50                   | Planner.py  | 测线延伸步长      |
-| `min_error` | 0.001                | GridCell.py | 网格拟合误差阈值    |
+| `min_error` | 0.001 (=0.1%)        | GridCell.py | 相对面积误差阈值（内部映射到专利误差项） |
 | `U`         | None (自动)            | main.py     | 分区数量（可手动指定） |
 | `microstep` | 35                   | Data.py     | 坡度角计算的微步长   |
 | 海域范围        | 0~~5×1852, 0~~4×1852 | main.py     | X/Y 边界（米）   |

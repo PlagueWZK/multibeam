@@ -4,6 +4,32 @@ import numpy as np
 from tool import Data
 from tool import Tool
 
+NAUTICAL_MILE_TO_METER = 1852.0
+
+
+def infer_raw_grid_spacing_m(x, y):
+    """根据原始 Excel 坐标推断原始网格边长（米）。"""
+
+    x_unique = np.sort(np.unique(np.asarray(x, dtype=float)))
+    y_unique = np.sort(np.unique(np.asarray(y, dtype=float)))
+    x_diff = np.diff(x_unique)
+    y_diff = np.diff(y_unique)
+    x_diff = x_diff[x_diff > 1e-12]
+    y_diff = y_diff[y_diff > 1e-12]
+
+    if len(x_diff) == 0 and len(y_diff) == 0:
+        raise ValueError("无法从原始坐标推断网格边长。")
+
+    candidate_steps = []
+    if len(x_diff) > 0:
+        candidate_steps.append(float(np.min(x_diff)))
+    if len(y_diff) > 0:
+        candidate_steps.append(float(np.min(y_diff)))
+
+    raw_spacing_nm = min(candidate_steps)
+    raw_spacing_m = raw_spacing_nm * NAUTICAL_MILE_TO_METER
+    return raw_spacing_nm, raw_spacing_m
+
 
 def compute_axis_effective_lengths(centers, cell_size, lower, upper):
     """计算一维均匀网格在矩形边界内的有效长度。"""
@@ -29,6 +55,7 @@ def compute_effective_cell_area_matrix(xs, ys, d, x_min, x_max, y_min, y_max):
 def calculate_optimal_mesh_size(data_path, min_error=0.001):
     # 读取高程/深度数据
     x, y, z = Tool.read_grid(data_path)
+    raw_spacing_nm, raw_spacing_m = infer_raw_grid_spacing_m(x, y)
 
     max_depth = np.max(z)
     print("最大深度:", max_depth)
@@ -43,16 +70,27 @@ def calculate_optimal_mesh_size(data_path, min_error=0.001):
     A = np.pi * xi**2
 
     print(f"xi: {xi:.2f}, A: {A:.2f}")
-    # 2. 设定控制精度的目标误差阈值 (默认 0.1% 的相对误差)
-    error_threshold = min_error
+    # 2. 设定控制精度的目标误差阈值。
+    # 为保持外部参数 min_error 的兼容性，仍将其解释为“允许的相对面积误差上限”。
+    # 再映射为专利误差项下限：
+    #   E(d, ξ) = (1 - |A - B| / A) * ξ^2
+    relative_error_threshold = min_error
+    patent_error_threshold = (1 - relative_error_threshold) * (xi**2)
 
     # 3. 初始化寻优参数
     optimal_d = None
-    # 设定 d 的搜索范围，从较大的网格逐渐细化到较小的网格
-    # 步长可以根据实际精度需求调整，这里以 0.5 为步长递减
-    d_candidates = np.arange(xi, 0.1, -0.5)
+    # 设定 d 的搜索范围。
+    # 保持专利误差项不变，但增加工程约束：候选 d 不允许超过原始数据网格边长。
+    # 为满足“结果小于原始网格边长”的要求，搜索上界采用严格小于原始网格的形式。
+    search_step = 0.5
+    if raw_spacing_m - search_step > 0.1:
+        candidate_upper_bound = raw_spacing_m - search_step
+    else:
+        candidate_upper_bound = np.nextafter(raw_spacing_m, 0.0)
+    d_candidates = np.arange(candidate_upper_bound, 0.1, -search_step)
 
-    final_E = None
+    final_relative_error = None
+    final_patent_E = None
 
     for d in d_candidates:
         # 计算在当前网格边长 d 下，X轴和Y轴方向的最大网格索引
@@ -70,24 +108,32 @@ def calculate_optimal_mesh_size(data_path, min_error=0.001):
         # 计算被判定为邻域覆盖的区域面积 B
         B = N_points * (d**2)
 
-        # 计算相对误差 E(d, ξ)
-        E = abs(A - B) / A
+        # 计算相对面积误差 |A-B|/A
+        relative_error = abs(A - B) / A
 
-        # 根据专利中的误差项指数拟合逻辑，误差会随着 d 的减小趋近于0
-        # 当误差首次小于设定的阈值时，认为找到了满足精度的最优且最经济的网格边长
-        if E <= error_threshold:
+        # 按专利公式构造误差项 E(d, ξ)
+        patent_error = (1 - relative_error) * (xi**2)
+
+        # 当专利误差项首次达到目标下限时，认为找到了满足精度且最经济的网格边长。
+        # 这里的目标下限由原有相对误差阈值等价映射而来，保持外部调用兼容性。
+        if patent_error >= patent_error_threshold:
             optimal_d = d
-            final_E = E
+            final_relative_error = relative_error
+            final_patent_E = patent_error
             break
 
     # 输出结果
     print(f"最大有效测深宽度 (w_max): {w_max:.2f}")
     print(f"邻域覆盖半径 (ξ): {xi:.2f}")
-    print(f"设定误差阈值: {error_threshold * 100}%")
+    print(f"原始网格边长: {raw_spacing_nm:.4f} 海里 = {raw_spacing_m:.2f} m")
+    print(f"候选 d 严格上界: {candidate_upper_bound:.2f} m")
+    print(f"设定相对面积误差阈值: {relative_error_threshold * 100}%")
+    print(f"对应专利误差项下限: {patent_error_threshold:.4f}")
 
     if optimal_d:
         print(f"满足精度的最优网格边长 (d): {optimal_d:.2f}")
-        print(f"最终拟合误差 (E): {final_E * 100:.4f}%")
+        print(f"最终专利误差项 E(d, ξ): {final_patent_E:.4f}")
+        print(f"最终相对面积误差: {final_relative_error * 100:.4f}%")
     else:
         print("在指定范围内未找到满足精度的 d，请尝试减小搜索下限或增大误差阈值。")
     return optimal_d
