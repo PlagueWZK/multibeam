@@ -11,4 +11,6 @@ __pycache__/
 *.pyc
 *.pyoa
 *.pyd
-/docs/
+
+/docs/*
+!/docs/original/
