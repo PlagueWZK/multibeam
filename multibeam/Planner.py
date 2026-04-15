@@ -844,10 +844,6 @@ class SurveyPlanner:
                 "值": round(self.total_area, 2),
             },
             {
-                "指标": "细网格分区待测面积汇总-诊断值(m²)",
-                "值": round(global_new_partition_area, 2),
-            },
-            {
                 "指标": "细网格待测面积偏差-诊断值(m²)",
                 "值": round(global_new_partition_area - self.total_area, 2),
             },

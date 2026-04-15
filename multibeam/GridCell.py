@@ -52,81 +52,115 @@ def compute_effective_cell_area_matrix(xs, ys, d, x_min, x_max, y_min, y_max):
     return x_lengths, y_lengths, cell_effective_area, cell_area_ratio
 
 
-def calculate_optimal_mesh_size(data_path, min_error=0.001):
-    # 读取高程/深度数据
+def calculate_mesh_size_search_trace(data_path, min_error=0.001, search_step=0.5):
+    """计算最优 d 搜索过程的完整误差轨迹。"""
+
     x, y, z = Tool.read_grid(data_path)
     raw_spacing_nm, raw_spacing_m = infer_raw_grid_spacing_m(x, y)
 
     max_depth = np.max(z)
-    print("最大深度:", max_depth)
-
     theta = 120
-
-    # 计算最大有效测深宽度
     w_max = max_depth * Data.tan(theta / 2) * 2
-
-    # 1. 计算邻域覆盖半径 ξ 和圆的理论面积 A
     xi = w_max / 2
     A = np.pi * xi**2
 
-    print(f"xi: {xi:.2f}, A: {A:.2f}")
-    # 2. 设定控制精度的目标误差阈值。
-    # 为保持外部参数 min_error 的兼容性，仍将其解释为“允许的相对面积误差上限”。
-    # 再映射为专利误差项下限：
-    #   E(d, ξ) = (1 - |A - B| / A) * ξ^2
     relative_error_threshold = min_error
     patent_error_threshold = (1 - relative_error_threshold) * (xi**2)
 
-    # 3. 初始化寻优参数
-    optimal_d = None
-    # 设定 d 的搜索范围。
-    # 保持专利误差项不变，但增加工程约束：候选 d 不允许超过原始数据网格边长。
-    # 为满足“结果小于原始网格边长”的要求，搜索上界采用严格小于原始网格的形式。
-    search_step = 0.5
-    if raw_spacing_m - search_step > 0.1:
-        candidate_upper_bound = raw_spacing_m - search_step
-    else:
-        candidate_upper_bound = np.nextafter(raw_spacing_m, 0.0)
-    d_candidates = np.arange(candidate_upper_bound, 0.1, -search_step)
+    start_d = float(xi)
+    d_candidates = np.arange(start_d, 0.0, -search_step)
 
+    def build_record(d, *, is_raw_spacing_reference, is_search_candidate):
+        max_idx = int(xi / d)
+        m = np.arange(-max_idx, max_idx + 1)
+        n = np.arange(-max_idx, max_idx + 1)
+        M, N = np.meshgrid(m, n)
+        N_points = int(np.sum(M**2 + N**2 <= (xi / d) ** 2))
+        B = N_points * (d**2)
+        relative_error = abs(A - B) / A
+        patent_error = (1 - relative_error) * (xi**2)
+        meets_threshold = patent_error >= patent_error_threshold
+        return {
+            "d_m": float(d),
+            "relative_error": float(relative_error),
+            "relative_error_percent": float(relative_error * 100),
+            "patent_error": float(patent_error),
+            "meets_threshold": bool(meets_threshold),
+            "grid_points_in_circle": N_points,
+            "covered_area_B": float(B),
+            "theoretical_area_A": float(A),
+            "is_raw_spacing_reference": bool(is_raw_spacing_reference),
+            "is_search_candidate": bool(is_search_candidate),
+            "radius_grid_count": int(max_idx),
+        }
+
+    trace_records = [
+        build_record(
+            raw_spacing_m,
+            is_raw_spacing_reference=True,
+            is_search_candidate=False,
+        )
+    ]
+
+    optimal_d = None
     final_relative_error = None
     final_patent_E = None
 
     for d in d_candidates:
-        # 计算在当前网格边长 d 下，X轴和Y轴方向的最大网格索引
-        max_idx = int(xi / d)
+        record = build_record(
+            d,
+            is_raw_spacing_reference=False,
+            is_search_candidate=True,
+        )
+        trace_records.append(record)
+        if optimal_d is None and record["meets_threshold"]:
+            optimal_d = float(d)
+            final_relative_error = record["relative_error"]
+            final_patent_E = record["patent_error"]
 
-        # 生成 m 和 n 的二维坐标网格
-        m = np.arange(-max_idx, max_idx + 1)
-        n = np.arange(-max_idx, max_idx + 1)
-        M, N = np.meshgrid(m, n)
+    return {
+        "max_depth": float(max_depth),
+        "theta": float(theta),
+        "w_max": float(w_max),
+        "xi": float(xi),
+        "theoretical_area_A": float(A),
+        "raw_spacing_nm": float(raw_spacing_nm),
+        "raw_spacing_m": float(raw_spacing_m),
+        "start_d": float(start_d),
+        "search_step": float(search_step),
+        "relative_error_threshold": float(relative_error_threshold),
+        "patent_error_threshold": float(patent_error_threshold),
+        "optimal_d": optimal_d,
+        "final_relative_error": final_relative_error,
+        "final_patent_E": final_patent_E,
+        "trace_records": trace_records,
+    }
 
-        # 统计落在圆内的格点数 N(d, ξ)
-        # 判定条件：(m*d)^2 + (n*d)^2 <= xi^2，即 m^2 + n^2 <= (xi/d)^2
-        N_points = np.sum(M**2 + N**2 <= (xi / d) ** 2)
 
-        # 计算被判定为邻域覆盖的区域面积 B
-        B = N_points * (d**2)
+def calculate_optimal_mesh_size(data_path, min_error=0.001):
+    trace_result = calculate_mesh_size_search_trace(data_path, min_error=min_error)
+    max_depth = trace_result["max_depth"]
+    print("最大深度:", max_depth)
 
-        # 计算相对面积误差 |A-B|/A
-        relative_error = abs(A - B) / A
+    xi = trace_result["xi"]
+    A = trace_result["theoretical_area_A"]
 
-        # 按专利公式构造误差项 E(d, ξ)
-        patent_error = (1 - relative_error) * (xi**2)
-
-        # 当专利误差项首次达到目标下限时，认为找到了满足精度且最经济的网格边长。
-        # 这里的目标下限由原有相对误差阈值等价映射而来，保持外部调用兼容性。
-        if patent_error >= patent_error_threshold:
-            optimal_d = d
-            final_relative_error = relative_error
-            final_patent_E = patent_error
-            break
+    print(f"xi: {xi:.2f}, A: {A:.2f}")
+    relative_error_threshold = trace_result["relative_error_threshold"]
+    patent_error_threshold = trace_result["patent_error_threshold"]
+    optimal_d = trace_result["optimal_d"]
+    final_relative_error = trace_result["final_relative_error"]
+    final_patent_E = trace_result["final_patent_E"]
+    w_max = trace_result["w_max"]
+    raw_spacing_nm = trace_result["raw_spacing_nm"]
+    raw_spacing_m = trace_result["raw_spacing_m"]
+    start_d = trace_result["start_d"]
 
     # 输出结果
     print(f"最大有效测深宽度 (w_max): {w_max:.2f}")
     print(f"邻域覆盖半径 (ξ): {xi:.2f}")
     print(f"原始网格边长: {raw_spacing_nm:.4f} 海里 = {raw_spacing_m:.2f} m")
-    print(f"候选 d 严格上界: {candidate_upper_bound:.2f} m")
+    print(f"覆盖邻域半径网格数为1时的起始 d: {start_d:.2f} m")
     print(f"设定相对面积误差阈值: {relative_error_threshold * 100}%")
     print(f"对应专利误差项下限: {patent_error_threshold:.4f}")
 
