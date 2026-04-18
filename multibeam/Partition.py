@@ -383,7 +383,7 @@ def partition_coverage_matrix(
     boundary_mask=None,
     gx_matrix=None,
     gy_matrix=None,
-    primary_feature_mode="coverage_only",
+    primary_feature_mode="xy_coverage",
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
     direction_dispersion_threshold=0.35,
