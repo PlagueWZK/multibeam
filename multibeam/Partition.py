@@ -1,3 +1,4 @@
+import json
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
@@ -5,6 +6,10 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 from tool.Data import get_gx, get_gy
+
+
+PRIMARY_FEATURE_NAMES = ("X", "Y", "coverage_count")
+SECONDARY_FEATURE_NAMES = ("X", "Y", "coverage_count", "gx", "gy")
 
 
 def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
@@ -68,8 +73,252 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
     return optimal_u
 
 
+def _build_feature_stacks(xs, ys, coverage_matrix):
+    rows, cols = coverage_matrix.shape
+    grid_x, grid_y = np.meshgrid(xs, ys)
+
+    print("[分区] 正在计算网格点梯度方向...")
+    flat_xy = list(zip(grid_x.flatten(), grid_y.flatten()))
+    gx_flat = np.array([get_gx(x, y) for x, y in flat_xy], dtype=float).reshape(-1, 1)
+    gy_flat = np.array([get_gy(x, y) for x, y in flat_xy], dtype=float).reshape(-1, 1)
+
+    feature_x = grid_x.flatten().reshape(-1, 1)
+    feature_y = grid_y.flatten().reshape(-1, 1)
+    feature_c = coverage_matrix.flatten().reshape(-1, 1)
+
+    primary_features = np.hstack((feature_x, feature_y, feature_c))
+    secondary_features = np.hstack((feature_x, feature_y, feature_c, gx_flat, gy_flat))
+
+    return {
+        "rows": rows,
+        "cols": cols,
+        "grid_x": grid_x,
+        "grid_y": grid_y,
+        "gx_matrix": gx_flat.reshape(rows, cols),
+        "gy_matrix": gy_flat.reshape(rows, cols),
+        "primary_features": primary_features,
+        "secondary_features": secondary_features,
+    }
+
+
+def _scale_features_for_kmeans(valid_features):
+    weighted_features = valid_features.copy().astype(float)
+
+    std_xy_raw = float(np.std(valid_features[:, :2]))
+    weighted_features[:, 2] *= std_xy_raw / (float(np.std(valid_features[:, 2])) + 1e-6)
+
+    if valid_features.shape[1] >= 5:
+        weighted_features[:, 3:5] *= std_xy_raw / (
+            float(np.std(valid_features[:, 3:5])) + 1e-6
+        )
+
+    scaler = StandardScaler()
+    return scaler.fit_transform(weighted_features)
+
+
+def _cluster_with_selected_mask(
+    features,
+    selected_mask_1d,
+    rows,
+    cols,
+    U=None,
+    k_max=10,
+    output_dir=None,
+    elbow_subdir=None,
+):
+    valid_features = features[selected_mask_1d]
+    n_samples = len(valid_features)
+    if n_samples == 0:
+        raise ValueError("无有效海域网格可用于聚类，请检查有效掩码。")
+    if n_samples < 3:
+        raise ValueError(f"可用于聚类的数据点过少 (n={n_samples})，至少需要 3 个点。")
+
+    scaled_features = _scale_features_for_kmeans(valid_features)
+
+    if U is not None:
+        if U < 2:
+            raise ValueError(f"分区数 U 必须 >= 2，当前传入 U={U}")
+        if U > n_samples - 1:
+            raise ValueError(
+                f"分区数 U={U} 超过数据点数 (n={n_samples})，"
+                f"KMeans 要求 n_clusters < n_samples"
+            )
+        optimal_u = U
+        print(f"[分区] 使用指定分区数量 U = {optimal_u}")
+    else:
+        elbow_output_dir = None
+        if output_dir is not None:
+            elbow_output_dir = Path(output_dir)
+            if elbow_subdir is not None:
+                elbow_output_dir = elbow_output_dir / elbow_subdir
+        optimal_u = find_optimal_k_elbow(
+            scaled_features,
+            k_min=2,
+            k_max=k_max,
+            output_dir=elbow_output_dir,
+        )
+        print(f"[分区] 根据 Elbow 准则自动确定 U = {optimal_u}")
+
+    print(f"正在执行 K-means 聚类 (U={optimal_u})...")
+    final_kmeans = KMeans(n_clusters=optimal_u, random_state=42, n_init=10)
+    cluster_labels_valid = final_kmeans.fit_predict(scaled_features)
+
+    cluster_labels_1d = np.full(rows * cols, -1, dtype=int)
+    cluster_labels_1d[selected_mask_1d] = cluster_labels_valid
+    return cluster_labels_1d.reshape(rows, cols), optimal_u
+
+
+def _detect_partition_boundaries(cluster_matrix):
+    valid_matrix = cluster_matrix >= 0
+    boundary = np.zeros_like(cluster_matrix, dtype=bool)
+    vertical_diff = cluster_matrix[:-1, :] != cluster_matrix[1:, :]
+    vertical_valid = valid_matrix[:-1, :] | valid_matrix[1:, :]
+    horizontal_diff = cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
+    horizontal_valid = valid_matrix[:, :-1] | valid_matrix[:, 1:]
+    boundary[:-1, :] |= vertical_diff & vertical_valid
+    boundary[1:, :] |= vertical_diff & vertical_valid
+    boundary[:, :-1] |= horizontal_diff & horizontal_valid
+    boundary[:, 1:] |= horizontal_diff & horizontal_valid
+    return boundary
+
+
+def _save_partition_plot(cluster_matrix, xs, ys, output_dir, file_name, title):
+    plt.figure(figsize=(10, 8))
+    display_matrix = np.ma.masked_where(cluster_matrix < 0, cluster_matrix)
+    plt.imshow(
+        display_matrix,
+        extent=[xs.min(), xs.max(), ys.max(), ys.min()],
+        cmap="Set3",
+        aspect="auto",
+    )
+
+    boundary = _detect_partition_boundaries(cluster_matrix)
+    if np.any(boundary):
+        by, bx = np.where(boundary)
+        plt.scatter(xs[bx], ys[by], c="black", s=0.3, marker="s", linewidths=0, zorder=2)
+
+    plt.title(title)
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.gca().invert_yaxis()
+    plt.colorbar(label="Cluster ID")
+
+    if output_dir is not None:
+        partition_dir = Path(output_dir) / "partition"
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(partition_dir / file_name, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def _renumber_cluster_matrix(cluster_matrix):
+    renumbered = np.full_like(cluster_matrix, -1, dtype=int)
+    next_id = 0
+    for pid in sorted(np.unique(cluster_matrix).astype(int)):
+        if pid < 0:
+            continue
+        renumbered[cluster_matrix == pid] = next_id
+        next_id += 1
+    return renumbered, next_id
+
+
+def _summarize_partition_gradient_complexity(
+    partition_id,
+    partition_mask,
+    gx_matrix,
+    gy_matrix,
+    unit_gx_matrix,
+    unit_gy_matrix,
+    direction_valid_mask,
+    min_partition_size_for_secondary=12,
+    direction_dispersion_threshold=0.35,
+):
+    cell_count = int(np.count_nonzero(partition_mask))
+
+    gx_values = gx_matrix[partition_mask]
+    gy_values = gy_matrix[partition_mask]
+    magnitudes = np.hypot(gx_values, gy_values)
+    finite_magnitudes = magnitudes[np.isfinite(magnitudes)]
+    mean_magnitude = float(np.mean(finite_magnitudes)) if finite_magnitudes.size else 0.0
+    std_magnitude = float(np.std(finite_magnitudes)) if finite_magnitudes.size else 0.0
+    unit_like_gradient = bool(
+        finite_magnitudes.size > 0
+        and np.allclose(finite_magnitudes, 1.0, atol=0.05, rtol=0.05)
+    )
+
+    direction_points = int(np.count_nonzero(partition_mask & direction_valid_mask))
+    direction_dispersion = 0.0
+    mean_resultant_length = 1.0
+    if direction_points > 0:
+        ux = unit_gx_matrix[partition_mask & direction_valid_mask]
+        uy = unit_gy_matrix[partition_mask & direction_valid_mask]
+        mean_resultant_length = float(np.hypot(np.mean(ux), np.mean(uy)))
+        direction_dispersion = float(max(0.0, 1.0 - mean_resultant_length))
+
+    trigger_reasons = []
+    if cell_count < min_partition_size_for_secondary:
+        trigger_reasons.append("too_small_for_secondary")
+        triggered = False
+    else:
+        if direction_dispersion >= direction_dispersion_threshold:
+            trigger_reasons.append("direction_dispersion")
+        triggered = bool(trigger_reasons)
+
+    return {
+        "partition_id": int(partition_id),
+        "cell_count": cell_count,
+        "direction_points": direction_points,
+        "mean_gradient_magnitude": mean_magnitude,
+        "std_gradient_magnitude": std_magnitude,
+        "unit_like_gradient": unit_like_gradient,
+        "mean_resultant_length": mean_resultant_length,
+        "direction_dispersion": direction_dispersion,
+        "triggered_secondary_partition": triggered,
+        "trigger_reasons": trigger_reasons,
+    }
+
+
+def _write_secondary_partition_diagnostics(
+    output_dir,
+    first_stage_u,
+    final_u,
+    diagnostics,
+    direction_dispersion_threshold,
+    min_partition_size_for_secondary,
+    secondary_k_max,
+):
+    if output_dir is None:
+        return
+
+    partition_dir = Path(output_dir) / "partition"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = partition_dir / "secondary_partition_diagnostics.json"
+    payload = {
+        "primary_features": list(PRIMARY_FEATURE_NAMES),
+        "secondary_features": list(SECONDARY_FEATURE_NAMES),
+        "first_stage_u": int(first_stage_u),
+        "final_u": int(final_u),
+        "secondary_detection_thresholds": {
+            "direction_dispersion_threshold": float(direction_dispersion_threshold),
+            "min_partition_size_for_secondary": int(min_partition_size_for_secondary),
+            "secondary_k_max": int(secondary_k_max),
+        },
+        "partitions": diagnostics,
+    }
+    with diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def partition_coverage_matrix(
-    xs, ys, coverage_matrix, U=None, k_max=10, output_dir=None, boundary_mask=None
+    xs,
+    ys,
+    coverage_matrix,
+    U=None,
+    k_max=10,
+    output_dir=None,
+    boundary_mask=None,
+    secondary_k_max=6,
+    min_partition_size_for_secondary=12,
+    direction_dispersion_threshold=0.35,
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
@@ -82,140 +331,149 @@ def partition_coverage_matrix(
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
         boundary_mask: 有效海域掩码。若提供，则仅对有效格聚类，其余位置标记为 -1
     """
-    rows, cols = coverage_matrix.shape
-
-    # 1. 构建特征矩阵 (X坐标, Y坐标, 覆盖次数, 梯度x, 梯度y)
-    # 注意：这里引入空间坐标是为了保证聚类结果在地理空间上的连续性
-    # 引入梯度方向是为了在地形剧变区域（如海沟、峡谷）形成分区边界，避免环形测线
-    grid_x, grid_y = np.meshgrid(xs, ys)
-
-    # 获取每个网格点的梯度（用于识别地形剧变区域）
-    print("[分区] 正在计算网格点梯度方向...")
-    gx_flat = np.array(
-        [get_gx(x, y) for x, y in zip(grid_x.flatten(), grid_y.flatten())]
-    ).reshape(-1, 1)
-    gy_flat = np.array(
-        [get_gy(x, y) for x, y in zip(grid_x.flatten(), grid_y.flatten())]
-    ).reshape(-1, 1)
-
-    # 将二维矩阵展平为一维特征向量
-    feature_x = grid_x.flatten().reshape(-1, 1)
-    feature_y = grid_y.flatten().reshape(-1, 1)
-    feature_c = coverage_matrix.flatten().reshape(-1, 1)
-
-    # 将空间坐标、覆盖次数与梯度方向拼接 (N, 5)
-    features = np.hstack((feature_x, feature_y, feature_c, gx_flat, gy_flat))
+    feature_bundle = _build_feature_stacks(xs, ys, coverage_matrix)
+    rows = feature_bundle["rows"]
+    cols = feature_bundle["cols"]
+    gx_matrix = feature_bundle["gx_matrix"]
+    gy_matrix = feature_bundle["gy_matrix"]
+    primary_features = feature_bundle["primary_features"]
+    secondary_features = feature_bundle["secondary_features"]
 
     if boundary_mask is None:
         valid_mask_1d = np.ones(rows * cols, dtype=bool)
     else:
         valid_mask_1d = np.asarray(boundary_mask, dtype=bool).reshape(-1)
 
-    valid_features = features[valid_mask_1d]
-    n_samples = len(valid_features)
-    if n_samples == 0:
+    if not np.any(valid_mask_1d):
         raise ValueError("无有效海域网格可用于聚类，请检查 boundary_mask。")
 
-    # 2. 特征缩放（修复：在标准化前计算权重，避免权重失效）
-    # 先计算原始特征的尺度差异，用于后续权重调节
-    std_xy_raw = np.std(valid_features[:, :2])
-    std_c_raw = np.std(valid_features[:, 2])
-    std_g_raw = np.std(valid_features[:, 3:5])
-
-    # 计算覆盖次数相对于空间坐标的权重比
-    # 目的：使覆盖次数维度的尺度与空间坐标维度相当
-    w_cover = std_xy_raw / (std_c_raw + 1e-6)
-    # 计算梯度相对于空间坐标的权重比（梯度值通常较小，需要适当放大）
-    w_grad = std_xy_raw / (std_g_raw + 1e-6)
-
-    # 应用权重
-    weighted_features = valid_features.copy().astype(float)
-    weighted_features[:, 2] *= w_cover
-    weighted_features[:, 3:5] *= w_grad
-
-    # 再进行标准化，使各维度均值为0、方差为1
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(weighted_features)
-
-    # 3. 确定簇的数目 U
-    if U is not None:
-        # 验证 U 的合法性
-        if U < 2:
-            raise ValueError(f"分区数 U 必须 >= 2，当前传入 U={U}")
-        if U > n_samples - 1:
-            raise ValueError(
-                f"分区数 U={U} 超过数据点数 (n={n_samples})，"
-                f"KMeans 要求 n_clusters < n_samples"
-            )
-        optimal_u = U
-        print(f"[分区] 使用指定分区数量 U = {optimal_u}")
-    else:
-        # 使用 Elbow 法则自动确定
-        optimal_u = find_optimal_k_elbow(
-            scaled_features, k_min=2, k_max=k_max, output_dir=output_dir
-        )
-        print(f"[分区] 根据 Elbow 准则自动确定 U = {optimal_u} ")
-
-    # 4. 对覆盖次数矩阵进行 K-means 空间聚类
-    print(f"正在执行 K-means 聚类 (U={optimal_u})...")
-    final_kmeans = KMeans(n_clusters=optimal_u, random_state=42, n_init=10)
-    cluster_labels_valid = final_kmeans.fit_predict(scaled_features)
-
-    # 5. 将一维的聚类标签还原为二维矩阵
-    cluster_labels_1d = np.full(rows * cols, -1, dtype=int)
-    cluster_labels_1d[valid_mask_1d] = cluster_labels_valid
-    cluster_matrix = cluster_labels_1d.reshape(rows, cols)
-
-    # 6. 可视化分区结果并确定每个区域的边界线
-    plt.figure(figsize=(10, 8))
-
-    # 绘制底图分区颜色
-    display_matrix = np.ma.masked_where(cluster_matrix < 0, cluster_matrix)
-    plt.imshow(
-        display_matrix,
-        extent=[xs.min(), xs.max(), ys.max(), ys.min()],
-        cmap="Set3",
-        aspect="auto",
+    print(
+        "[分区] 一级分区特征 = "
+        f"{PRIMARY_FEATURE_NAMES} | 二级分区特征 = {SECONDARY_FEATURE_NAMES}"
+    )
+    first_stage_cluster_matrix, first_stage_u = _cluster_with_selected_mask(
+        primary_features,
+        valid_mask_1d,
+        rows,
+        cols,
+        U=U,
+        k_max=k_max,
+        output_dir=output_dir,
+        elbow_subdir="stage1",
+    )
+    _save_partition_plot(
+        first_stage_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage1_U={first_stage_u}.png",
+        f"Stage-1 Partitioning (U={first_stage_u})",
     )
 
-    # 检测边界像素：任何相邻像素属于不同分区的像素即为边界
-    valid_matrix = cluster_matrix >= 0
-    boundary = np.zeros_like(cluster_matrix, dtype=bool)
-    vertical_diff = cluster_matrix[:-1, :] != cluster_matrix[1:, :]
-    vertical_valid = valid_matrix[:-1, :] | valid_matrix[1:, :]
-    horizontal_diff = cluster_matrix[:, :-1] != cluster_matrix[:, 1:]
-    horizontal_valid = valid_matrix[:, :-1] | valid_matrix[:, 1:]
-    boundary[:-1, :] |= vertical_diff & vertical_valid
-    boundary[1:, :] |= vertical_diff & vertical_valid
-    boundary[:, :-1] |= horizontal_diff & horizontal_valid
-    boundary[:, 1:] |= horizontal_diff & horizontal_valid
+    gradient_magnitude = np.hypot(gx_matrix, gy_matrix)
+    direction_valid_mask = np.isfinite(gradient_magnitude) & (gradient_magnitude > 1e-8)
+    unit_gx_matrix = np.zeros_like(gx_matrix, dtype=float)
+    unit_gy_matrix = np.zeros_like(gy_matrix, dtype=float)
+    unit_gx_matrix[direction_valid_mask] = (
+        gx_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
+    )
+    unit_gy_matrix[direction_valid_mask] = (
+        gy_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
+    )
 
-    # 用散点图绘制边界（单像素宽度，避免 contour 的多重轮廓叠加）
-    if np.any(boundary):
-        by, bx = np.where(boundary)
-        # 将网格索引转换为实际坐标
-        px = xs[bx]
-        py = ys[by]
-        plt.scatter(px, py, c="black", s=0.3, marker="s", linewidths=0, zorder=2)
-
-    plt.title(f"K-means Spatial Partitioning (U={optimal_u}) with Boundary Lines")
-    plt.xlabel("X (m)")
-    plt.ylabel("Y (m)")
-
-    # 防止坐标轴倒置（根据海图习惯，通常北向上，如果需要反转去掉此行即可）
-    plt.gca().invert_yaxis()
-    plt.colorbar(label="Cluster ID")
-    if output_dir is not None:
-        partition_dir = Path(output_dir) / "partition"
-        partition_dir.mkdir(parents=True, exist_ok=True)
-        plt.savefig(
-            partition_dir / f"partition_U={optimal_u}.png",
-            dpi=300,
-            bbox_inches="tight",
+    merged_cluster_matrix = np.full_like(first_stage_cluster_matrix, -1, dtype=int)
+    diagnostics = []
+    next_global_id = 0
+    partition_ids = [
+        int(pid)
+        for pid in sorted(np.unique(first_stage_cluster_matrix).astype(int))
+        if pid >= 0
+    ]
+    for partition_id in partition_ids:
+        partition_mask = first_stage_cluster_matrix == partition_id
+        diagnostic = _summarize_partition_gradient_complexity(
+            partition_id,
+            partition_mask,
+            gx_matrix,
+            gy_matrix,
+            unit_gx_matrix,
+            unit_gy_matrix,
+            direction_valid_mask,
+            min_partition_size_for_secondary=min_partition_size_for_secondary,
+            direction_dispersion_threshold=direction_dispersion_threshold,
         )
-    plt.close()
 
-    return cluster_matrix, optimal_u
+        print(
+            f"[分区检测] 一级分区{partition_id} | cells={diagnostic['cell_count']} | "
+            f"dispersion={diagnostic['direction_dispersion']:.3f} | "
+            f"unit_like={diagnostic['unit_like_gradient']} | "
+            f"二次分区={diagnostic['triggered_secondary_partition']} | "
+            f"reasons={diagnostic['trigger_reasons']}"
+        )
+
+        if diagnostic["triggered_secondary_partition"]:
+            local_mask_1d = partition_mask.reshape(-1)
+            if np.count_nonzero(local_mask_1d) >= 3:
+                local_cluster_matrix, local_u = _cluster_with_selected_mask(
+                    secondary_features,
+                    local_mask_1d,
+                    rows,
+                    cols,
+                    U=None,
+                    k_max=secondary_k_max,
+                    output_dir=output_dir,
+                    elbow_subdir=f"stage2_partition_{partition_id}",
+                )
+                diagnostic["secondary_partition_count"] = int(local_u)
+                for local_label in sorted(np.unique(local_cluster_matrix).astype(int)):
+                    if local_label < 0:
+                        continue
+                    merged_cluster_matrix[local_cluster_matrix == local_label] = next_global_id
+                    next_global_id += 1
+            else:
+                diagnostic["secondary_partition_count"] = 1
+                diagnostic["triggered_secondary_partition"] = False
+                diagnostic["trigger_reasons"] = ["insufficient_local_samples"]
+                merged_cluster_matrix[partition_mask] = next_global_id
+                next_global_id += 1
+        else:
+            diagnostic["secondary_partition_count"] = 1
+            merged_cluster_matrix[partition_mask] = next_global_id
+            next_global_id += 1
+
+        diagnostics.append(diagnostic)
+
+    final_cluster_matrix, final_u = _renumber_cluster_matrix(merged_cluster_matrix)
+    _save_partition_plot(
+        final_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_final_U={final_u}.png",
+        f"Two-Stage Partitioning (U={final_u})",
+    )
+    _save_partition_plot(
+        final_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_U={final_u}.png",
+        f"Two-Stage Partitioning (U={final_u})",
+    )
+    _write_secondary_partition_diagnostics(
+        output_dir,
+        first_stage_u,
+        final_u,
+        diagnostics,
+        direction_dispersion_threshold,
+        min_partition_size_for_secondary,
+        secondary_k_max,
+    )
+
+    print(
+        f"[分区] 一级分区数={first_stage_u} | 二次分区合并后总分区数={final_u}"
+    )
+    return final_cluster_matrix, final_u
 
 
 def _point_line_distance(p0, p1, p2):

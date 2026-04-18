@@ -38,7 +38,6 @@ if __name__ == "__main__":
         d=d_optimal,
     )
 
-    _ = coarse_boundary_mask, coarse_cell_effective_area, coarse_cell_area_ratio
 
     # 统一时间戳，确保所有输出在同一目录下
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -54,7 +53,8 @@ if __name__ == "__main__":
     )
 
     print(f"U= {U}")
-    # Phase 4: 测线规划（封装对象，即时指标）
+
+    # Phase 4: 测线规划（恢复完整主流程）
     planner = SurveyPlanner(
         xs,
         ys,
