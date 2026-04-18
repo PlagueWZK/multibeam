@@ -72,4 +72,4 @@ if __name__ == "__main__":
         grid_cell_size=d_optimal,
     )
     # planner.plan_line(1000, 1000, output_dir=output_base)
-    # planner.plan_all(output_dir=output_base)
+    planner.plan_all(output_dir=output_base)
