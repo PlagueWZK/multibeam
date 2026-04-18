@@ -386,7 +386,7 @@ def partition_coverage_matrix(
     primary_feature_mode="coverage_only",
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
-    direction_dispersion_threshold=0.35,
+    direction_dispersion_threshold=0.30,
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
