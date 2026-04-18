@@ -44,6 +44,37 @@ class ModelManager:
         return cls._loaded
 
 
+def predict_model_fields(points, include_height=True, include_gradient=True):
+    """
+    对一批二维坐标点进行批量模型预测。
+
+    参数:
+        points: shape=(N, 2) 的坐标数组
+        include_height: 是否预测深度
+        include_gradient: 是否预测 gx / gy
+
+    返回:
+        dict: 按需包含 height / gx / gy 一维数组
+    """
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(
+            f"points 必须是 shape=(N, 2) 的二维数组，当前 shape={points.shape}"
+        )
+
+    height_rf, gx_rf, gy_rf = ModelManager.get_models()
+    results = {}
+
+    if include_height:
+        results["height"] = np.asarray(height_rf.predict(points), dtype=float)
+
+    if include_gradient:
+        results["gx"] = np.asarray(gx_rf.predict(points), dtype=float)
+        results["gy"] = np.asarray(gy_rf.predict(points), dtype=float)
+
+    return results
+
+
 def get_height(x, y):
     """输入x、y坐标，返回该位置的深度"""
     height_rf, _, _ = ModelManager.get_models()

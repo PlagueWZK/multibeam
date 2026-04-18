@@ -30,6 +30,8 @@ if __name__ == "__main__":
         coarse_boundary_mask,
         coarse_cell_effective_area,
         coarse_cell_area_ratio,
+        gx_matrix,
+        gy_matrix,
     ) = calculate_coverage_matrix_with_ml(
         x_min=X_MIN,
         x_max=X_MAX,
@@ -50,6 +52,8 @@ if __name__ == "__main__":
         coverage_matrix,
         output_dir=output_base,
         boundary_mask=coarse_boundary_mask,
+        gx_matrix=gx_matrix,
+        gy_matrix=gy_matrix,
     )
 
     print(f"U= {U}")
@@ -68,4 +72,4 @@ if __name__ == "__main__":
         grid_cell_size=d_optimal,
     )
     # planner.plan_line(1000, 1000, output_dir=output_base)
-    planner.plan_all(output_dir=output_base)
+    # planner.plan_all(output_dir=output_base)

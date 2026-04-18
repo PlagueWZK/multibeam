@@ -9,7 +9,7 @@ from tool.Data import get_gx, get_gy
 
 
 PRIMARY_FEATURE_NAMES = ("X", "Y", "coverage_count")
-SECONDARY_FEATURE_NAMES = ("X", "Y", "coverage_count", "gx", "gy")
+SECONDARY_FEATURE_NAMES = ("X", "Y", "ux", "uy")
 
 
 def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
@@ -73,29 +73,71 @@ def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
     return optimal_u
 
 
-def _build_feature_stacks(xs, ys, coverage_matrix):
+def _build_feature_stacks(xs, ys, coverage_matrix, gx_matrix=None, gy_matrix=None):
     rows, cols = coverage_matrix.shape
     grid_x, grid_y = np.meshgrid(xs, ys)
 
-    print("[分区] 正在计算网格点梯度方向...")
-    flat_xy = list(zip(grid_x.flatten(), grid_y.flatten()))
-    gx_flat = np.array([get_gx(x, y) for x, y in flat_xy], dtype=float).reshape(-1, 1)
-    gy_flat = np.array([get_gy(x, y) for x, y in flat_xy], dtype=float).reshape(-1, 1)
+    if gx_matrix is not None or gy_matrix is not None:
+        if gx_matrix is None or gy_matrix is None:
+            raise ValueError("gx_matrix 和 gy_matrix 必须同时提供，或同时为 None。")
+        gx_matrix = np.asarray(gx_matrix, dtype=float)
+        gy_matrix = np.asarray(gy_matrix, dtype=float)
+        if gx_matrix.shape != (rows, cols) or gy_matrix.shape != (rows, cols):
+            raise ValueError(
+                "提供的梯度矩阵尺寸与 coverage_matrix 不一致："
+                f"coverage={coverage_matrix.shape}, gx={gx_matrix.shape}, gy={gy_matrix.shape}"
+            )
+        print("[分区] 复用 Coverage 阶段预计算的网格梯度矩阵...")
+        gx_flat = gx_matrix.reshape(-1, 1)
+        gy_flat = gy_matrix.reshape(-1, 1)
+    else:
+        print("[分区] 正在计算网格点梯度方向...")
+        flat_xy = list(zip(grid_x.flatten(), grid_y.flatten()))
+        gx_flat = np.array([get_gx(x, y) for x, y in flat_xy], dtype=float).reshape(
+            -1, 1
+        )
+        gy_flat = np.array([get_gy(x, y) for x, y in flat_xy], dtype=float).reshape(
+            -1, 1
+        )
 
     feature_x = grid_x.flatten().reshape(-1, 1)
     feature_y = grid_y.flatten().reshape(-1, 1)
     feature_c = coverage_matrix.flatten().reshape(-1, 1)
 
+    gx_matrix = gx_flat.reshape(rows, cols)
+    gy_matrix = gy_flat.reshape(rows, cols)
+    gradient_magnitude = np.hypot(gx_matrix, gy_matrix)
+    direction_valid_mask = np.isfinite(gradient_magnitude) & (gradient_magnitude > 1e-8)
+    unit_gx_matrix = np.zeros_like(gx_matrix, dtype=float)
+    unit_gy_matrix = np.zeros_like(gy_matrix, dtype=float)
+    unit_gx_matrix[direction_valid_mask] = (
+        gx_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
+    )
+    unit_gy_matrix[direction_valid_mask] = (
+        gy_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
+    )
+
     primary_features = np.hstack((feature_x, feature_y, feature_c))
-    secondary_features = np.hstack((feature_x, feature_y, feature_c, gx_flat, gy_flat))
+    secondary_features = np.hstack(
+        (
+            feature_x,
+            feature_y,
+            unit_gx_matrix.reshape(-1, 1),
+            unit_gy_matrix.reshape(-1, 1),
+        )
+    )
 
     return {
         "rows": rows,
         "cols": cols,
         "grid_x": grid_x,
         "grid_y": grid_y,
-        "gx_matrix": gx_flat.reshape(rows, cols),
-        "gy_matrix": gy_flat.reshape(rows, cols),
+        "gx_matrix": gx_matrix,
+        "gy_matrix": gy_matrix,
+        "gradient_magnitude": gradient_magnitude,
+        "direction_valid_mask": direction_valid_mask,
+        "unit_gx_matrix": unit_gx_matrix,
+        "unit_gy_matrix": unit_gy_matrix,
         "primary_features": primary_features,
         "secondary_features": secondary_features,
     }
@@ -104,10 +146,21 @@ def _build_feature_stacks(xs, ys, coverage_matrix):
 def _scale_features_for_kmeans(valid_features):
     weighted_features = valid_features.copy().astype(float)
 
-    std_xy_raw = float(np.std(valid_features[:, :2]))
-    weighted_features[:, 2] *= std_xy_raw / (float(np.std(valid_features[:, 2])) + 1e-6)
-
-    if valid_features.shape[1] >= 5:
+    if valid_features.shape[1] == 3:
+        std_xy_raw = float(np.std(valid_features[:, :2]))
+        weighted_features[:, 2] *= std_xy_raw / (
+            float(np.std(valid_features[:, 2])) + 1e-6
+        )
+    elif valid_features.shape[1] == 4:
+        std_xy_raw = float(np.std(valid_features[:, :2]))
+        weighted_features[:, 2:4] *= std_xy_raw / (
+            float(np.std(valid_features[:, 2:4])) + 1e-6
+        )
+    elif valid_features.shape[1] >= 5:
+        std_xy_raw = float(np.std(valid_features[:, :2]))
+        weighted_features[:, 2] *= std_xy_raw / (
+            float(np.std(valid_features[:, 2])) + 1e-6
+        )
         weighted_features[:, 3:5] *= std_xy_raw / (
             float(np.std(valid_features[:, 3:5])) + 1e-6
         )
@@ -316,6 +369,8 @@ def partition_coverage_matrix(
     k_max=10,
     output_dir=None,
     boundary_mask=None,
+    gx_matrix=None,
+    gy_matrix=None,
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
     direction_dispersion_threshold=0.35,
@@ -331,11 +386,21 @@ def partition_coverage_matrix(
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
         boundary_mask: 有效海域掩码。若提供，则仅对有效格聚类，其余位置标记为 -1
     """
-    feature_bundle = _build_feature_stacks(xs, ys, coverage_matrix)
+    feature_bundle = _build_feature_stacks(
+        xs,
+        ys,
+        coverage_matrix,
+        gx_matrix=gx_matrix,
+        gy_matrix=gy_matrix,
+    )
     rows = feature_bundle["rows"]
     cols = feature_bundle["cols"]
     gx_matrix = feature_bundle["gx_matrix"]
     gy_matrix = feature_bundle["gy_matrix"]
+    gradient_magnitude = feature_bundle["gradient_magnitude"]
+    direction_valid_mask = feature_bundle["direction_valid_mask"]
+    unit_gx_matrix = feature_bundle["unit_gx_matrix"]
+    unit_gy_matrix = feature_bundle["unit_gy_matrix"]
     primary_features = feature_bundle["primary_features"]
     secondary_features = feature_bundle["secondary_features"]
 
@@ -368,17 +433,6 @@ def partition_coverage_matrix(
         output_dir,
         f"partition_stage1_U={first_stage_u}.png",
         f"Stage-1 Partitioning (U={first_stage_u})",
-    )
-
-    gradient_magnitude = np.hypot(gx_matrix, gy_matrix)
-    direction_valid_mask = np.isfinite(gradient_magnitude) & (gradient_magnitude > 1e-8)
-    unit_gx_matrix = np.zeros_like(gx_matrix, dtype=float)
-    unit_gy_matrix = np.zeros_like(gy_matrix, dtype=float)
-    unit_gx_matrix[direction_valid_mask] = (
-        gx_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
-    )
-    unit_gy_matrix[direction_valid_mask] = (
-        gy_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
     )
 
     merged_cluster_matrix = np.full_like(first_stage_cluster_matrix, -1, dtype=int)
