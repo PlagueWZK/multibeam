@@ -15,8 +15,8 @@ if __name__ == "__main__":
     BASE_DIR = __import__("pathlib").Path(__file__).resolve().parent
     DATA_DIR = BASE_DIR / "data" / "data.xlsx"
 
-    X_MIN, X_MAX = 0, 5 * 1852
-    Y_MIN, Y_MAX = 0, 4 * 1852
+    X_MIN, X_MAX = 0, 4 * 1852
+    Y_MIN, Y_MAX = 0, 5 * 1852
 
     # Phase 1: 最优网格（arange 策略，d 保持原始值不变）
     d_optimal = calculate_optimal_mesh_size(DATA_DIR)

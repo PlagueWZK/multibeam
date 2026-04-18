@@ -52,7 +52,9 @@ def compute_effective_cell_area_matrix(xs, ys, d, x_min, x_max, y_min, y_max):
     return x_lengths, y_lengths, cell_effective_area, cell_area_ratio
 
 
-def calculate_mesh_size_search_trace(data_path, min_error=0.001, search_step=0.5):
+def calculate_mesh_size_search_trace(
+    data_path, min_error=0.001, search_step=0.5, stop_on_first_match=False
+):
     """计算最优 d 搜索过程的完整误差轨迹。"""
 
     x, y, z = Tool.read_grid(data_path)
@@ -67,7 +69,8 @@ def calculate_mesh_size_search_trace(data_path, min_error=0.001, search_step=0.5
     relative_error_threshold = min_error
     patent_error_threshold = (1 - relative_error_threshold) * (xi**2)
 
-    start_d = float(xi)
+    xi_start_d = float(xi)
+    start_d = float(max(raw_spacing_m - search_step, 0.0))
     d_candidates = np.arange(start_d, 0.0, -search_step)
 
     def build_record(d, *, is_raw_spacing_reference, is_search_candidate):
@@ -117,6 +120,8 @@ def calculate_mesh_size_search_trace(data_path, min_error=0.001, search_step=0.5
             optimal_d = float(d)
             final_relative_error = record["relative_error"]
             final_patent_E = record["patent_error"]
+            if stop_on_first_match:
+                break
 
     return {
         "max_depth": float(max_depth),
@@ -126,6 +131,7 @@ def calculate_mesh_size_search_trace(data_path, min_error=0.001, search_step=0.5
         "theoretical_area_A": float(A),
         "raw_spacing_nm": float(raw_spacing_nm),
         "raw_spacing_m": float(raw_spacing_m),
+        "xi_start_d": float(xi_start_d),
         "start_d": float(start_d),
         "search_step": float(search_step),
         "relative_error_threshold": float(relative_error_threshold),
@@ -138,7 +144,9 @@ def calculate_mesh_size_search_trace(data_path, min_error=0.001, search_step=0.5
 
 
 def calculate_optimal_mesh_size(data_path, min_error=0.001):
-    trace_result = calculate_mesh_size_search_trace(data_path, min_error=min_error)
+    trace_result = calculate_mesh_size_search_trace(
+        data_path, min_error=min_error, stop_on_first_match=True
+    )
     max_depth = trace_result["max_depth"]
     print("最大深度:", max_depth)
 
@@ -154,13 +162,15 @@ def calculate_optimal_mesh_size(data_path, min_error=0.001):
     w_max = trace_result["w_max"]
     raw_spacing_nm = trace_result["raw_spacing_nm"]
     raw_spacing_m = trace_result["raw_spacing_m"]
+    xi_start_d = trace_result["xi_start_d"]
     start_d = trace_result["start_d"]
 
     # 输出结果
     print(f"最大有效测深宽度 (w_max): {w_max:.2f}")
     print(f"邻域覆盖半径 (ξ): {xi:.2f}")
     print(f"原始网格边长: {raw_spacing_nm:.4f} 海里 = {raw_spacing_m:.2f} m")
-    print(f"覆盖邻域半径网格数为1时的起始 d: {start_d:.2f} m")
+    print(f"邻域覆盖半径(ξ)对应的理论起点 d: {xi_start_d:.2f} m")
+    print(f"受原始网格上界约束的搜索起始 d: {start_d:.2f} m")
     print(f"设定相对面积误差阈值: {relative_error_threshold * 100}%")
     print(f"对应专利误差项下限: {patent_error_threshold:.4f}")
 
@@ -243,8 +253,8 @@ if __name__ == "__main__":
 
     if d_optimal:
         # 测试新坐标生成方案
-        X_MIN, X_MAX = 0, 5 * 1852
-        Y_MIN, Y_MAX = 0, 4 * 1852
+        X_MIN, X_MAX = 0, 4 * 1852
+        Y_MIN, Y_MAX = 0, 5 * 1852
         xs, ys, mask, area_mat, area_ratio = generate_coordinate_array(
             X_MIN, X_MAX, Y_MIN, Y_MAX, d_optimal
         )

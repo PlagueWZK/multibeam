@@ -28,6 +28,7 @@ class PartitionCoverageSummary:
     microstep: float
     total_area: float
     covered_area: float
+    repeated_area: float
     uncovered_area: float
     coverage_rate: float
     miss_rate: float
@@ -182,13 +183,16 @@ class PartitionCoverageStateGrid:
         self.domain_sample_counts = None
         self.partition_sample_mask = None
         self.covered_sample_mask = None
+        self.repeated_sample_mask = None
         self.partition_sample_counts = None
         self.covered_sample_counts = None
+        self.repeated_sample_counts = None
         self.partition_area_ratio_matrix = None
         self.coverage_ratio_matrix = None
         self.state_code_matrix = None
         self.total_partition_area = 0.0
         self.total_cells = 0
+        self.cumulative_repeated_area = 0.0
 
         self._build()
 
@@ -268,6 +272,9 @@ class PartitionCoverageStateGrid:
             self.sample_partition_ids == self.partition_id
         )
         self.covered_sample_mask = np.zeros_like(self.partition_sample_mask, dtype=bool)
+        self.repeated_sample_mask = np.zeros_like(
+            self.partition_sample_mask, dtype=bool
+        )
         self.partition_sample_counts = np.sum(self.partition_sample_mask, axis=2)
 
         self.partition_area_ratio_matrix = np.zeros_like(
@@ -346,10 +353,14 @@ class PartitionCoverageStateGrid:
                 pending_mask = self.partition_sample_mask[i, j] & (
                     ~self.covered_sample_mask[i, j]
                 )
-                if not np.any(pending_mask):
+                single_hit_mask = self.partition_sample_mask[i, j] & (
+                    self.covered_sample_mask[i, j] & (~self.repeated_sample_mask[i, j])
+                )
+                candidate_mask = pending_mask | single_hit_mask
+                if not np.any(candidate_mask):
                     continue
 
-                sample_indices = np.where(pending_mask)[0]
+                sample_indices = np.where(candidate_mask)[0]
                 covered_now = self._points_within_segment_swath(
                     self.sample_x[i, j, sample_indices],
                     self.sample_y[i, j, sample_indices],
@@ -357,7 +368,96 @@ class PartitionCoverageStateGrid:
                     end,
                 )
                 if np.any(covered_now):
-                    self.covered_sample_mask[i, j, sample_indices[covered_now]] = True
+                    hit_indices = sample_indices[covered_now]
+                    repeat_hit_indices = hit_indices[
+                        self.covered_sample_mask[i, j, hit_indices]
+                    ]
+                    if len(repeat_hit_indices) > 0:
+                        self.repeated_sample_mask[i, j, repeat_hit_indices] = True
+                    self.covered_sample_mask[i, j, hit_indices] = True
+
+    def compute_polyline_hit_mask(
+        self, line: np.ndarray | list[list[float]]
+    ) -> np.ndarray:
+        line_arr = np.asarray(line, dtype=float)
+        hit_mask = np.zeros_like(self.partition_sample_mask, dtype=bool)
+        if len(line_arr) < 2:
+            return hit_mask
+
+        for start, end in zip(line_arr[:-1], line_arr[1:]):
+            start = np.asarray(start, dtype=float)
+            end = np.asarray(end, dtype=float)
+            radius = max(float(start[2]), float(end[2])) / 2.0
+            if radius <= 0:
+                continue
+
+            x_low = min(float(start[0]), float(end[0])) - radius
+            x_high = max(float(start[0]), float(end[0])) + radius
+            y_low = min(float(start[1]), float(end[1])) - radius
+            y_high = max(float(start[1]), float(end[1])) + radius
+
+            row_start, row_end = self._candidate_index_range(
+                self.y_centers, y_low, y_high
+            )
+            col_start, col_end = self._candidate_index_range(
+                self.x_centers, x_low, x_high
+            )
+
+            if row_end < row_start or col_end < col_start:
+                continue
+
+            for i in range(row_start, row_end + 1):
+                for j in range(col_start, col_end + 1):
+                    if self.partition_sample_counts[i, j] == 0:
+                        continue
+
+                    sample_indices = np.where(self.partition_sample_mask[i, j])[0]
+                    if len(sample_indices) == 0:
+                        continue
+
+                    covered_now = self._points_within_segment_swath(
+                        self.sample_x[i, j, sample_indices],
+                        self.sample_y[i, j, sample_indices],
+                        start,
+                        end,
+                    )
+                    if np.any(covered_now):
+                        hit_mask[i, j, sample_indices[covered_now]] = True
+
+        return hit_mask
+
+    def compute_polyline_repeat_area(
+        self,
+        line: np.ndarray | list[list[float]],
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> float:
+        line_hit_mask = self.compute_polyline_hit_mask(line)
+        if prior_covered_mask is None:
+            prior_covered_mask = self.covered_sample_mask
+
+        prior_mask = np.asarray(prior_covered_mask, dtype=bool)
+        repeated_mask = line_hit_mask & prior_mask & self.partition_sample_mask
+        repeated_counts = np.sum(repeated_mask, axis=2)
+        valid_domain_cells = self.domain_sample_counts > 0
+        repeated_ratio_against_domain = np.zeros_like(
+            self.partition_sample_counts, dtype=float
+        )
+        repeated_ratio_against_domain[valid_domain_cells] = (
+            repeated_counts[valid_domain_cells]
+            / self.domain_sample_counts[valid_domain_cells]
+        )
+        return float(np.sum(repeated_ratio_against_domain * self.cell_domain_area))
+
+    def accumulate_polyline_repeat_area(
+        self,
+        line: np.ndarray | list[list[float]],
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> float:
+        repeated_area = self.compute_polyline_repeat_area(
+            line, prior_covered_mask=prior_covered_mask
+        )
+        self.cumulative_repeated_area += repeated_area
+        return repeated_area
 
     def update_polyline(self, line: np.ndarray | list[list[float]]) -> None:
         line_arr = np.asarray(line, dtype=float)
@@ -444,6 +544,9 @@ class PartitionCoverageStateGrid:
         self.covered_sample_counts = np.sum(
             self.partition_sample_mask & self.covered_sample_mask, axis=2
         )
+        self.repeated_sample_counts = np.sum(
+            self.partition_sample_mask & self.repeated_sample_mask, axis=2
+        )
         self.coverage_ratio_matrix = np.zeros_like(
             self.partition_sample_counts, dtype=float
         )
@@ -520,6 +623,9 @@ class PartitionCoverageStateGrid:
             np.sum(covered_ratio_against_domain * self.cell_domain_area)
         )
         covered_area = min(covered_area, self.total_partition_area)
+
+        repeated_area = float(self.cumulative_repeated_area)
+
         uncovered_area = max(self.total_partition_area - covered_area, 0.0)
 
         coverage_rate = (
@@ -549,6 +655,7 @@ class PartitionCoverageStateGrid:
             microstep=self.microstep,
             total_area=self.total_partition_area,
             covered_area=covered_area,
+            repeated_area=repeated_area,
             uncovered_area=uncovered_area,
             coverage_rate=coverage_rate,
             miss_rate=miss_rate,

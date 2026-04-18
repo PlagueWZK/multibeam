@@ -154,7 +154,16 @@ class SurveyPlanner:
             return TerminationReason.BOUNDARY
         return TerminationReason.NONE
 
-    def _record_line(self, points, partition_id, terminated_by):
+    def _record_line(
+        self,
+        points,
+        partition_id,
+        terminated_by,
+        *,
+        overlap_excess_length=0.0,
+        max_overlap_eta=0.0,
+        repeated_area=0.0,
+    ):
         """测线生成完毕后立即计算并记录指标"""
         pts = np.array(points)
         length = figure_length(pts)
@@ -166,11 +175,102 @@ class SurveyPlanner:
             points=pts,
             length=length,
             coverage=coverage,
+            overlap_excess_length=float(overlap_excess_length),
+            max_overlap_eta=float(max_overlap_eta),
+            repeated_area=float(repeated_area),
             terminated_by=terminated_by,
         )
         self.all_records.append(record)
         self._line_counter += 1
         return record
+
+    def _compute_parent_child_overlap_rate(self, parent_point, child_point) -> float:
+        parent_arr = np.asarray(parent_point, dtype=float)
+        child_arr = np.asarray(child_point, dtype=float)
+        x_i, y_i = float(parent_arr[0]), float(parent_arr[1])
+        x_j, y_j = float(child_arr[0]), float(child_arr[1])
+
+        d_i = get_height(x_i, y_i)
+        d_j = get_height(x_j, y_j)
+        alpha_i = np.radians(self._get_alpha(x_i, y_i))
+        alpha_j = np.radians(self._get_alpha(x_j, y_j))
+        sin_half = np.sin(self.theta_rad / 2.0)
+
+        denom_i_left = np.sin((np.pi - self.theta_rad) / 2.0 + alpha_i)
+        denom_i_right = np.sin((np.pi - self.theta_rad) / 2.0 - alpha_i)
+        denom_j_right = np.sin((np.pi - self.theta_rad) / 2.0 - alpha_j)
+        cos_alpha_i = np.cos(alpha_i)
+
+        if (
+            abs(denom_i_left) <= 1e-12
+            or abs(denom_i_right) <= 1e-12
+            or abs(denom_j_right) <= 1e-12
+            or abs(cos_alpha_i) <= 1e-12
+        ):
+            return 0.0
+
+        overlap_width = (
+            d_i * sin_half / denom_i_left
+            + d_j * sin_half / denom_j_right
+            - np.hypot(x_i - x_j, y_i - y_j) / cos_alpha_i
+        )
+        coverage_width_i = d_i * sin_half * (1.0 / denom_i_left + 1.0 / denom_i_right)
+
+        if not np.isfinite(overlap_width) or not np.isfinite(coverage_width_i):
+            return 0.0
+        if coverage_width_i <= 1e-12:
+            return 0.0
+        return float(max(overlap_width / coverage_width_i, 0.0))
+
+    @staticmethod
+    def _compute_overlap_excess_length(
+        child_points, overlap_rates, threshold=0.2
+    ) -> float:
+        line_arr = np.asarray(child_points, dtype=float)
+        rates = np.asarray(overlap_rates, dtype=float)
+        if line_arr.ndim != 2 or len(line_arr) < 2 or len(rates) < 2:
+            return 0.0
+
+        total_length = 0.0
+        for point0, point1, rate0, rate1 in zip(
+            line_arr[:-1], line_arr[1:], rates[:-1], rates[1:]
+        ):
+            segment_length = float(
+                np.hypot(point1[0] - point0[0], point1[1] - point0[1])
+            )
+            if segment_length <= 0 or (not np.isfinite(rate0)) or (not np.isfinite(rate1)):
+                continue
+
+            if rate0 <= threshold and rate1 <= threshold:
+                continue
+            if rate0 > threshold and rate1 > threshold:
+                total_length += segment_length
+                continue
+            if abs(rate1 - rate0) <= 1e-12:
+                if rate0 > threshold:
+                    total_length += segment_length
+                continue
+
+            crossing_ratio = (threshold - rate0) / (rate1 - rate0)
+            crossing_ratio = float(np.clip(crossing_ratio, 0.0, 1.0))
+            if rate0 > threshold and rate1 <= threshold:
+                total_length += segment_length * crossing_ratio
+            elif rate0 <= threshold and rate1 > threshold:
+                total_length += segment_length * (1.0 - crossing_ratio)
+
+        return float(total_length)
+
+    def _snapshot_current_covered_mask(self):
+        if self.current_partition_grid is None:
+            return None
+        return np.array(self.current_partition_grid.covered_sample_mask, copy=True)
+
+    def _accumulate_current_partition_repeated_area(self, line, prior_covered_mask) -> float:
+        if self.current_partition_grid is None or prior_covered_mask is None:
+            return 0.0
+        return self.current_partition_grid.accumulate_polyline_repeat_area(
+            line, prior_covered_mask=prior_covered_mask
+        )
 
     def _point_with_width(self, x, y):
         """返回 [x, y, 覆盖宽度(w_total)]。"""
@@ -214,6 +314,7 @@ class SurveyPlanner:
         从起点向正反两个方向交替延伸，按边界与细网格收益决定是否继续。
         """
         line = [self._point_with_width(start_x, start_y)]
+        prior_covered_mask = self._snapshot_current_covered_mask()
 
         ext_step = step / 2
         ext_loop = 0
@@ -310,7 +411,10 @@ class SurveyPlanner:
             f"[主测线1] 完成 | 共{len(line)}个点 | {status} | "
             f"起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})"
         )
-        return line, terminated_by
+        repeated_area = self._accumulate_current_partition_repeated_area(
+            line, prior_covered_mask
+        )
+        return line, terminated_by, 0.0, 0.0, repeated_area
 
     def _generate_perpendicular_lines(
         self,
@@ -333,7 +437,9 @@ class SurveyPlanner:
 
         while True:
             perp_iter += 1
+            prior_covered_mask = self._snapshot_current_covered_mask()
             t1 = []
+            t1_overlap_rates = []
             boundary_rejects = 0
             low_value_rejects = 0
 
@@ -368,6 +474,9 @@ class SurveyPlanner:
                     candidate_point = self._point_with_width(new_x, new_y)
                     if self._candidate_point_has_value(candidate_point):
                         t1.append(candidate_point)
+                        t1_overlap_rates.append(
+                            self._compute_parent_child_overlap_rate(i, candidate_point)
+                        )
                     else:
                         low_value_rejects += 1
                 else:
@@ -397,6 +506,13 @@ class SurveyPlanner:
                     f"按从测线停止规则终止该方向 | 边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
                 )
                 break
+
+            overlap_excess_length = self._compute_overlap_excess_length(
+                t1, t1_overlap_rates, threshold=0.2
+            )
+            max_overlap_eta = (
+                float(np.max(t1_overlap_rates)) if len(t1_overlap_rates) > 0 else 0.0
+            )
 
             line = copy.deepcopy(t1)
             self._update_current_partition_grid_with_polyline(line)
@@ -490,7 +606,17 @@ class SurveyPlanner:
                 if terminated_reason != TerminationReason.NONE
                 else "boundary"
             )
-            self._record_line(line, partition_id, terminated_by)
+            repeated_area = self._accumulate_current_partition_repeated_area(
+                line, prior_covered_mask
+            )
+            self._record_line(
+                line,
+                partition_id,
+                terminated_by,
+                overlap_excess_length=overlap_excess_length,
+                max_overlap_eta=max_overlap_eta,
+                repeated_area=repeated_area,
+            )
 
             total_points += len(line)
 
@@ -573,10 +699,17 @@ class SurveyPlanner:
 
             # 主测线
             print(f"[分区{partition_id}] 主测线开始双向延伸")
-            line, main_terminated = self._extend_line_bidirectional(
+            line, main_terminated, overlap_excess_length, max_overlap_eta, repeated_area = self._extend_line_bidirectional(
                 start_x, start_y, partition_id, self.step
             )
-            self._record_line(line, partition_id, main_terminated)
+            self._record_line(
+                line,
+                partition_id,
+                main_terminated,
+                overlap_excess_length=overlap_excess_length,
+                max_overlap_eta=max_overlap_eta,
+                repeated_area=repeated_area,
+            )
             line_counter += 1
             self.visualizer.draw_line(line, "b", 1.5, "Main line")
 
@@ -742,9 +875,12 @@ class SurveyPlanner:
         partition_rows = []
         global_total_length = 0.0
         global_old_proxy_coverage = 0.0
+        global_overlap_excess_length = 0.0
+        global_max_overlap_eta = 0.0
         global_total_lines = 0
         global_new_partition_area = 0.0
         global_new_covered_area = 0.0
+        global_repeated_area = 0.0
 
         partition_ids = sorted(
             set(r.partition_id for r in self.all_records)
@@ -755,6 +891,8 @@ class SurveyPlanner:
             recs = [r for r in self.all_records if r.partition_id == pid]
             total_length = sum(r.length for r in recs)
             proxy_coverage = sum(r.coverage for r in recs)
+            overlap_excess_length = sum(r.overlap_excess_length for r in recs)
+            max_overlap_eta = max((r.max_overlap_eta for r in recs), default=0.0)
             coverage_summary = self.partition_coverage_summaries.get(pid)
 
             partition_rows.append(
@@ -763,11 +901,16 @@ class SurveyPlanner:
                     "测线条数": len(recs),
                     "测线总长度(m)": round(total_length, 2),
                     "积分覆盖面积-旧口径(m²)": round(proxy_coverage, 2),
+                    "重叠率超过20%部分长度(m)": round(overlap_excess_length, 2),
+                    "parent-child公式下最大η(诊断)": round(max_overlap_eta, 4),
                     "细网格待测面积-新口径(m²)": round(
                         coverage_summary.total_area if coverage_summary else 0.0, 2
                     ),
                     "细网格覆盖面积-新口径(m²)": round(
                         coverage_summary.covered_area if coverage_summary else 0.0, 2
+                    ),
+                    "细网格重复测量面积-新口径(m²)": round(
+                        coverage_summary.repeated_area if coverage_summary else 0.0, 2
                     ),
                     "细网格覆盖率-新口径": (
                         f"{coverage_summary.coverage_rate:.4%}"
@@ -803,9 +946,12 @@ class SurveyPlanner:
             global_total_lines += len(recs)
             global_total_length += total_length
             global_old_proxy_coverage += proxy_coverage
+            global_overlap_excess_length += overlap_excess_length
+            global_max_overlap_eta = max(global_max_overlap_eta, max_overlap_eta)
             if coverage_summary is not None:
                 global_new_partition_area += coverage_summary.total_area
                 global_new_covered_area += coverage_summary.covered_area
+                global_repeated_area += coverage_summary.repeated_area
 
         df_partition = pd.DataFrame(partition_rows)
 
@@ -821,6 +967,7 @@ class SurveyPlanner:
         )
         new_coverage_rate = min(max(new_coverage_rate, 0.0), 1.0)
         new_miss_rate = 1.0 - new_coverage_rate
+        repeated_rate = global_repeated_area / self.total_area if self.total_area > 0 else 0.0
 
         global_rows = [
             {"指标": "测线条数", "值": global_total_lines},
@@ -840,6 +987,14 @@ class SurveyPlanner:
                 "值": f"{1 - old_coverage_rate:.4%}",
             },
             {
+                "指标": "重叠率超过20%部分总长度(m)",
+                "值": round(global_overlap_excess_length, 2),
+            },
+            {
+                "指标": "parent-child公式下最大η(诊断)",
+                "值": round(global_max_overlap_eta, 4),
+            },
+            {
                 "指标": "固定矩形海域总面积-新分母(m²)",
                 "值": round(self.total_area, 2),
             },
@@ -851,6 +1006,11 @@ class SurveyPlanner:
                 "指标": "细网格真实覆盖面积-新口径(m²)",
                 "值": round(global_new_covered_area, 2),
             },
+            {
+                "指标": "细网格重复测量面积-新口径(m²)",
+                "值": round(global_repeated_area, 2),
+            },
+            {"指标": "累积重复率-新口径", "值": f"{repeated_rate:.4%}"},
             {"指标": "细网格覆盖率-新口径", "值": f"{new_coverage_rate:.4%}"},
             {"指标": "细网格漏测率-新口径", "值": f"{new_miss_rate:.4%}"},
         ]

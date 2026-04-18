@@ -31,6 +31,9 @@ class LineRecord:
     points: np.ndarray  # [N, 3] = [x, y, w_total]
     length: float
     coverage: float
+    overlap_excess_length: float
+    max_overlap_eta: float
+    repeated_area: float
     terminated_by: str  # "boundary" / "low_value" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
 
 

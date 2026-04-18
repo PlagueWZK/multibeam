@@ -48,7 +48,8 @@ def export_d_search_errors(data_path, min_error=0.001):
     print(
         f"原始网格边长: {result['raw_spacing_nm']:.4f} 海里 = {result['raw_spacing_m']:.2f} m"
     )
-    print(f"覆盖邻域半径网格数为1时的起始 d: {result['start_d']:.2f} m")
+    print(f"邻域覆盖半径(ξ)对应的理论起点 d: {result['xi_start_d']:.2f} m")
+    print(f"受原始网格上界约束的搜索起始 d: {result['start_d']:.2f} m")
     print(f"相对面积误差阈值: {result['relative_error_threshold'] * 100:.4f}%")
     if result["optimal_d"] is not None:
         print(f"满足条件的最优 d: {result['optimal_d']:.2f} m")
