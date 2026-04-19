@@ -56,6 +56,7 @@ class SurveyPlanner:
         boundary_mask=None,
         cell_effective_area=None,
         grid_cell_size=None,
+        depth_matrix=None,
     ):
         self.xs = xs
         self.ys = ys
@@ -94,11 +95,21 @@ class SurveyPlanner:
             if cell_effective_area is not None
             else None
         )
+        self.depth_matrix = (
+            np.asarray(depth_matrix, dtype=float)
+            if depth_matrix is not None
+            else None
+        )
         self.grid_cell_size = (
             float(grid_cell_size)
             if grid_cell_size is not None
             else infer_uniform_cell_size(self.xs, self.ys)
         )
+        if self.depth_matrix is not None and self.depth_matrix.shape != self.cluster_matrix.shape:
+            raise ValueError(
+                "depth_matrix 尺寸必须与 cluster_matrix 一致："
+                f"depth={self.depth_matrix.shape}, cluster={self.cluster_matrix.shape}"
+            )
 
         # 即时指标存储
         self.all_records: list[LineRecord] = []
@@ -128,6 +139,34 @@ class SurveyPlanner:
             y_max=self.y_max,
         )
         return is_in
+
+    def _select_partition_start_point(self, partition_id, rows, cols):
+        """选择分区内最大水深网格中心作为起始点。"""
+        if len(rows) == 0:
+            raise ValueError(f"分区 {partition_id} 无有效网格点可用于选择起点")
+
+        valid_mask = self.boundary_mask[rows, cols]
+        valid_rows = rows[valid_mask]
+        valid_cols = cols[valid_mask]
+        if len(valid_rows) == 0:
+            valid_rows = rows
+            valid_cols = cols
+
+        if self.depth_matrix is not None:
+            depths = self.depth_matrix[valid_rows, valid_cols]
+        else:
+            depths = np.array(
+                [get_height(float(self.xs[c]), float(self.ys[r])) for r, c in zip(valid_rows, valid_cols)],
+                dtype=float,
+            )
+
+        deepest_idx = int(np.argmax(depths))
+        start_row = int(valid_rows[deepest_idx])
+        start_col = int(valid_cols[deepest_idx])
+        start_x = float(self.xs[start_col])
+        start_y = float(self.ys[start_row])
+        start_depth = float(depths[deepest_idx])
+        return start_x, start_y, start_depth
 
     def _candidate_point_has_value(self, point) -> bool:
         """细网格状态驱动的点保留判断。"""
@@ -316,7 +355,7 @@ class SurveyPlanner:
         line = [self._point_with_width(start_x, start_y)]
         prior_covered_mask = self._snapshot_current_covered_mask()
 
-        ext_step = step / 2
+        ext_step = step
         ext_loop = 0
         front_x, front_y = start_x, start_y
         back_x, back_y = start_x, start_y
@@ -499,14 +538,6 @@ class SurveyPlanner:
                 )
                 break
 
-            # 检查测线退化：只丢弃长度不足以形成线段的情况
-            if len(t1) <= 1:
-                print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮仅{len(t1)}个新点(<=1)，"
-                    f"按从测线停止规则终止该方向 | 边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
-                )
-                break
-
             overlap_excess_length = self._compute_overlap_excess_length(
                 t1, t1_overlap_rates, threshold=0.2
             )
@@ -519,7 +550,7 @@ class SurveyPlanner:
             terminated_reason = TerminationReason.NONE
 
             # 主循环：两端按边界 + 细网格收益进行自延伸
-            ext_step = self.step / 2
+            ext_step = self.step
             ext_loop = 0
 
             front_x, front_y = line[-1][0], line[-1][1]
@@ -648,12 +679,14 @@ class SurveyPlanner:
             print(f"[分区{partition_id}] 未找到有效网格点, 跳过")
             return PartitionResult(partition_id, [], [], 0.0, 0.0)
 
-        start_x = float(np.mean(self.xs[cols]))
-        start_y = float(np.mean(self.ys[rows]))
+        start_x, start_y, start_depth = self._select_partition_start_point(
+            partition_id, rows, cols
+        )
 
         print(f"\n{'=' * 60}")
         print(
-            f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | 分区中心"
+            f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
+            f"最大水深网格中心 | depth={start_depth:.2f}m"
         )
 
         state_grid = PartitionCoverageStateGrid(
@@ -777,7 +810,13 @@ class SurveyPlanner:
             output_dir = "./multibeam/output"
 
         output_path = Path(output_dir)
-        is_timestamped = len(output_path.name) == 15 and output_path.name[8] == "_"
+        output_name = output_path.name
+        is_timestamped = (
+            len(output_name) >= 15
+            and output_name[:8].isdigit()
+            and output_name[8] == "_"
+            and output_name[9:15].isdigit()
+        )
 
         if is_timestamped:
             run_dir = output_path
