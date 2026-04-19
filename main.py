@@ -43,7 +43,7 @@ if __name__ == "__main__":
 
     # 统一时间戳，确保所有输出在同一目录下
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_base = f"./multibeam/output/{current_time}_cov-g"
+    output_base = f"./multibeam/output/{current_time}_xycov-xyg"
 
     # Phase 3: 分区（elbow 和 partition 图写入 output/<timestamp>/partition/）
     final_cluster_matrix, U = partition_coverage_matrix(
