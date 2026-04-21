@@ -158,61 +158,8 @@ class SurveyPlanner:
             dtype=float,
         )
 
-    def _get_boundary_cell_along_gradient(
-        self,
-        start_row,
-        start_col,
-        partition_rows,
-        partition_cols,
-        partition_depths,
-    ):
-        x0 = float(self.xs[start_col])
-        y0 = float(self.ys[start_row])
-        gx = float(get_gx(x0, y0))
-        gy = float(get_gy(x0, y0))
-        norm = float(np.hypot(gx, gy))
-        if norm <= 1e-12:
-            return None
-
-        ux = gx / norm
-        uy = gy / norm
-        dx = self.xs[partition_cols] - x0
-        dy = self.ys[partition_rows] - y0
-        proj = dx * ux + dy * uy
-        perp = np.abs(dx * uy - dy * ux)
-        ray_tolerance = max(self.grid_cell_size, 1e-6)
-        candidate_mask = (proj > 1e-8) & (perp <= ray_tolerance)
-        if not np.any(candidate_mask):
-            return None
-
-        candidate_indices = np.where(candidate_mask)[0]
-        best_local_idx = int(candidate_indices[np.argmax(proj[candidate_mask])])
-        return {
-            "distance": float(proj[best_local_idx]),
-            "depth": float(partition_depths[best_local_idx]),
-            "row": int(partition_rows[best_local_idx]),
-            "col": int(partition_cols[best_local_idx]),
-        }
-
-    def _compute_required_seed_clearance(self, alpha_deg, boundary_depth):
-        alpha = float(np.radians(alpha_deg))
-        sin_half = float(np.sin(self.theta_rad / 2.0))
-        denominator = float(
-            np.sin((np.pi - self.theta_rad) / 2.0 - alpha)
-            + np.sin(alpha) * sin_half
-        )
-        if boundary_depth <= 0 or not np.isfinite(boundary_depth):
-            return np.inf
-        if denominator <= 1e-12:
-            return np.inf
-
-        delta_r = float(np.cos(alpha) * boundary_depth * sin_half / denominator)
-        if not np.isfinite(delta_r) or delta_r < 0:
-            return np.inf
-        return delta_r
-
     def _select_partition_start_point(self, partition_id, rows, cols):
-        """选择满足 clearance 约束的最深网格中心作为起始点。"""
+        """选择当前分区中的最深网格中心作为起始点。"""
         if len(rows) == 0:
             raise ValueError(f"分区 {partition_id} 无有效网格点可用于选择起点")
 
@@ -224,60 +171,18 @@ class SurveyPlanner:
             valid_cols = cols
 
         depths = self._get_depth_at_cells(valid_rows, valid_cols)
-        candidate_order = np.argsort(depths)[::-1]
-
-        fallback_idx = int(candidate_order[0])
-        fallback_row = int(valid_rows[fallback_idx])
-        fallback_col = int(valid_cols[fallback_idx])
-        fallback_depth = float(depths[fallback_idx])
-
-        for idx in candidate_order:
-            start_row = int(valid_rows[idx])
-            start_col = int(valid_cols[idx])
-            start_x = float(self.xs[start_col])
-            start_y = float(self.ys[start_row])
-            start_depth = float(depths[idx])
-            alpha_deg = float(self._get_alpha(start_x, start_y))
-            boundary_info = self._get_boundary_cell_along_gradient(
-                start_row,
-                start_col,
-                valid_rows,
-                valid_cols,
-                depths,
-            )
-            if boundary_info is None:
-                continue
-
-            delta_r = self._compute_required_seed_clearance(
-                alpha_deg, boundary_info["depth"]
-            )
-            if boundary_info["distance"] >= delta_r:
-                return {
-                    "x": start_x,
-                    "y": start_y,
-                    "depth": start_depth,
-                    "row": start_row,
-                    "col": start_col,
-                    "alpha_deg": alpha_deg,
-                    "boundary_distance": float(boundary_info["distance"]),
-                    "boundary_depth": float(boundary_info["depth"]),
-                    "delta_r": float(delta_r),
-                    "rule": "deepest_cell_with_gradient_clearance",
-                }
-
-        fallback_x = float(self.xs[fallback_col])
-        fallback_y = float(self.ys[fallback_row])
+        deepest_idx = int(np.argmax(depths))
+        deepest_row = int(valid_rows[deepest_idx])
+        deepest_col = int(valid_cols[deepest_idx])
+        deepest_x = float(self.xs[deepest_col])
+        deepest_y = float(self.ys[deepest_row])
         return {
-            "x": fallback_x,
-            "y": fallback_y,
-            "depth": fallback_depth,
-            "row": fallback_row,
-            "col": fallback_col,
-            "alpha_deg": float(self._get_alpha(fallback_x, fallback_y)),
-            "boundary_distance": None,
-            "boundary_depth": None,
-            "delta_r": None,
-            "rule": "fallback_deepest_cell",
+            "x": deepest_x,
+            "y": deepest_y,
+            "depth": float(depths[deepest_idx]),
+            "row": deepest_row,
+            "col": deepest_col,
+            "rule": "deepest_cell_in_partition",
         }
 
     def _candidate_point_has_value(self, point) -> bool:
@@ -798,17 +703,10 @@ class SurveyPlanner:
         self.partition_start_points[partition_id] = start_info
 
         print(f"\n{'=' * 60}")
-        if start_info["rule"] == "deepest_cell_with_gradient_clearance":
-            print(
-                f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
-                f"最深可行网格中心 | depth={start_depth:.2f}m | "
-                f"distance={start_info['boundary_distance']:.2f}m | Δr={start_info['delta_r']:.2f}m"
-            )
-        else:
-            print(
-                f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
-                f"回退到最深网格中心 | depth={start_depth:.2f}m"
-            )
+        print(
+            f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
+            f"当前分区最深网格中心 | depth={start_depth:.2f}m"
+        )
 
         state_grid = PartitionCoverageStateGrid(
             partition_id,
