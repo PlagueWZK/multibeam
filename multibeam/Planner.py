@@ -159,7 +159,7 @@ class SurveyPlanner:
         )
 
     def _select_partition_start_point(self, partition_id, rows, cols):
-        """选择当前分区中的最深网格中心作为起始点。"""
+        """选择当前分区中的深度中值网格中心作为起始点。"""
         if len(rows) == 0:
             raise ValueError(f"分区 {partition_id} 无有效网格点可用于选择起点")
 
@@ -171,18 +171,20 @@ class SurveyPlanner:
             valid_cols = cols
 
         depths = self._get_depth_at_cells(valid_rows, valid_cols)
-        deepest_idx = int(np.argmax(depths))
-        deepest_row = int(valid_rows[deepest_idx])
-        deepest_col = int(valid_cols[deepest_idx])
-        deepest_x = float(self.xs[deepest_col])
-        deepest_y = float(self.ys[deepest_row])
+        depth_order = np.argsort(depths)
+        median_rank = len(depth_order) // 2
+        median_idx = int(depth_order[median_rank])
+        median_row = int(valid_rows[median_idx])
+        median_col = int(valid_cols[median_idx])
+        median_x = float(self.xs[median_col])
+        median_y = float(self.ys[median_row])
         return {
-            "x": deepest_x,
-            "y": deepest_y,
-            "depth": float(depths[deepest_idx]),
-            "row": deepest_row,
-            "col": deepest_col,
-            "rule": "deepest_cell_in_partition",
+            "x": median_x,
+            "y": median_y,
+            "depth": float(depths[median_idx]),
+            "row": median_row,
+            "col": median_col,
+            "rule": "upper_median_depth_cell_in_partition",
         }
 
     def _candidate_point_has_value(self, point) -> bool:
@@ -705,7 +707,7 @@ class SurveyPlanner:
         print(f"\n{'=' * 60}")
         print(
             f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
-            f"当前分区最深网格中心 | depth={start_depth:.2f}m"
+            f"当前分区深度中值网格中心(偶数取偏深一侧) | depth={start_depth:.2f}m"
         )
 
         state_grid = PartitionCoverageStateGrid(

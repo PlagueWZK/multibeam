@@ -11,6 +11,16 @@ from tool.Data import get_gx, get_gy
 PRIMARY_FEATURES_BY_MODE = {
     "xy_coverage": ("X", "Y", "coverage_count"),
     "coverage_only": ("coverage_count",),
+    "xy_depth_coverage": ("X", "Y", "depth", "coverage_count"),
+    "xy_depth_coverage_direction": (
+        "X",
+        "Y",
+        "depth",
+        "coverage_count",
+        "ux",
+        "uy",
+    ),
+    "coverage_direction": ("coverage_count", "ux", "uy"),
 }
 SECONDARY_FEATURE_NAMES = ("ux", "uy")
 
@@ -80,6 +90,7 @@ def _build_feature_stacks(
     xs,
     ys,
     coverage_matrix,
+    depth_matrix=None,
     gx_matrix=None,
     gy_matrix=None,
     primary_feature_mode="coverage_only",
@@ -117,6 +128,15 @@ def _build_feature_stacks(
         )
 
     feature_c = coverage_matrix.flatten().reshape(-1, 1)
+    feature_depth = None
+    if depth_matrix is not None:
+        depth_matrix = np.asarray(depth_matrix, dtype=float)
+        if depth_matrix.shape != (rows, cols):
+            raise ValueError(
+                "提供的深度矩阵尺寸与 coverage_matrix 不一致："
+                f"coverage={coverage_matrix.shape}, depth={depth_matrix.shape}"
+            )
+        feature_depth = depth_matrix.flatten().reshape(-1, 1)
 
     gx_matrix = gx_flat.reshape(rows, cols)
     gy_matrix = gy_flat.reshape(rows, cols)
@@ -131,12 +151,36 @@ def _build_feature_stacks(
         gy_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
     )
 
+    feature_x = grid_x.flatten().reshape(-1, 1)
+    feature_y = grid_y.flatten().reshape(-1, 1)
+    feature_ux = unit_gx_matrix.reshape(-1, 1)
+    feature_uy = unit_gy_matrix.reshape(-1, 1)
+
     if primary_feature_mode == "xy_coverage":
-        feature_x = grid_x.flatten().reshape(-1, 1)
-        feature_y = grid_y.flatten().reshape(-1, 1)
         primary_features = np.hstack((feature_x, feature_y, feature_c))
-    else:
+    elif primary_feature_mode == "coverage_only":
         primary_features = feature_c
+    elif primary_feature_mode == "xy_depth_coverage":
+        if feature_depth is None:
+            raise ValueError(
+                "primary_feature_mode='xy_depth_coverage' 需要提供 depth_matrix。"
+            )
+        primary_features = np.hstack((feature_x, feature_y, feature_depth, feature_c))
+    elif primary_feature_mode == "xy_depth_coverage_direction":
+        if feature_depth is None:
+            raise ValueError(
+                "primary_feature_mode='xy_depth_coverage_direction' 需要提供 depth_matrix。"
+            )
+        primary_features = np.hstack(
+            (feature_x, feature_y, feature_depth, feature_c, feature_ux, feature_uy)
+        )
+    elif primary_feature_mode == "coverage_direction":
+        primary_features = np.hstack((feature_c, feature_ux, feature_uy))
+    else:
+        raise ValueError(
+            "不支持的一级分区特征模式："
+            f"{primary_feature_mode}，可选={tuple(PRIMARY_FEATURES_BY_MODE)}"
+        )
 
     secondary_features = np.hstack(
         (
@@ -162,10 +206,10 @@ def _build_feature_stacks(
     }
 
 
-def _scale_features_for_kmeans(valid_features):
+def _scale_features_for_kmeans(valid_features, feature_scaling_mode="legacy_balanced"):
     weighted_features = valid_features.copy().astype(float)
 
-    if valid_features.shape[1] >= 3:
+    if feature_scaling_mode == "legacy_balanced" and valid_features.shape[1] >= 3:
         std_xy_raw = float(np.std(valid_features[:, :2]))
         weighted_features[:, 2] *= std_xy_raw / (
             float(np.std(valid_features[:, 2])) + 1e-6
@@ -175,6 +219,11 @@ def _scale_features_for_kmeans(valid_features):
             weighted_features[:, 3:5] *= std_xy_raw / (
                 float(np.std(valid_features[:, 3:5])) + 1e-6
             )
+    elif feature_scaling_mode != "equal_weight_standardized":
+        raise ValueError(
+            "不支持的特征缩放模式："
+            f"{feature_scaling_mode}，可选=('legacy_balanced', 'equal_weight_standardized')"
+        )
 
     scaler = StandardScaler()
     return scaler.fit_transform(weighted_features)
@@ -189,6 +238,7 @@ def _cluster_with_selected_mask(
     k_max=10,
     output_dir=None,
     elbow_subdir=None,
+    feature_scaling_mode="legacy_balanced",
 ):
     valid_features = features[selected_mask_1d]
     n_samples = len(valid_features)
@@ -197,7 +247,9 @@ def _cluster_with_selected_mask(
     if n_samples < 3:
         raise ValueError(f"可用于聚类的数据点过少 (n={n_samples})，至少需要 3 个点。")
 
-    scaled_features = _scale_features_for_kmeans(valid_features)
+    scaled_features = _scale_features_for_kmeans(
+        valid_features, feature_scaling_mode=feature_scaling_mode
+    )
 
     if U is not None:
         if U < 2:
@@ -350,6 +402,8 @@ def _write_secondary_partition_diagnostics(
     direction_dispersion_threshold,
     min_partition_size_for_secondary,
     secondary_k_max,
+    enable_secondary_partition,
+    feature_scaling_mode,
 ):
     if output_dir is None:
         return
@@ -362,6 +416,8 @@ def _write_secondary_partition_diagnostics(
         "secondary_features": list(SECONDARY_FEATURE_NAMES),
         "first_stage_u": int(first_stage_u),
         "final_u": int(final_u),
+        "secondary_partition_enabled": bool(enable_secondary_partition),
+        "feature_scaling_mode": feature_scaling_mode,
         "secondary_detection_thresholds": {
             "direction_dispersion_threshold": float(direction_dispersion_threshold),
             "min_partition_size_for_secondary": int(min_partition_size_for_secondary),
@@ -377,6 +433,7 @@ def partition_coverage_matrix(
     xs,
     ys,
     coverage_matrix,
+    depth_matrix=None,
     U=None,
     k_max=10,
     output_dir=None,
@@ -384,6 +441,8 @@ def partition_coverage_matrix(
     gx_matrix=None,
     gy_matrix=None,
     primary_feature_mode="coverage_only",
+    feature_scaling_mode="legacy_balanced",
+    enable_secondary_partition=True,
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
     direction_dispersion_threshold=0.30,
@@ -394,6 +453,7 @@ def partition_coverage_matrix(
     参数:
         xs, ys: 坐标数组
         coverage_matrix: 覆盖次数矩阵
+        depth_matrix: 深度矩阵（当一级特征包含 depth 时必需）
         U: 指定分区数量（可选）。若传入则直接使用，若为 None 则使用 Elbow 法则自动确定
         k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
@@ -403,6 +463,7 @@ def partition_coverage_matrix(
         xs,
         ys,
         coverage_matrix,
+        depth_matrix=depth_matrix,
         gx_matrix=gx_matrix,
         gy_matrix=gy_matrix,
         primary_feature_mode=primary_feature_mode,
@@ -429,7 +490,8 @@ def partition_coverage_matrix(
 
     print(
         "[分区] 一级分区特征 = "
-        f"{primary_feature_names} | 二级分区特征 = {SECONDARY_FEATURE_NAMES}"
+        f"{primary_feature_names} | 特征缩放 = {feature_scaling_mode} | "
+        f"二级分区启用 = {enable_secondary_partition} | 二级分区特征 = {SECONDARY_FEATURE_NAMES}"
     )
     first_stage_cluster_matrix, first_stage_u = _cluster_with_selected_mask(
         primary_features,
@@ -440,6 +502,7 @@ def partition_coverage_matrix(
         k_max=k_max,
         output_dir=output_dir,
         elbow_subdir="stage1",
+        feature_scaling_mode=feature_scaling_mode,
     )
     _save_partition_plot(
         first_stage_cluster_matrix,
@@ -480,7 +543,7 @@ def partition_coverage_matrix(
             f"reasons={diagnostic['trigger_reasons']}"
         )
 
-        if diagnostic["triggered_secondary_partition"]:
+        if enable_secondary_partition and diagnostic["triggered_secondary_partition"]:
             local_mask_1d = partition_mask.reshape(-1)
             if np.count_nonzero(local_mask_1d) >= 3:
                 local_cluster_matrix, local_u = _cluster_with_selected_mask(
@@ -492,6 +555,7 @@ def partition_coverage_matrix(
                     k_max=secondary_k_max,
                     output_dir=output_dir,
                     elbow_subdir=f"stage2_partition_{partition_id}",
+                    feature_scaling_mode="equal_weight_standardized",
                 )
                 diagnostic["secondary_partition_count"] = int(local_u)
                 for local_label in sorted(np.unique(local_cluster_matrix).astype(int)):
@@ -505,6 +569,16 @@ def partition_coverage_matrix(
                 diagnostic["trigger_reasons"] = ["insufficient_local_samples"]
                 merged_cluster_matrix[partition_mask] = next_global_id
                 next_global_id += 1
+        elif not enable_secondary_partition:
+            diagnostic["would_trigger_secondary_partition"] = bool(
+                diagnostic["triggered_secondary_partition"]
+            )
+            diagnostic["would_trigger_reasons"] = list(diagnostic["trigger_reasons"])
+            diagnostic["triggered_secondary_partition"] = False
+            diagnostic["trigger_reasons"] = ["disabled_by_configuration"]
+            diagnostic["secondary_partition_count"] = 1
+            merged_cluster_matrix[partition_mask] = next_global_id
+            next_global_id += 1
         else:
             diagnostic["secondary_partition_count"] = 1
             merged_cluster_matrix[partition_mask] = next_global_id
@@ -513,13 +587,18 @@ def partition_coverage_matrix(
         diagnostics.append(diagnostic)
 
     final_cluster_matrix, final_u = _renumber_cluster_matrix(merged_cluster_matrix)
+    final_partition_title = (
+        f"Two-Stage Partitioning (U={final_u})"
+        if enable_secondary_partition
+        else f"Single-Stage Partitioning (U={final_u})"
+    )
     _save_partition_plot(
         final_cluster_matrix,
         xs,
         ys,
         output_dir,
         f"partition_final_U={final_u}.png",
-        f"Two-Stage Partitioning (U={final_u})",
+        final_partition_title,
     )
     _save_partition_plot(
         final_cluster_matrix,
@@ -527,7 +606,7 @@ def partition_coverage_matrix(
         ys,
         output_dir,
         f"partition_U={final_u}.png",
-        f"Two-Stage Partitioning (U={final_u})",
+        final_partition_title,
     )
     _write_secondary_partition_diagnostics(
         output_dir,
@@ -538,10 +617,13 @@ def partition_coverage_matrix(
         direction_dispersion_threshold,
         min_partition_size_for_secondary,
         secondary_k_max,
+        enable_secondary_partition,
+        feature_scaling_mode,
     )
 
     print(
-        f"[分区] 一级分区数={first_stage_u} | 二次分区合并后总分区数={final_u}"
+        f"[分区] 一级分区数={first_stage_u} | "
+        f"{'二次分区合并后总分区数' if enable_secondary_partition else '单阶段最终总分区数'}={final_u}"
     )
     return final_cluster_matrix, final_u
 
