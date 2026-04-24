@@ -583,6 +583,216 @@ def _merge_small_partitions(
     return renumbered_matrix, final_u, diagnostics
 
 
+def _count_partition_boundary_grid_contacts(cluster_matrix, partition_id):
+    """统计分区自身边界网格数，以及这些边界网格接触各相邻分区的数量。"""
+    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
+    rows, cols = cluster_matrix.shape
+    total_boundary_cells = 0
+    neighbor_contact_cells = {}
+
+    for row, col in np.argwhere(cluster_matrix == partition_id):
+        row = int(row)
+        col = int(col)
+        is_boundary_cell = False
+        touched_neighbor_ids = set()
+
+        for d_row, d_col in _connected_component_offsets(4):
+            next_row = row + d_row
+            next_col = col + d_col
+            if next_row < 0 or next_row >= rows or next_col < 0 or next_col >= cols:
+                is_boundary_cell = True
+                continue
+
+            neighbor_id = int(cluster_matrix[next_row, next_col])
+            if neighbor_id == partition_id:
+                continue
+
+            is_boundary_cell = True
+            if neighbor_id >= 0:
+                touched_neighbor_ids.add(neighbor_id)
+
+        if not is_boundary_cell:
+            continue
+
+        total_boundary_cells += 1
+        for neighbor_id in touched_neighbor_ids:
+            neighbor_contact_cells[neighbor_id] = (
+                neighbor_contact_cells.get(neighbor_id, 0) + 1
+            )
+
+    return total_boundary_cells, neighbor_contact_cells
+
+
+def _select_boundary_dominance_merge_target(
+    cluster_matrix,
+    partition_id,
+    partition_areas,
+    boundary_contact_ratio_threshold,
+):
+    total_boundary_cells, neighbor_contact_cells = (
+        _count_partition_boundary_grid_contacts(cluster_matrix, partition_id)
+    )
+    if total_boundary_cells == 0 or not neighbor_contact_cells:
+        return None, total_boundary_cells, neighbor_contact_cells
+
+    eligible_neighbors = []
+    for neighbor_id, contact_cells in neighbor_contact_cells.items():
+        contact_ratio = contact_cells / total_boundary_cells
+        if contact_ratio > boundary_contact_ratio_threshold:
+            eligible_neighbors.append((neighbor_id, contact_cells, contact_ratio))
+
+    if not eligible_neighbors:
+        return None, total_boundary_cells, neighbor_contact_cells
+
+    target_partition_id, _, _ = max(
+        eligible_neighbors,
+        key=lambda item: (
+            item[2],
+            item[1],
+            partition_areas.get(item[0], 0.0),
+            -item[0],
+        ),
+    )
+    return target_partition_id, total_boundary_cells, neighbor_contact_cells
+
+
+def _merge_boundary_dominant_partitions(
+    cluster_matrix,
+    cell_effective_area=None,
+    boundary_partition_area_ratio=0.10,
+    boundary_contact_ratio_threshold=0.50,
+    max_iterations=None,
+):
+    """将边界主要接触同一邻区的 10% 以下分区合并到该邻区。"""
+    if boundary_partition_area_ratio < 0:
+        raise ValueError(
+            "boundary_partition_area_ratio 必须 >= 0，"
+            f"当前为 {boundary_partition_area_ratio}"
+        )
+    if not 0 <= boundary_contact_ratio_threshold <= 1:
+        raise ValueError(
+            "boundary_contact_ratio_threshold 必须位于 [0, 1]，"
+            f"当前为 {boundary_contact_ratio_threshold}"
+        )
+
+    working_matrix = np.asarray(cluster_matrix, dtype=int).copy()
+    area_matrix, area_source = _build_partition_area_matrix(
+        working_matrix,
+        cell_effective_area=cell_effective_area,
+    )
+    total_area = float(np.sum(area_matrix[working_matrix >= 0]))
+    threshold_area = float(total_area * boundary_partition_area_ratio)
+    diagnostics = {
+        "enabled": True,
+        "area_source": area_source,
+        "boundary_partition_area_ratio": float(boundary_partition_area_ratio),
+        "boundary_contact_ratio_threshold": float(boundary_contact_ratio_threshold),
+        "total_area": total_area,
+        "threshold_area": threshold_area,
+        "merge_count": 0,
+        "merges": [],
+        "remaining_under_threshold_partitions": [],
+    }
+
+    partition_areas = _calculate_partition_areas(working_matrix, area_matrix)
+    if max_iterations is None:
+        max_iterations = max(len(partition_areas), 1)
+
+    if total_area <= 0 or boundary_partition_area_ratio == 0:
+        renumbered_matrix, final_u = _renumber_cluster_matrix(working_matrix)
+        diagnostics["final_u"] = int(final_u)
+        return renumbered_matrix, final_u, diagnostics
+
+    iteration = 0
+    while iteration < max_iterations:
+        partition_areas = _calculate_partition_areas(working_matrix, area_matrix)
+        candidate_ids = [
+            partition_id
+            for partition_id, area in partition_areas.items()
+            if area < threshold_area
+        ]
+        if not candidate_ids:
+            break
+
+        merge_candidates = []
+        for partition_id in candidate_ids:
+            target_partition_id, total_boundary_cells, neighbor_contact_cells = (
+                _select_boundary_dominance_merge_target(
+                    working_matrix,
+                    partition_id,
+                    partition_areas,
+                    boundary_contact_ratio_threshold,
+                )
+            )
+            neighbor_contact_ratios = {
+                int(neighbor_id): (
+                    contact_cells / total_boundary_cells
+                    if total_boundary_cells > 0
+                    else 0.0
+                )
+                for neighbor_id, contact_cells in neighbor_contact_cells.items()
+            }
+            if target_partition_id is None:
+                continue
+
+            contact_cells = int(neighbor_contact_cells[target_partition_id])
+            contact_ratio = float(neighbor_contact_ratios[target_partition_id])
+            merge_candidates.append(
+                {
+                    "partition_id": int(partition_id),
+                    "target_partition_id": int(target_partition_id),
+                    "area": float(partition_areas[partition_id]),
+                    "area_ratio": float(partition_areas[partition_id] / total_area),
+                    "target_area_before": float(partition_areas[target_partition_id]),
+                    "total_boundary_cells": int(total_boundary_cells),
+                    "target_contact_boundary_cells": contact_cells,
+                    "target_contact_boundary_ratio": contact_ratio,
+                    "neighbor_contact_boundary_cells": {
+                        str(int(neighbor_id)): int(contact_cells)
+                        for neighbor_id, contact_cells in sorted(
+                            neighbor_contact_cells.items()
+                        )
+                    },
+                    "neighbor_contact_boundary_ratios": {
+                        str(int(neighbor_id)): float(contact_ratio)
+                        for neighbor_id, contact_ratio in sorted(
+                            neighbor_contact_ratios.items()
+                        )
+                    },
+                }
+            )
+
+        if not merge_candidates:
+            break
+
+        merge_action = min(
+            merge_candidates,
+            key=lambda item: (item["area"], item["partition_id"]),
+        )
+        source_partition_id = merge_action["partition_id"]
+        target_partition_id = merge_action["target_partition_id"]
+        working_matrix[working_matrix == source_partition_id] = target_partition_id
+
+        merge_action["iteration"] = int(iteration + 1)
+        diagnostics["merges"].append(merge_action)
+        diagnostics["merge_count"] = int(len(diagnostics["merges"]))
+        iteration += 1
+
+    renumbered_matrix, final_u = _renumber_cluster_matrix(working_matrix)
+    final_areas = _calculate_partition_areas(renumbered_matrix, area_matrix)
+    diagnostics["final_u"] = int(final_u)
+    diagnostics["remaining_under_threshold_partitions"] = [
+        {
+            "partition_id": int(partition_id),
+            "area": float(area),
+            "area_ratio": float(area / total_area),
+        }
+        for partition_id, area in final_areas.items()
+        if area < threshold_area
+    ]
+    return renumbered_matrix, final_u, diagnostics
+
+
 def _summarize_partition_gradient_complexity(
     partition_id,
     partition_mask,
@@ -715,6 +925,17 @@ def _write_small_partition_merge_diagnostics(output_dir, diagnostics):
         json.dump(diagnostics, f, ensure_ascii=False, indent=2)
 
 
+def _write_boundary_dominance_merge_diagnostics(output_dir, diagnostics):
+    if output_dir is None:
+        return
+
+    partition_dir = Path(output_dir) / "partition"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = partition_dir / "boundary_dominance_merge_diagnostics.json"
+    with diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+
+
 def partition_coverage_matrix(
     xs,
     ys,
@@ -733,6 +954,9 @@ def partition_coverage_matrix(
     cell_effective_area=None,
     merge_small_partitions=True,
     small_partition_area_ratio=0.02,
+    merge_boundary_dominance_partitions=True,
+    boundary_partition_area_ratio=0.10,
+    boundary_contact_ratio_threshold=0.50,
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
@@ -748,6 +972,9 @@ def partition_coverage_matrix(
         cell_effective_area: 每个网格在待测海域内的真实有效面积；提供时用于小面积分区合并
         merge_small_partitions: 是否在连通性拆分后合并小于阈值的小面积分区
         small_partition_area_ratio: 小面积分区阈值，默认 0.02 表示待测海域总面积的 2%
+        merge_boundary_dominance_partitions: 是否启用 10% 以下分区边界占比合并
+        boundary_partition_area_ratio: 边界占比合并候选面积阈值，默认 0.10 表示 10%
+        boundary_contact_ratio_threshold: 相邻分区接触边界网格占比阈值，默认 0.50
     """
     feature_bundle = _build_feature_stacks(
         xs,
@@ -930,6 +1157,40 @@ def partition_coverage_matrix(
         f"partition_stage4_small_area_merged_U={final_u}.png",
         f"Stage 4: Small-Area-Merged Final Partitioning (U={final_u})",
     )
+
+    small_merged_cluster_matrix = final_cluster_matrix
+    small_merged_u = final_u
+    if merge_boundary_dominance_partitions:
+        final_cluster_matrix, final_u, boundary_dominance_diagnostics = (
+            _merge_boundary_dominant_partitions(
+                small_merged_cluster_matrix,
+                cell_effective_area=cell_effective_area,
+                boundary_partition_area_ratio=boundary_partition_area_ratio,
+                boundary_contact_ratio_threshold=boundary_contact_ratio_threshold,
+            )
+        )
+    else:
+        boundary_dominance_diagnostics = {
+            "enabled": False,
+            "boundary_partition_area_ratio": float(boundary_partition_area_ratio),
+            "boundary_contact_ratio_threshold": float(
+                boundary_contact_ratio_threshold
+            ),
+            "pre_merge_u": int(small_merged_u),
+            "final_u": int(final_u),
+            "merge_count": 0,
+            "merges": [],
+            "remaining_under_threshold_partitions": [],
+        }
+
+    _save_partition_plot(
+        final_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage5_boundary_dominance_merged_U={final_u}.png",
+        f"Stage 5: Boundary-Dominance-Merged Final Partitioning (U={final_u})",
+    )
     _save_partition_plot(
         final_cluster_matrix,
         xs,
@@ -967,18 +1228,27 @@ def partition_coverage_matrix(
         output_dir,
         small_merge_diagnostics,
     )
+    _write_boundary_dominance_merge_diagnostics(
+        output_dir,
+        boundary_dominance_diagnostics,
+    )
 
     split_partition_count = sum(
         1 for diagnostic in connectivity_diagnostics if diagnostic["split"]
     )
     small_merge_count = int(small_merge_diagnostics.get("merge_count", 0))
+    boundary_dominance_merge_count = int(
+        boundary_dominance_diagnostics.get("merge_count", 0)
+    )
     print(
         f"[分区] 一级分区数={first_stage_u} | "
         f"二次分区合并后总分区数={post_secondary_u} | "
         f"连通性拆分后总分区数={connected_u} | "
-        f"小面积合并后总分区数={final_u} | "
+        f"小面积合并后总分区数={small_merged_u} | "
+        f"边界占比合并后总分区数={final_u} | "
         f"发生拆分的分区数={split_partition_count} | "
-        f"小面积合并次数={small_merge_count}"
+        f"小面积合并次数={small_merge_count} | "
+        f"边界占比合并次数={boundary_dominance_merge_count}"
     )
     return final_cluster_matrix, final_u
 
