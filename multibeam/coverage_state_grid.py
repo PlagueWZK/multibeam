@@ -535,7 +535,7 @@ class PartitionCoverageStateGrid:
 
     def would_segment_add_value(self, start: np.ndarray, end: np.ndarray) -> bool:
         gain = self._estimate_swath_gain(start, end)
-        return gain["nonfull_cells_touched"] > 0
+        return gain["new_samples_in_nonfull_cells"] > 0
 
     def would_point_add_value(self, point: np.ndarray) -> bool:
         point_arr = np.asarray(point, dtype=float)

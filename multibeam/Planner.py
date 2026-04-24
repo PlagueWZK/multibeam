@@ -5,10 +5,9 @@
 数据类、几何计算和可视化逻辑已拆分到独立模块。
 """
 
-import copy
 import datetime
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +41,16 @@ from tool.Data import (
 # ---------------------------------------------------------------------------
 # SurveyPlanner — 测线规划核心类
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ChildLineCandidate:
+    """垂直扩展候选真实测线段。"""
+
+    line: np.ndarray
+    initial_line: np.ndarray
+    overlap_rates: np.ndarray
+    terminated_reason: TerminationReason = TerminationReason.NONE
 
 
 class SurveyPlanner:
@@ -86,6 +95,8 @@ class SurveyPlanner:
         self.partition_state_grids = {}
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
+        self.jump_line_gain_threshold = 0.5
+        self.max_consecutive_jump_lines = 3
         self.start_point_strategy = str(start_point_strategy).strip().lower()
         self.supported_start_point_strategies = {"deepest", "coordinate_center"}
         if self.start_point_strategy not in self.supported_start_point_strategies:
@@ -400,6 +411,8 @@ class SurveyPlanner:
     ):
         """测线生成完毕后立即计算并记录指标"""
         pts = np.array(points)
+        if len(pts) < 2:
+            return None
         length = figure_length(pts)
         coverage = figure_width(pts)
 
@@ -660,6 +673,392 @@ class SurveyPlanner:
         )
         return line, terminated_by, 0.0, 0.0, repeated_area
 
+    @staticmethod
+    def _line_has_enough_points(line) -> bool:
+        return len(np.asarray(line)) >= 2
+
+    def _snapshot_current_partition_state(self):
+        if self.current_partition_grid is None:
+            return None
+        return {
+            "covered_sample_mask": np.array(
+                self.current_partition_grid.covered_sample_mask, copy=True
+            ),
+            "repeated_sample_mask": np.array(
+                self.current_partition_grid.repeated_sample_mask, copy=True
+            ),
+            "cumulative_repeated_area": float(
+                self.current_partition_grid.cumulative_repeated_area
+            ),
+        }
+
+    def _restore_current_partition_state(self, snapshot) -> None:
+        if self.current_partition_grid is None or snapshot is None:
+            return
+        self.current_partition_grid.covered_sample_mask = np.array(
+            snapshot["covered_sample_mask"], copy=True
+        )
+        self.current_partition_grid.repeated_sample_mask = np.array(
+            snapshot["repeated_sample_mask"], copy=True
+        )
+        self.current_partition_grid.cumulative_repeated_area = float(
+            snapshot["cumulative_repeated_area"]
+        )
+
+    def _area_from_current_partition_sample_mask(self, sample_mask) -> float:
+        grid = self.current_partition_grid
+        if grid is None or sample_mask is None or not np.any(sample_mask):
+            return 0.0
+        masked = np.asarray(sample_mask, dtype=bool) & grid.partition_sample_mask
+        sample_counts = np.sum(masked, axis=2)
+        valid_domain_cells = grid.domain_sample_counts > 0
+        ratio_against_domain = np.zeros_like(sample_counts, dtype=float)
+        ratio_against_domain[valid_domain_cells] = (
+            sample_counts[valid_domain_cells]
+            / grid.domain_sample_counts[valid_domain_cells]
+        )
+        return float(np.sum(ratio_against_domain * grid.cell_domain_area))
+
+    def _compute_group_hit_mask(self, lines):
+        if self.current_partition_grid is None:
+            return None
+        hit_mask = np.zeros_like(
+            self.current_partition_grid.partition_sample_mask, dtype=bool
+        )
+        for line in lines:
+            if self._line_has_enough_points(line):
+                hit_mask |= self.current_partition_grid.compute_polyline_hit_mask(line)
+        return hit_mask
+
+    def _compute_group_gain_ratio(self, candidates, prior_covered_mask):
+        lines = [candidate.line for candidate in candidates]
+        total_coverage_area = sum(figure_width(line) for line in lines)
+        if total_coverage_area <= 1e-12:
+            return 0.0, 0.0, total_coverage_area
+
+        group_hit_mask = self._compute_group_hit_mask(lines)
+        if group_hit_mask is None:
+            return 1.0, total_coverage_area, total_coverage_area
+
+        prior_mask = (
+            np.asarray(prior_covered_mask, dtype=bool)
+            if prior_covered_mask is not None
+            else self.current_partition_grid.covered_sample_mask
+        )
+        new_mask = group_hit_mask & (~prior_mask)
+        new_area = self._area_from_current_partition_sample_mask(new_mask)
+        return new_area / total_coverage_area, new_area, total_coverage_area
+
+    @staticmethod
+    def _is_finite_candidate_point(point) -> bool:
+        point_arr = np.asarray(point, dtype=float)
+        return (
+            point_arr.shape[0] >= 3
+            and np.all(np.isfinite(point_arr[:3]))
+            and float(point_arr[2]) > 0.0
+        )
+
+    def _compute_perpendicular_candidate_point(
+        self, parent_point, direction, target_partition_id
+    ):
+        x, y = float(parent_point[0]), float(parent_point[1])
+        alpha = float(self._get_alpha(x, y))
+        h = float(get_height(x, y))
+        if not np.isfinite(alpha) or not np.isfinite(h) or h <= 0:
+            return None, None, "low_value"
+
+        if alpha <= 0.005:
+            d = 2 * h * np.tan(self.theta_rad / 2) * (1 - self.n)
+            tx = d * get_gx(x, y)
+            ty = d * get_gy(x, y)
+        else:
+            alpha_rad = np.radians(alpha)
+            sin_alpha = np.sin(alpha_rad)
+            if abs(sin_alpha) <= 1e-12:
+                return None, None, "low_value"
+            A = np.sin(np.radians(90) - self.theta_rad / 2 + alpha_rad)
+            B = np.sin(np.radians(90) - self.theta_rad / 2 - alpha_rad)
+            if abs(A) <= 1e-12 or abs(B) <= 1e-12:
+                return None, None, "low_value"
+            C = np.sin(self.theta_rad / 2) / A - 1 / sin_alpha
+            D = (
+                self.n * np.sin(self.theta_rad / 2) * (1 / A + 1 / B)
+                - np.sin(self.theta_rad / 2) / B
+                - 1 / sin_alpha
+            )
+            if abs(D) <= 1e-12:
+                return None, None, "low_value"
+            next_h = h * C / D
+            if not np.isfinite(next_h):
+                return None, None, "low_value"
+            tx = (h - next_h) / np.tan(alpha_rad) * get_gx(x, y)
+            ty = (h - next_h) / np.tan(alpha_rad) * get_gy(x, y)
+
+        new_x = x - direction * tx
+        new_y = y - direction * ty
+        if not np.isfinite(new_x) or not np.isfinite(new_y):
+            return None, None, "low_value"
+        if not self._is_in_partition(new_x, new_y, target_partition_id):
+            return None, None, "boundary"
+
+        candidate_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
+        if not self._is_finite_candidate_point(candidate_point):
+            return None, None, "low_value"
+        if not self._candidate_point_has_value(candidate_point):
+            return None, None, "low_value"
+
+        overlap_rate = self._compute_parent_child_overlap_rate(
+            parent_point, candidate_point
+        )
+        return candidate_point, overlap_rate, None
+
+    @staticmethod
+    def _make_child_candidate(points, overlap_rates) -> _ChildLineCandidate:
+        line = np.asarray(points, dtype=float)
+        rates = np.asarray(overlap_rates, dtype=float)
+        return _ChildLineCandidate(
+            line=line.copy(), initial_line=line.copy(), overlap_rates=rates.copy()
+        )
+
+    def _generate_initial_child_candidates(
+        self, parent_segments, direction, target_partition_id
+    ):
+        candidates: list[_ChildLineCandidate] = []
+        current_points = []
+        current_rates = []
+        valid_points = 0
+        boundary_rejects = 0
+        low_value_rejects = 0
+
+        def flush_current_run():
+            nonlocal current_points, current_rates
+            if len(current_points) >= 2:
+                candidates.append(
+                    self._make_child_candidate(current_points, current_rates)
+                )
+            current_points = []
+            current_rates = []
+
+        for parent_segment in parent_segments:
+            flush_current_run()
+            parent_arr = np.asarray(parent_segment, dtype=float)
+            if len(parent_arr) == 0:
+                continue
+
+            for parent_point in parent_arr:
+                candidate_point, overlap_rate, reject_reason = (
+                    self._compute_perpendicular_candidate_point(
+                        parent_point, direction, target_partition_id
+                    )
+                )
+                if candidate_point is None:
+                    if reject_reason == "boundary":
+                        boundary_rejects += 1
+                    else:
+                        low_value_rejects += 1
+                    flush_current_run()
+                    continue
+
+                current_points.append(candidate_point)
+                current_rates.append(overlap_rate)
+                valid_points += 1
+                if len(current_points) >= 2:
+                    self._update_current_partition_grid_with_segment(
+                        current_points[-2], current_points[-1]
+                    )
+
+            flush_current_run()
+
+        return candidates, valid_points, boundary_rejects, low_value_rejects
+
+    def _extend_child_candidate(
+        self, candidate: _ChildLineCandidate, target_partition_id, direction_name
+    ) -> _ChildLineCandidate:
+        line = [np.asarray(point, dtype=float) for point in candidate.line]
+        if len(line) < 2:
+            return candidate
+
+        ext_step = self.step
+        ext_loop = 0
+        front_x, front_y = float(line[-1][0]), float(line[-1][1])
+        back_x, back_y = float(line[0][0]), float(line[0][1])
+        front_stopped = False
+        back_stopped = False
+        front_stop_reason = TerminationReason.NONE
+        back_stop_reason = TerminationReason.NONE
+        extend_front = True
+
+        while True:
+            if front_stopped and back_stopped:
+                break
+            if extend_front and front_stopped:
+                extend_front = False
+                continue
+            if not extend_front and back_stopped:
+                extend_front = True
+                continue
+
+            ext_loop += 1
+            if extend_front:
+                dx, dy = forward_direction(
+                    get_gx(front_x, front_y), get_gy(front_x, front_y)
+                )
+                new_x = front_x + ext_step * dx
+                new_y = front_y + ext_step * dy
+            else:
+                dx, dy = forward_direction(get_gx(back_x, back_y), get_gy(back_x, back_y))
+                new_x = back_x - ext_step * dx
+                new_y = back_y - ext_step * dy
+
+            if not np.isfinite(new_x) or not np.isfinite(new_y):
+                stop_reason = TerminationReason.LOW_VALUE
+            elif not self._is_in_partition(new_x, new_y, target_partition_id):
+                stop_reason = TerminationReason.BOUNDARY
+            else:
+                new_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
+                anchor_point = line[-1] if extend_front else line[0]
+                if not self._is_finite_candidate_point(new_point):
+                    stop_reason = TerminationReason.LOW_VALUE
+                elif not self._candidate_segment_has_value(anchor_point, new_point):
+                    stop_reason = TerminationReason.LOW_VALUE
+                else:
+                    stop_reason = TerminationReason.NONE
+
+            if stop_reason != TerminationReason.NONE:
+                side_name = "前端" if extend_front else "后端"
+                if stop_reason == TerminationReason.BOUNDARY:
+                    print(f"  [测线延伸-{side_name}] 延伸{ext_loop}步后超出边界")
+                else:
+                    print(
+                        f"  [测线延伸-{side_name}] 新线段未覆盖未测网格，停止该端"
+                    )
+                if extend_front:
+                    front_stopped = True
+                    front_stop_reason = stop_reason
+                else:
+                    back_stopped = True
+                    back_stop_reason = stop_reason
+                extend_front = not extend_front
+                continue
+
+            if extend_front:
+                self._update_current_partition_grid_with_segment(line[-1], new_point)
+                line.append(new_point)
+                front_x, front_y = new_x, new_y
+            else:
+                self._update_current_partition_grid_with_segment(new_point, line[0])
+                line.insert(0, new_point)
+                back_x, back_y = new_x, new_y
+
+            extend_front = not extend_front
+
+        candidate.line = np.asarray(line, dtype=float)
+        candidate.terminated_reason = self._resolve_line_termination(
+            front_stop_reason, back_stop_reason
+        )
+        print(
+            f"  [{direction_name}子测线段] 延伸完成 | 共{len(candidate.line)}点 | "
+            f"终止={candidate.terminated_reason.name.lower()}"
+        )
+        return candidate
+
+    def _generate_candidate_group(
+        self, parent_segments, direction, target_partition_id, direction_name
+    ):
+        candidates, valid_points, boundary_rejects, low_value_rejects = (
+            self._generate_initial_child_candidates(
+                parent_segments, direction, target_partition_id
+            )
+        )
+        extended_candidates = []
+        for candidate in candidates:
+            extended = self._extend_child_candidate(
+                candidate, target_partition_id, direction_name
+            )
+            if self._line_has_enough_points(extended.line):
+                extended_candidates.append(extended)
+        return extended_candidates, valid_points, boundary_rejects, low_value_rejects
+
+    def _record_retained_child_group(
+        self,
+        candidates,
+        partition_id,
+        lines_dir,
+        line_counter,
+        perp_iter,
+        prior_covered_mask,
+    ):
+        total_points = 0
+        simulated_prior = (
+            np.array(prior_covered_mask, copy=True)
+            if prior_covered_mask is not None
+            else None
+        )
+
+        for segment_index, candidate in enumerate(candidates, start=1):
+            line = np.asarray(candidate.line, dtype=float)
+            if not self._line_has_enough_points(line):
+                continue
+
+            repeated_area = 0.0
+            if self.current_partition_grid is not None and simulated_prior is not None:
+                repeated_area = self.current_partition_grid.compute_polyline_repeat_area(
+                    line, prior_covered_mask=simulated_prior
+                )
+                self.current_partition_grid.cumulative_repeated_area += repeated_area
+                simulated_prior |= self.current_partition_grid.compute_polyline_hit_mask(line)
+
+            overlap_excess_length = self._compute_overlap_excess_length(
+                candidate.initial_line, candidate.overlap_rates, threshold=0.2
+            )
+            max_overlap_eta = (
+                float(np.max(candidate.overlap_rates))
+                if len(candidate.overlap_rates) > 0
+                else 0.0
+            )
+            terminated_by = (
+                candidate.terminated_reason.name.lower()
+                if candidate.terminated_reason != TerminationReason.NONE
+                else "boundary"
+            )
+            record = self._record_line(
+                line,
+                partition_id,
+                terminated_by,
+                overlap_excess_length=overlap_excess_length,
+                max_overlap_eta=max_overlap_eta,
+                repeated_area=repeated_area,
+            )
+            if record is None:
+                continue
+
+            color = (
+                "orange"
+                if candidate.terminated_reason == TerminationReason.LOW_VALUE
+                else "purple"
+            )
+            self.visualizer.draw_line(line, color, 1.5)
+            total_points += len(line)
+            line_counter += 1
+            suffix = (
+                f"_seg{segment_index:02d}" if len(candidates) > 1 else ""
+            )
+            snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}{suffix}.png"
+            self.visualizer.save_snapshot(snap_path)
+            print(f"  >> 已保存测线: {snap_path}")
+
+        return total_points, line_counter
+
+    def _draw_parent_group_light(self, parent_segments, draw_allowed, draw_first_line, perp_iter):
+        if not draw_allowed:
+            return
+        if not (draw_first_line or perp_iter > 1):
+            return
+        for segment in parent_segments:
+            line = np.asarray(segment, dtype=float)
+            if len(line) > 1:
+                self.visualizer.draw_light_line(line)
+
     def _generate_perpendicular_lines(
         self,
         main_line,
@@ -671,8 +1070,13 @@ class SurveyPlanner:
         partition_id,
         draw_first_line=True,
     ):
-        """生成垂直扩展测线"""
-        line = copy.deepcopy(main_line)
+        """生成垂直扩展测线，按连续有效点切分子测线组。"""
+        if not self._line_has_enough_points(main_line):
+            return 0, line_counter
+
+        parent_segments = [np.asarray(main_line, dtype=float)]
+        parent_draw_allowed = True
+        consecutive_jump_groups = 0
         perp_iter = 0
         total_points = 0
 
@@ -681,193 +1085,85 @@ class SurveyPlanner:
 
         while True:
             perp_iter += 1
-            prior_covered_mask = self._snapshot_current_covered_mask()
-            t1 = []
-            t1_overlap_rates = []
-            boundary_rejects = 0
-            low_value_rejects = 0
+            transaction_snapshot = self._snapshot_current_partition_state()
+            prior_covered_mask = (
+                np.array(transaction_snapshot["covered_sample_mask"], copy=True)
+                if transaction_snapshot is not None
+                else None
+            )
 
-            # 计算下一轮测线点
-            for i in line:
-                x, y = i[0], i[1]
-                alpha = self._get_alpha(x, y)
-                h = get_height(x, y)
+            self._draw_parent_group_light(
+                parent_segments, parent_draw_allowed, draw_first_line, perp_iter
+            )
 
-                if alpha <= 0.005:
-                    d = 2 * h * np.tan(self.theta_rad / 2) * (1 - self.n)
-                    tx = d * get_gx(x, y)
-                    ty = d * get_gy(x, y)
-                    new_x = x - direction * tx
-                    new_y = y - direction * ty
-                else:
-                    A = np.sin(np.radians(90) - self.theta_rad / 2 + np.radians(alpha))
-                    B = np.sin(np.radians(90) - self.theta_rad / 2 - np.radians(alpha))
-                    C = np.sin(self.theta_rad / 2) / A - 1 / np.sin(np.radians(alpha))
-                    D = (
-                        self.n * np.sin(self.theta_rad / 2) * (1 / A + 1 / B)
-                        - np.sin(self.theta_rad / 2) / B
-                        - 1 / np.sin(np.radians(alpha))
-                    )
-                    next_h = h * C / D
-                    tx = (h - next_h) / np.tan(np.radians(alpha)) * get_gx(x, y)
-                    ty = (h - next_h) / np.tan(np.radians(alpha)) * get_gy(x, y)
-                    new_x = x - direction * tx
-                    new_y = y - direction * ty
-
-                if self._is_in_partition(new_x, new_y, target_partition_id):
-                    candidate_point = self._point_with_width(new_x, new_y)
-                    if self._candidate_point_has_value(candidate_point):
-                        t1.append(candidate_point)
-                        t1_overlap_rates.append(
-                            self._compute_parent_child_overlap_rate(i, candidate_point)
-                        )
-                    else:
-                        low_value_rejects += 1
-                else:
-                    boundary_rejects += 1
-
-            # 绘制中间过程
-            if len(line) > 5 and (draw_first_line or perp_iter > 1):
-                self.visualizer.draw_light_line(line)
+            candidates, valid_points, boundary_rejects, low_value_rejects = (
+                self._generate_candidate_group(
+                    parent_segments, direction, target_partition_id, direction_name
+                )
+            )
 
             elapsed = time.time() - t0
             print(
-                f"[{direction_name}扩展 第{perp_iter}轮] 当前{len(line)}点 -> 新增{len(t1)}有效点 | 已耗时{elapsed:.1f}s"
+                f"[{direction_name}扩展 第{perp_iter}轮] 父对象{len(parent_segments)}段 -> "
+                f"有效点{valid_points}个 / 子测线{len(candidates)}段 | 已耗时{elapsed:.1f}s"
             )
 
-            # 检查空测线
-            if len(t1) == 0:
+            if len(candidates) == 0:
+                self._restore_current_partition_state(transaction_snapshot)
                 print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮无新有效点，结束规划 | "
+                    f"[{direction_name}扩展] 第{perp_iter}轮无有效子测线，结束规划 | "
                     f"边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
                 )
                 break
 
-            overlap_excess_length = self._compute_overlap_excess_length(
-                t1, t1_overlap_rates, threshold=0.2
+            gain_ratio, new_area, coverage_area = self._compute_group_gain_ratio(
+                candidates, prior_covered_mask
             )
-            max_overlap_eta = (
-                float(np.max(t1_overlap_rates)) if len(t1_overlap_rates) > 0 else 0.0
+            if coverage_area <= 1e-12:
+                self._restore_current_partition_state(transaction_snapshot)
+                print(
+                    f"[{direction_name}扩展] 第{perp_iter}轮候选组积分覆盖面积为0，结束规划"
+                )
+                break
+
+            is_jump_group = gain_ratio < self.jump_line_gain_threshold
+            print(
+                f"[{direction_name}扩展 第{perp_iter}轮] 候选组收益率={gain_ratio:.2%} "
+                f"(新增={new_area:.2f}m² / 积分={coverage_area:.2f}m²)"
             )
 
-            line = copy.deepcopy(t1)
-            self._update_current_partition_grid_with_polyline(line)
-            terminated_reason = TerminationReason.NONE
-
-            # 主循环：两端按边界 + 细网格收益进行自延伸
-            ext_step = self.step
-            ext_loop = 0
-
-            front_x, front_y = line[-1][0], line[-1][1]
-            back_x, back_y = line[0][0], line[0][1]
-            front_stopped = False
-            back_stopped = False
-            front_stop_reason = TerminationReason.NONE
-            back_stop_reason = TerminationReason.NONE
-            extend_front = True
-
-            while True:
-                if front_stopped and back_stopped:
+            if is_jump_group:
+                consecutive_jump_groups += 1
+                self._restore_current_partition_state(transaction_snapshot)
+                if consecutive_jump_groups > self.max_consecutive_jump_lines:
+                    print(
+                        f"[{direction_name}扩展] 连续第{consecutive_jump_groups}个跳板组仍低于"
+                        f"{self.jump_line_gain_threshold:.0%}，终止该方向测线生成"
+                    )
                     break
 
-                if extend_front and front_stopped:
-                    extend_front = False
-                    continue
-                if not extend_front and back_stopped:
-                    extend_front = True
-                    continue
+                parent_segments = [candidate.line.copy() for candidate in candidates]
+                parent_draw_allowed = False
+                print(
+                    f"[{direction_name}扩展] 第{perp_iter}轮作为跳板组继续迭代 | "
+                    f"连续跳板={consecutive_jump_groups}/{self.max_consecutive_jump_lines}"
+                )
+                continue
 
-                ext_loop += 1
-
-                if extend_front:
-                    dx, dy = forward_direction(
-                        get_gx(front_x, front_y), get_gy(front_x, front_y)
-                    )
-                    new_x = front_x + ext_step * dx
-                    new_y = front_y + ext_step * dy
-                else:
-                    dx, dy = forward_direction(
-                        get_gx(back_x, back_y), get_gy(back_x, back_y)
-                    )
-                    new_x = back_x - ext_step * dx
-                    new_y = back_y - ext_step * dy
-
-                if not self._is_in_partition(new_x, new_y, target_partition_id):
-                    if extend_front:
-                        print(f"  [测线延伸-前端] 延伸{ext_loop}步后超出边界")
-                        front_stopped = True
-                        front_stop_reason = TerminationReason.BOUNDARY
-                    else:
-                        print(f"  [测线延伸-后端] 延伸{ext_loop}步后超出边界")
-                        back_stopped = True
-                        back_stop_reason = TerminationReason.BOUNDARY
-                    extend_front = not extend_front
-                    continue
-
-                new_point = self._point_with_width(new_x, new_y)
-                anchor_point = line[-1] if extend_front else line[0]
-                if not self._candidate_segment_has_value(anchor_point, new_point):
-                    if extend_front:
-                        print(f"  [测线延伸-前端] 新线段对应细网格收益不足，停止该端")
-                        front_stopped = True
-                        front_stop_reason = TerminationReason.LOW_VALUE
-                    else:
-                        print(f"  [测线延伸-后端] 新线段对应细网格收益不足，停止该端")
-                        back_stopped = True
-                        back_stop_reason = TerminationReason.LOW_VALUE
-                    extend_front = not extend_front
-                    continue
-
-                if extend_front:
-                    self._update_current_partition_grid_with_segment(
-                        line[-1], new_point
-                    )
-                    line.append(new_point)
-                    front_x, front_y = new_x, new_y
-                else:
-                    self._update_current_partition_grid_with_segment(new_point, line[0])
-                    line.insert(0, new_point)
-                    back_x, back_y = new_x, new_y
-
-                extend_front = not extend_front
-
-            line = np.array(line)
-            terminated_reason = self._resolve_line_termination(
-                front_stop_reason, back_stop_reason
-            )
-
-            # 记录指标
-            terminated_by = (
-                terminated_reason.name.lower()
-                if terminated_reason != TerminationReason.NONE
-                else "boundary"
-            )
-            repeated_area = self._accumulate_current_partition_repeated_area(
-                line, prior_covered_mask
-            )
-            self._record_line(
-                line,
+            consecutive_jump_groups = 0
+            added_points, line_counter = self._record_retained_child_group(
+                candidates,
                 partition_id,
-                terminated_by,
-                overlap_excess_length=overlap_excess_length,
-                max_overlap_eta=max_overlap_eta,
-                repeated_area=repeated_area,
+                lines_dir,
+                line_counter,
+                perp_iter,
+                prior_covered_mask,
             )
+            total_points += added_points
+            parent_segments = [candidate.line.copy() for candidate in candidates]
+            parent_draw_allowed = True
 
-            total_points += len(line)
-
-            # 绘制和保存
-            if terminated_reason == TerminationReason.LOW_VALUE:
-                self.visualizer.draw_line(line, "orange", 1.5)
-            else:
-                self.visualizer.draw_line(line, "purple", 1.5)
-
-            line_counter += 1
-            snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}.png"
-            self.visualizer.save_snapshot(snap_path)
-            print(f"  >> 已保存测线: {snap_path}")
-
-        print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | {total_points}点")
+        print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | 保留{total_points}点")
         return total_points, line_counter
 
     # ------------------------------------------------------------------
@@ -961,7 +1257,7 @@ class SurveyPlanner:
             line, main_terminated, overlap_excess_length, max_overlap_eta, repeated_area = self._extend_line_bidirectional(
                 start_x, start_y, partition_id, self.step
             )
-            self._record_line(
+            main_record = self._record_line(
                 line,
                 partition_id,
                 main_terminated,
@@ -969,24 +1265,30 @@ class SurveyPlanner:
                 max_overlap_eta=max_overlap_eta,
                 repeated_area=repeated_area,
             )
-            line_counter += 1
-            self.visualizer.draw_line(line, "b", 1.5, "Main line")
+            if main_record is None:
+                print(f"[分区{partition_id}] 主测线不足2点，丢弃并结束该分区规划")
+                total_points1 = 0
+                total_points2 = 0
+                total_points = 0
+            else:
+                line_counter += 1
+                self.visualizer.draw_line(line, "b", 1.5, "Main line")
 
-            snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
-            self.visualizer.save_snapshot(snap_path)
-            print(f"  >> 已保存测线: {snap_path}")
+                snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
+                self.visualizer.save_snapshot(snap_path)
+                print(f"  >> 已保存测线: {snap_path}")
 
-            # 正向扩展
-            total_points1, line_counter = self._generate_perpendicular_lines(
-                line, 1, partition_id, lines_dir, t0, line_counter, partition_id, False
-            )
+                # 正向扩展
+                total_points1, line_counter = self._generate_perpendicular_lines(
+                    line, 1, partition_id, lines_dir, t0, line_counter, partition_id, False
+                )
 
-            # 反向扩展
-            total_points2, line_counter = self._generate_perpendicular_lines(
-                line, -1, partition_id, lines_dir, t0, line_counter, partition_id, False
-            )
+                # 反向扩展
+                total_points2, line_counter = self._generate_perpendicular_lines(
+                    line, -1, partition_id, lines_dir, t0, line_counter, partition_id, False
+                )
 
-            total_points = len(line) + total_points1 + total_points2
+                total_points = len(line) + total_points1 + total_points2
 
             # 保存最终图
             overlay_legend = self.visualizer.draw_fine_grid_overlay(
