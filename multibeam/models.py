@@ -38,6 +38,21 @@ class LineRecord:
 
 
 @dataclass
+class LinePartitionContribution:
+    """保留测线对目标分区的统计贡献。"""
+
+    line_id: int
+    owner_partition_id: int
+    target_partition_id: int
+    hit_area: float
+    new_area: float
+    repeated_area: float
+    hit_samples: int
+    new_samples: int
+    repeated_samples: int
+
+
+@dataclass
 class PartitionResult:
     """单个分区的规划结果"""
 

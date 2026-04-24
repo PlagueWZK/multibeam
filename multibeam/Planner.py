@@ -15,10 +15,16 @@ import numpy as np
 
 # 从拆分后的模块导入
 from multibeam.coverage_state_grid import (
+    GlobalCoverageMetricsGrid,
     PartitionCoverageStateGrid,
     infer_uniform_cell_size,
 )
-from multibeam.models import LineRecord, PartitionResult, TerminationReason
+from multibeam.models import (
+    LinePartitionContribution,
+    LineRecord,
+    PartitionResult,
+    TerminationReason,
+)
 from multibeam.Partition import get_partition_for_point, is_point_in_partition
 from multibeam.planner_visualizer import SurveyVisualizer, save_dot_csv
 from tool.Data import (
@@ -57,6 +63,7 @@ class SurveyPlanner:
         cell_effective_area=None,
         grid_cell_size=None,
         depth_matrix=None,
+        start_point_strategy="deepest",
     ):
         self.xs = xs
         self.ys = ys
@@ -79,6 +86,13 @@ class SurveyPlanner:
         self.partition_state_grids = {}
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
+        self.start_point_strategy = str(start_point_strategy).strip().lower()
+        self.supported_start_point_strategies = {"deepest", "coordinate_center"}
+        if self.start_point_strategy not in self.supported_start_point_strategies:
+            raise ValueError(
+                "不支持的起点选择策略："
+                f"{start_point_strategy}，可选={sorted(self.supported_start_point_strategies)}"
+            )
 
         # 支持传入真实海域边界
         self.x_min = float(x_min) if x_min is not None else float(xs[0])
@@ -111,6 +125,28 @@ class SurveyPlanner:
                 "depth_matrix 尺寸必须与 cluster_matrix 一致："
                 f"depth={self.depth_matrix.shape}, cluster={self.cluster_matrix.shape}"
             )
+
+        # 全局统计网格只用于记录已保留测线对所有分区的贡献，不能参与测线取舍。
+        self.metrics_state_grid = GlobalCoverageMetricsGrid(
+            self.xs,
+            self.ys,
+            self.cluster_matrix,
+            theta=self.theta,
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
+            boundary_mask=self.boundary_mask,
+            cell_effective_area=self.cell_effective_area,
+            cell_size=self.grid_cell_size,
+            sampling_points=self.fine_grid_sampling_points,
+            full_threshold=self.fine_grid_full_threshold,
+            step_scale=self.step_scale,
+            microstep_min=self.microstep_min,
+            microstep_max=self.microstep_max,
+            legacy_microstep=self.legacy_microstep,
+        )
+        self.line_partition_contributions: list[LinePartitionContribution] = []
 
         # 即时指标存储
         self.all_records: list[LineRecord] = []
@@ -211,8 +247,7 @@ class SurveyPlanner:
             return np.inf
         return delta_r
 
-    def _select_partition_start_point(self, partition_id, rows, cols):
-        """选择满足 clearance 约束的最深网格中心作为起始点。"""
+    def _get_valid_partition_cells(self, partition_id, rows, cols):
         if len(rows) == 0:
             raise ValueError(f"分区 {partition_id} 无有效网格点可用于选择起点")
 
@@ -222,6 +257,13 @@ class SurveyPlanner:
         if len(valid_rows) == 0:
             valid_rows = rows
             valid_cols = cols
+        return valid_rows, valid_cols
+
+    def _select_deepest_partition_start_point(self, partition_id, rows, cols):
+        """选择满足 clearance 约束的最深网格中心作为起始点。"""
+        valid_rows, valid_cols = self._get_valid_partition_cells(
+            partition_id, rows, cols
+        )
 
         depths = self._get_depth_at_cells(valid_rows, valid_cols)
         candidate_order = np.argsort(depths)[::-1]
@@ -263,6 +305,7 @@ class SurveyPlanner:
                     "boundary_depth": float(boundary_info["depth"]),
                     "delta_r": float(delta_r),
                     "rule": "deepest_cell_with_gradient_clearance",
+                    "strategy": "deepest",
                 }
 
         fallback_x = float(self.xs[fallback_col])
@@ -278,7 +321,47 @@ class SurveyPlanner:
             "boundary_depth": None,
             "delta_r": None,
             "rule": "fallback_deepest_cell",
+            "strategy": "deepest",
         }
+
+    def _select_coordinate_center_partition_start_point(self, partition_id, rows, cols):
+        """选择最接近分区有效网格坐标中心的网格中心作为起始点。"""
+        valid_rows, valid_cols = self._get_valid_partition_cells(
+            partition_id, rows, cols
+        )
+        center_x = float(np.mean(self.xs[valid_cols]))
+        center_y = float(np.mean(self.ys[valid_rows]))
+
+        dx = self.xs[valid_cols] - center_x
+        dy = self.ys[valid_rows] - center_y
+        nearest_idx = int(np.argmin(dx * dx + dy * dy))
+        start_row = int(valid_rows[nearest_idx])
+        start_col = int(valid_cols[nearest_idx])
+        start_x = float(self.xs[start_col])
+        start_y = float(self.ys[start_row])
+        start_depth = float(self._get_depth_at_cells([start_row], [start_col])[0])
+        return {
+            "x": start_x,
+            "y": start_y,
+            "depth": start_depth,
+            "row": start_row,
+            "col": start_col,
+            "alpha_deg": float(self._get_alpha(start_x, start_y)),
+            "boundary_distance": None,
+            "boundary_depth": None,
+            "delta_r": None,
+            "rule": "coordinate_center_nearest_cell",
+            "strategy": "coordinate_center",
+            "target_center_x": center_x,
+            "target_center_y": center_y,
+        }
+
+    def _select_partition_start_point(self, partition_id, rows, cols):
+        if self.start_point_strategy == "coordinate_center":
+            return self._select_coordinate_center_partition_start_point(
+                partition_id, rows, cols
+            )
+        return self._select_deepest_partition_start_point(partition_id, rows, cols)
 
     def _candidate_point_has_value(self, point) -> bool:
         """细网格状态驱动的点保留判断。"""
@@ -332,6 +415,16 @@ class SurveyPlanner:
             terminated_by=terminated_by,
         )
         self.all_records.append(record)
+
+        if self.metrics_state_grid is not None:
+            self.line_partition_contributions.extend(
+                self.metrics_state_grid.record_polyline_contribution(
+                    pts,
+                    line_id=record.line_id,
+                    owner_partition_id=partition_id,
+                )
+            )
+
         self._line_counter += 1
         return record
 
@@ -804,6 +897,12 @@ class SurveyPlanner:
                 f"最深可行网格中心 | depth={start_depth:.2f}m | "
                 f"distance={start_info['boundary_distance']:.2f}m | Δr={start_info['delta_r']:.2f}m"
             )
+        elif start_info["rule"] == "coordinate_center_nearest_cell":
+            print(
+                f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
+                f"坐标中心最近网格中心 | depth={start_depth:.2f}m | "
+                f"target=({start_info['target_center_x']:.1f}, {start_info['target_center_y']:.1f})"
+            )
         else:
             print(
                 f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
@@ -1009,7 +1108,10 @@ class SurveyPlanner:
         flat_all_lines = [line for r in all_results for line in r.lines]
         save_dot_csv(flat_all_lines, lines_dir)
         self.visualizer.draw_merged_lines(
-            all_results, lines_dir, self.partition_state_grids, self.partition_start_points
+            all_results,
+            lines_dir,
+            self.metrics_state_grid,
+            self.partition_start_points,
         )
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
@@ -1032,6 +1134,9 @@ class SurveyPlanner:
             metrics_dir = Path(output_dir) / "metrics" / current_time
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
+        if self.metrics_state_grid is not None:
+            self.partition_coverage_summaries = self.metrics_state_grid.summarize_all()
+
         partition_rows = []
         global_total_length = 0.0
         global_old_proxy_coverage = 0.0
@@ -1042,10 +1147,13 @@ class SurveyPlanner:
         global_new_covered_area = 0.0
         global_repeated_area = 0.0
 
-        partition_ids = sorted(
+        partition_id_set = (
             set(r.partition_id for r in self.all_records)
             | set(self.partition_coverage_summaries.keys())
         )
+        if self.metrics_state_grid is not None:
+            partition_id_set |= set(self.metrics_state_grid.partition_ids)
+        partition_ids = sorted(partition_id_set)
 
         for pid in partition_ids:
             recs = [r for r in self.all_records if r.partition_id == pid]
@@ -1173,6 +1281,14 @@ class SurveyPlanner:
             {"指标": "累积重复率-新口径", "值": f"{repeated_rate:.4%}"},
             {"指标": "细网格覆盖率-新口径", "值": f"{new_coverage_rate:.4%}"},
             {"指标": "细网格漏测率-新口径", "值": f"{new_miss_rate:.4%}"},
+            {
+                "指标": "新口径统计说明",
+                "值": "全局统计网格记录所有已保留测线对所有分区的贡献；测线取舍仍只使用当前分区规划网格。",
+            },
+            {
+                "指标": "跨分区贡献记录数",
+                "值": len(self.line_partition_contributions),
+            },
         ]
 
         for pid in partition_ids:
@@ -1195,12 +1311,48 @@ class SurveyPlanner:
                     }
                 )
 
+        contribution_rows = []
+        for contribution in self.line_partition_contributions:
+            contribution_rows.append(
+                {
+                    "line_id": int(contribution.line_id),
+                    "测线所属分区ID": int(contribution.owner_partition_id),
+                    "贡献目标分区ID": int(contribution.target_partition_id),
+                    "是否跨分区贡献": bool(
+                        contribution.owner_partition_id
+                        != contribution.target_partition_id
+                    ),
+                    "扫中面积(m²)": round(contribution.hit_area, 2),
+                    "新增覆盖面积(m²)": round(contribution.new_area, 2),
+                    "重复测量面积(m²)": round(contribution.repeated_area, 2),
+                    "扫中样本数": int(contribution.hit_samples),
+                    "新增覆盖样本数": int(contribution.new_samples),
+                    "重复测量样本数": int(contribution.repeated_samples),
+                }
+            )
+
         df_global = pd.DataFrame(global_rows)
+        df_contribution = pd.DataFrame(
+            contribution_rows,
+            columns=[
+                "line_id",
+                "测线所属分区ID",
+                "贡献目标分区ID",
+                "是否跨分区贡献",
+                "扫中面积(m²)",
+                "新增覆盖面积(m²)",
+                "重复测量面积(m²)",
+                "扫中样本数",
+                "新增覆盖样本数",
+                "重复测量样本数",
+            ],
+        )
 
         metrics_path = metrics_dir / "metrics.xlsx"
         with pd.ExcelWriter(metrics_path, engine="openpyxl") as writer:
             df_partition.to_excel(writer, sheet_name="分区统计", index=False)
             df_global.to_excel(writer, sheet_name="全局统计", index=False)
+            df_contribution.to_excel(writer, sheet_name="跨分区贡献", index=False)
 
         print(f"\n[指标统计完成] 已保存到: {metrics_path}")
         return metrics_path
