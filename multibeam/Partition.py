@@ -285,6 +285,105 @@ def _renumber_cluster_matrix(cluster_matrix):
     return renumbered, next_id
 
 
+def _connected_component_offsets(connectivity):
+    if connectivity == 4:
+        return ((-1, 0), (1, 0), (0, -1), (0, 1))
+    if connectivity == 8:
+        return (
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        )
+    raise ValueError(
+        f"不支持的连通性定义 connectivity={connectivity}，仅支持 4 或 8。"
+    )
+
+
+def _iter_connected_components(mask, connectivity=4):
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"连通组件掩码必须是二维矩阵，当前 ndim={mask.ndim}")
+
+    rows, cols = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    offsets = _connected_component_offsets(connectivity)
+
+    for start_row, start_col in np.argwhere(mask):
+        start_row = int(start_row)
+        start_col = int(start_col)
+        if visited[start_row, start_col]:
+            continue
+
+        stack = [(start_row, start_col)]
+        visited[start_row, start_col] = True
+        component_rows = []
+        component_cols = []
+
+        while stack:
+            row, col = stack.pop()
+            component_rows.append(row)
+            component_cols.append(col)
+
+            for d_row, d_col in offsets:
+                next_row = row + d_row
+                next_col = col + d_col
+                if next_row < 0 or next_row >= rows or next_col < 0 or next_col >= cols:
+                    continue
+                if visited[next_row, next_col] or not mask[next_row, next_col]:
+                    continue
+                visited[next_row, next_col] = True
+                stack.append((next_row, next_col))
+
+        yield np.array(component_rows, dtype=int), np.array(component_cols, dtype=int)
+
+
+def _split_disconnected_partitions(cluster_matrix, connectivity=4):
+    """将同一分区 ID 下的非连通区域拆为不同分区。"""
+    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
+    split_matrix = np.full_like(cluster_matrix, -1, dtype=int)
+    diagnostics = []
+    next_global_id = 0
+
+    partition_ids = [
+        int(pid) for pid in sorted(np.unique(cluster_matrix).astype(int)) if pid >= 0
+    ]
+    for partition_id in partition_ids:
+        partition_mask = cluster_matrix == partition_id
+        components = []
+
+        for component_rows, component_cols in _iter_connected_components(
+            partition_mask, connectivity=connectivity
+        ):
+            target_partition_id = next_global_id
+            split_matrix[component_rows, component_cols] = target_partition_id
+            components.append(
+                {
+                    "target_partition_id": int(target_partition_id),
+                    "cell_count": int(len(component_rows)),
+                }
+            )
+            next_global_id += 1
+
+        diagnostics.append(
+            {
+                "source_partition_id": int(partition_id),
+                "component_count": int(len(components)),
+                "split": bool(len(components) > 1),
+                "target_partition_ids": [
+                    item["target_partition_id"] for item in components
+                ],
+                "component_cell_counts": [item["cell_count"] for item in components],
+            }
+        )
+
+    return split_matrix, next_global_id, diagnostics
+
+
 def _summarize_partition_gradient_complexity(
     partition_id,
     partition_mask,
@@ -373,6 +472,39 @@ def _write_secondary_partition_diagnostics(
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _write_connectivity_partition_diagnostics(
+    output_dir,
+    pre_connectivity_u,
+    final_u,
+    connectivity,
+    diagnostics,
+):
+    if output_dir is None:
+        return
+
+    partition_dir = Path(output_dir) / "partition"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = partition_dir / "connectivity_partition_diagnostics.json"
+    split_partition_count = int(
+        sum(1 for diagnostic in diagnostics if diagnostic["split"])
+    )
+    payload = {
+        "connectivity": int(connectivity),
+        "connectivity_definition": (
+            "edge-connected grid cells"
+            if connectivity == 4
+            else "edge-or-corner connected grid cells"
+        ),
+        "pre_connectivity_u": int(pre_connectivity_u),
+        "final_u": int(final_u),
+        "split_partition_count": split_partition_count,
+        "added_partition_count": int(final_u - pre_connectivity_u),
+        "partitions": diagnostics,
+    }
+    with diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def partition_coverage_matrix(
     xs,
     ys,
@@ -387,6 +519,7 @@ def partition_coverage_matrix(
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
     direction_dispersion_threshold=0.30,
+    connectivity=4,
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
@@ -398,6 +531,7 @@ def partition_coverage_matrix(
         k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
         boundary_mask: 有效海域掩码。若提供，则仅对有效格聚类，其余位置标记为 -1
+        connectivity: 分区后处理的连通性定义。默认 4 表示边连通；8 表示边或角连通
     """
     feature_bundle = _build_feature_stacks(
         xs,
@@ -512,14 +646,22 @@ def partition_coverage_matrix(
 
         diagnostics.append(diagnostic)
 
-    final_cluster_matrix, final_u = _renumber_cluster_matrix(merged_cluster_matrix)
+    post_secondary_cluster_matrix, post_secondary_u = _renumber_cluster_matrix(
+        merged_cluster_matrix
+    )
+    final_cluster_matrix, final_u, connectivity_diagnostics = (
+        _split_disconnected_partitions(
+            post_secondary_cluster_matrix,
+            connectivity=connectivity,
+        )
+    )
     _save_partition_plot(
         final_cluster_matrix,
         xs,
         ys,
         output_dir,
         f"partition_final_U={final_u}.png",
-        f"Two-Stage Partitioning (U={final_u})",
+        f"Connected Final Partitioning (U={final_u})",
     )
     _save_partition_plot(
         final_cluster_matrix,
@@ -527,21 +669,34 @@ def partition_coverage_matrix(
         ys,
         output_dir,
         f"partition_U={final_u}.png",
-        f"Two-Stage Partitioning (U={final_u})",
+        f"Connected Final Partitioning (U={final_u})",
     )
     _write_secondary_partition_diagnostics(
         output_dir,
         first_stage_u,
-        final_u,
+        post_secondary_u,
         primary_feature_names,
         diagnostics,
         direction_dispersion_threshold,
         min_partition_size_for_secondary,
         secondary_k_max,
     )
+    _write_connectivity_partition_diagnostics(
+        output_dir,
+        post_secondary_u,
+        final_u,
+        connectivity,
+        connectivity_diagnostics,
+    )
 
+    split_partition_count = sum(
+        1 for diagnostic in connectivity_diagnostics if diagnostic["split"]
+    )
     print(
-        f"[分区] 一级分区数={first_stage_u} | 二次分区合并后总分区数={final_u}"
+        f"[分区] 一级分区数={first_stage_u} | "
+        f"二次分区合并后总分区数={post_secondary_u} | "
+        f"连通性拆分后总分区数={final_u} | "
+        f"发生拆分的分区数={split_partition_count}"
     )
     return final_cluster_matrix, final_u
 
