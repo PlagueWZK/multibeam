@@ -53,6 +53,7 @@ if __name__ == "__main__":
         boundary_mask=coarse_boundary_mask,
         gx_matrix=gx_matrix,
         gy_matrix=gy_matrix,
+        cell_effective_area=coarse_cell_effective_area,
     )
 
     print(f"U= {U}")
