@@ -7,6 +7,7 @@
 
 import copy
 import datetime
+import json
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +39,19 @@ from tool.Data import (
 # ---------------------------------------------------------------------------
 
 
+START_POINT_STRATEGY_DESCRIPTIONS = {
+    "deepest_depth_cell": "深度极点(最深点)网格中心",
+    "median_depth_cell": "深度中位数网格中心(偶数取偏深一侧)",
+    "geometric_center_cell": "分区几何中心对应网格中心",
+}
+
+START_POINT_STRATEGY_RULES = {
+    "deepest_depth_cell": "deepest_depth_cell_in_partition",
+    "median_depth_cell": "upper_median_depth_cell_in_partition",
+    "geometric_center_cell": "nearest_grid_cell_to_partition_geometric_center",
+}
+
+
 class SurveyPlanner:
     """测线规划器：封装分区测线生成与即时指标记录"""
 
@@ -57,6 +71,7 @@ class SurveyPlanner:
         cell_effective_area=None,
         grid_cell_size=None,
         depth_matrix=None,
+        partition_start_point_strategy="median_depth_cell",
     ):
         self.xs = xs
         self.ys = ys
@@ -79,6 +94,12 @@ class SurveyPlanner:
         self.partition_state_grids = {}
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
+        if partition_start_point_strategy not in START_POINT_STRATEGY_DESCRIPTIONS:
+            raise ValueError(
+                "不支持的分区起始点策略："
+                f"{partition_start_point_strategy}，可选={tuple(START_POINT_STRATEGY_DESCRIPTIONS)}"
+            )
+        self.partition_start_point_strategy = partition_start_point_strategy
 
         # 支持传入真实海域边界
         self.x_min = float(x_min) if x_min is not None else float(xs[0])
@@ -158,34 +179,149 @@ class SurveyPlanner:
             dtype=float,
         )
 
-    def _select_partition_start_point(self, partition_id, rows, cols):
-        """选择当前分区中的深度中值网格中心作为起始点。"""
-        if len(rows) == 0:
-            raise ValueError(f"分区 {partition_id} 无有效网格点可用于选择起点")
-
+    def _get_valid_partition_cells(self, rows, cols):
         valid_mask = self.boundary_mask[rows, cols]
         valid_rows = rows[valid_mask]
         valid_cols = cols[valid_mask]
         if len(valid_rows) == 0:
             valid_rows = rows
             valid_cols = cols
+        return valid_rows, valid_cols
+
+    def _compute_partition_centroid(self, valid_rows, valid_cols):
+        centroid_x = float(np.mean(self.xs[valid_cols]))
+        centroid_y = float(np.mean(self.ys[valid_rows]))
+        return centroid_x, centroid_y
+
+    @staticmethod
+    def _pick_tie_broken_index(candidate_indices, valid_rows, valid_cols, distances_sq=None):
+        candidate_indices = np.asarray(candidate_indices, dtype=int)
+        if candidate_indices.size == 0:
+            raise ValueError("candidate_indices 不能为空")
+
+        rows_subset = np.asarray(valid_rows[candidate_indices], dtype=int)
+        cols_subset = np.asarray(valid_cols[candidate_indices], dtype=int)
+        if distances_sq is None:
+            distances_subset = np.zeros(candidate_indices.size, dtype=float)
+        else:
+            distances_subset = np.asarray(distances_sq[candidate_indices], dtype=float)
+
+        winner_order = np.lexsort((cols_subset, rows_subset, distances_subset))
+        return int(candidate_indices[int(winner_order[0])])
+
+    def _build_start_point_info(
+        self,
+        *,
+        row,
+        col,
+        depth,
+        strategy,
+        centroid_x=None,
+        centroid_y=None,
+    ):
+        payload = {
+            "x": float(self.xs[int(col)]),
+            "y": float(self.ys[int(row)]),
+            "depth": float(depth),
+            "row": int(row),
+            "col": int(col),
+            "strategy": strategy,
+            "rule": START_POINT_STRATEGY_RULES[strategy],
+            "description": START_POINT_STRATEGY_DESCRIPTIONS[strategy],
+        }
+        if centroid_x is not None:
+            payload["partition_centroid_x"] = float(centroid_x)
+        if centroid_y is not None:
+            payload["partition_centroid_y"] = float(centroid_y)
+        return payload
+
+    def _select_partition_start_point(self, partition_id, rows, cols):
+        """根据配置选择当前分区起始点。"""
+        if len(rows) == 0:
+            raise ValueError(f"分区 {partition_id} 无有效网格点可用于选择起点")
+
+        valid_rows, valid_cols = self._get_valid_partition_cells(rows, cols)
 
         depths = self._get_depth_at_cells(valid_rows, valid_cols)
-        depth_order = np.argsort(depths)
-        median_rank = len(depth_order) // 2
-        median_idx = int(depth_order[median_rank])
-        median_row = int(valid_rows[median_idx])
-        median_col = int(valid_cols[median_idx])
-        median_x = float(self.xs[median_col])
-        median_y = float(self.ys[median_row])
-        return {
-            "x": median_x,
-            "y": median_y,
-            "depth": float(depths[median_idx]),
-            "row": median_row,
-            "col": median_col,
-            "rule": "upper_median_depth_cell_in_partition",
+        if self.partition_start_point_strategy == "median_depth_cell":
+            depth_order = np.lexsort((valid_cols, valid_rows, depths))
+            median_rank = len(depth_order) // 2
+            median_idx = int(depth_order[median_rank])
+            return self._build_start_point_info(
+                row=int(valid_rows[median_idx]),
+                col=int(valid_cols[median_idx]),
+                depth=float(depths[median_idx]),
+                strategy="median_depth_cell",
+            )
+
+        centroid_x, centroid_y = self._compute_partition_centroid(valid_rows, valid_cols)
+        cell_x = np.asarray(self.xs[valid_cols], dtype=float)
+        cell_y = np.asarray(self.ys[valid_rows], dtype=float)
+        distances_sq = (cell_x - centroid_x) ** 2 + (cell_y - centroid_y) ** 2
+
+        if self.partition_start_point_strategy == "deepest_depth_cell":
+            deepest_depth = float(np.max(depths))
+            candidate_indices = np.flatnonzero(np.isclose(depths, deepest_depth))
+            selected_idx = self._pick_tie_broken_index(
+                candidate_indices,
+                valid_rows,
+                valid_cols,
+                distances_sq=distances_sq,
+            )
+            return self._build_start_point_info(
+                row=int(valid_rows[selected_idx]),
+                col=int(valid_cols[selected_idx]),
+                depth=float(depths[selected_idx]),
+                strategy="deepest_depth_cell",
+                centroid_x=centroid_x,
+                centroid_y=centroid_y,
+            )
+
+        if self.partition_start_point_strategy == "geometric_center_cell":
+            nearest_distance = float(np.min(distances_sq))
+            candidate_indices = np.flatnonzero(
+                np.isclose(distances_sq, nearest_distance)
+            )
+            selected_idx = self._pick_tie_broken_index(
+                candidate_indices,
+                valid_rows,
+                valid_cols,
+                distances_sq=distances_sq,
+            )
+            return self._build_start_point_info(
+                row=int(valid_rows[selected_idx]),
+                col=int(valid_cols[selected_idx]),
+                depth=float(depths[selected_idx]),
+                strategy="geometric_center_cell",
+                centroid_x=centroid_x,
+                centroid_y=centroid_y,
+            )
+
+        raise ValueError(
+            "不支持的分区起始点策略："
+            f"{self.partition_start_point_strategy}，可选={tuple(START_POINT_STRATEGY_DESCRIPTIONS)}"
+        )
+
+    def _save_start_points_json(self, metrics_dir: Path):
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        start_points_path = metrics_dir / "start_points.json"
+        payload = {
+            str(int(partition_id)): {
+                key: (
+                    int(value)
+                    if isinstance(value, (int, np.integer))
+                    else float(value)
+                    if isinstance(value, (float, np.floating))
+                    else value
+                )
+                for key, value in start_info.items()
+            }
+            for partition_id, start_info in sorted(self.partition_start_points.items())
         }
+        with start_points_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[起始点] 已保存到: {start_points_path}")
+        return start_points_path
 
     def _candidate_point_has_value(self, point) -> bool:
         """细网格状态驱动的点保留判断。"""
@@ -707,7 +843,7 @@ class SurveyPlanner:
         print(f"\n{'=' * 60}")
         print(
             f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
-            f"当前分区深度中值网格中心(偶数取偏深一侧) | depth={start_depth:.2f}m"
+            f"{start_info['description']} | depth={start_depth:.2f}m"
         )
 
         state_grid = PartitionCoverageStateGrid(
@@ -869,6 +1005,7 @@ class SurveyPlanner:
 
         save_dot_csv(result.lines, lines_dir)
         self.save_metrics_excel(metrics_dir=metrics_dir)
+        self._save_start_points_json(metrics_dir)
 
         print(f"[测线规划完成] 输出目录: {run_dir}")
         return result
@@ -912,6 +1049,7 @@ class SurveyPlanner:
             all_results, lines_dir, self.partition_state_grids, self.partition_start_points
         )
         self.save_metrics_excel(metrics_dir=metrics_dir)
+        self._save_start_points_json(metrics_dir)
 
         total_lines = sum(len(r.records) for r in all_results)
         print(f"[全局规划完成] 共 {len(partition_ids)} 个分区 | {total_lines} 条测线")
