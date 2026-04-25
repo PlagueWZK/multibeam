@@ -51,6 +51,9 @@ class _ChildLineCandidate:
     initial_line: np.ndarray
     overlap_rates: np.ndarray
     terminated_reason: TerminationReason = TerminationReason.NONE
+    gain_ratio: float = 0.0
+    new_area: float = 0.0
+    hit_area: float = 0.0
 
 
 class SurveyPlanner:
@@ -730,15 +733,33 @@ class SurveyPlanner:
                 hit_mask |= self.current_partition_grid.compute_polyline_hit_mask(line)
         return hit_mask
 
+    def _compute_line_gain_ratio(self, line, prior_covered_mask):
+        if self.current_partition_grid is None or not self._line_has_enough_points(line):
+            return 0.0, 0.0, 0.0
+
+        line_hit_mask = self.current_partition_grid.compute_polyline_hit_mask(line)
+        hit_area = self._area_from_current_partition_sample_mask(line_hit_mask)
+        if hit_area <= 1e-12:
+            return 0.0, 0.0, hit_area
+
+        prior_mask = (
+            np.asarray(prior_covered_mask, dtype=bool)
+            if prior_covered_mask is not None
+            else self.current_partition_grid.covered_sample_mask
+        )
+        new_mask = line_hit_mask & (~prior_mask)
+        new_area = self._area_from_current_partition_sample_mask(new_mask)
+        return new_area / hit_area, new_area, hit_area
+
     def _compute_group_gain_ratio(self, candidates, prior_covered_mask):
         lines = [candidate.line for candidate in candidates]
-        total_coverage_area = sum(figure_width(line) for line in lines)
-        if total_coverage_area <= 1e-12:
-            return 0.0, 0.0, total_coverage_area
-
         group_hit_mask = self._compute_group_hit_mask(lines)
         if group_hit_mask is None:
-            return 1.0, total_coverage_area, total_coverage_area
+            return 0.0, 0.0, 0.0
+
+        hit_area = self._area_from_current_partition_sample_mask(group_hit_mask)
+        if hit_area <= 1e-12:
+            return 0.0, 0.0, hit_area
 
         prior_mask = (
             np.asarray(prior_covered_mask, dtype=bool)
@@ -747,7 +768,23 @@ class SurveyPlanner:
         )
         new_mask = group_hit_mask & (~prior_mask)
         new_area = self._area_from_current_partition_sample_mask(new_mask)
-        return new_area / total_coverage_area, new_area, total_coverage_area
+        return new_area / hit_area, new_area, hit_area
+
+    def _filter_child_candidates_by_segment_gain(self, candidates, prior_covered_mask):
+        retained = []
+        filtered = []
+        for candidate in candidates:
+            gain_ratio, new_area, hit_area = self._compute_line_gain_ratio(
+                candidate.line, prior_covered_mask
+            )
+            candidate.gain_ratio = float(gain_ratio)
+            candidate.new_area = float(new_area)
+            candidate.hit_area = float(hit_area)
+            if hit_area > 1e-12 and gain_ratio >= self.jump_line_gain_threshold:
+                retained.append(candidate)
+            else:
+                filtered.append(candidate)
+        return retained, filtered
 
     @staticmethod
     def _is_finite_candidate_point(point) -> bool:
@@ -962,6 +999,117 @@ class SurveyPlanner:
         )
         return candidate
 
+    def _extend_child_group_external_ends(
+        self, candidates: list[_ChildLineCandidate], target_partition_id, direction_name
+    ) -> list[_ChildLineCandidate]:
+        """仅延伸测线组作为逻辑整体时的两个外端。"""
+        candidates = [c for c in candidates if self._line_has_enough_points(c.line)]
+        if not candidates:
+            return []
+
+        line_lists = [
+            [np.asarray(point, dtype=float) for point in candidate.line]
+            for candidate in candidates
+        ]
+        front_idx = len(line_lists) - 1
+        back_idx = 0
+        front_x, front_y = float(line_lists[front_idx][-1][0]), float(
+            line_lists[front_idx][-1][1]
+        )
+        back_x, back_y = float(line_lists[back_idx][0][0]), float(
+            line_lists[back_idx][0][1]
+        )
+
+        ext_step = self.step
+        ext_loop = 0
+        front_stopped = False
+        back_stopped = False
+        front_stop_reason = TerminationReason.NONE
+        back_stop_reason = TerminationReason.NONE
+        extend_front = True
+
+        while True:
+            if front_stopped and back_stopped:
+                break
+            if extend_front and front_stopped:
+                extend_front = False
+                continue
+            if not extend_front and back_stopped:
+                extend_front = True
+                continue
+
+            ext_loop += 1
+            if extend_front:
+                dx, dy = forward_direction(
+                    get_gx(front_x, front_y), get_gy(front_x, front_y)
+                )
+                new_x = front_x + ext_step * dx
+                new_y = front_y + ext_step * dy
+                anchor_point = line_lists[front_idx][-1]
+            else:
+                dx, dy = forward_direction(get_gx(back_x, back_y), get_gy(back_x, back_y))
+                new_x = back_x - ext_step * dx
+                new_y = back_y - ext_step * dy
+                anchor_point = line_lists[back_idx][0]
+
+            if not np.isfinite(new_x) or not np.isfinite(new_y):
+                stop_reason = TerminationReason.LOW_VALUE
+            elif not self._is_in_partition(new_x, new_y, target_partition_id):
+                stop_reason = TerminationReason.BOUNDARY
+            else:
+                new_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
+                if not self._is_finite_candidate_point(new_point):
+                    stop_reason = TerminationReason.LOW_VALUE
+                elif not self._candidate_segment_has_value(anchor_point, new_point):
+                    stop_reason = TerminationReason.LOW_VALUE
+                else:
+                    stop_reason = TerminationReason.NONE
+
+            if stop_reason != TerminationReason.NONE:
+                side_name = "前端" if extend_front else "后端"
+                if stop_reason == TerminationReason.BOUNDARY:
+                    print(f"  [测线组外端延伸-{side_name}] 延伸{ext_loop}步后超出边界")
+                else:
+                    print(
+                        f"  [测线组外端延伸-{side_name}] 新线段未覆盖未测网格，停止该端"
+                    )
+                if extend_front:
+                    front_stopped = True
+                    front_stop_reason = stop_reason
+                else:
+                    back_stopped = True
+                    back_stop_reason = stop_reason
+                extend_front = not extend_front
+                continue
+
+            if extend_front:
+                self._update_current_partition_grid_with_segment(anchor_point, new_point)
+                line_lists[front_idx].append(new_point)
+                front_x, front_y = new_x, new_y
+            else:
+                self._update_current_partition_grid_with_segment(new_point, anchor_point)
+                line_lists[back_idx].insert(0, new_point)
+                back_x, back_y = new_x, new_y
+
+            extend_front = not extend_front
+
+        if len(candidates) == 1:
+            candidates[0].terminated_reason = self._resolve_line_termination(
+                front_stop_reason, back_stop_reason
+            )
+        else:
+            candidates[front_idx].terminated_reason = front_stop_reason
+            candidates[back_idx].terminated_reason = back_stop_reason
+
+        for candidate, line in zip(candidates, line_lists):
+            candidate.line = np.asarray(line, dtype=float)
+
+        print(
+            f"  [{direction_name}子测线组] 外端延伸完成 | 共{len(candidates)}段 | "
+            f"前端={front_stop_reason.name.lower()} | 后端={back_stop_reason.name.lower()}"
+        )
+        return candidates
+
     def _generate_candidate_group(
         self, parent_segments, direction, target_partition_id, direction_name
     ):
@@ -970,13 +1118,9 @@ class SurveyPlanner:
                 parent_segments, direction, target_partition_id
             )
         )
-        extended_candidates = []
-        for candidate in candidates:
-            extended = self._extend_child_candidate(
-                candidate, target_partition_id, direction_name
-            )
-            if self._line_has_enough_points(extended.line):
-                extended_candidates.append(extended)
+        extended_candidates = self._extend_child_group_external_ends(
+            candidates, target_partition_id, direction_name
+        )
         return extended_candidates, valid_points, boundary_rejects, low_value_rejects
 
     def _record_retained_child_group(
@@ -1007,6 +1151,7 @@ class SurveyPlanner:
                 )
                 self.current_partition_grid.cumulative_repeated_area += repeated_area
                 simulated_prior |= self.current_partition_grid.compute_polyline_hit_mask(line)
+            self._update_current_partition_grid_with_polyline(line)
 
             overlap_excess_length = self._compute_overlap_excess_length(
                 candidate.initial_line, candidate.overlap_rates, threshold=0.2
@@ -1116,20 +1261,46 @@ class SurveyPlanner:
                 )
                 break
 
-            gain_ratio, new_area, coverage_area = self._compute_group_gain_ratio(
+            all_gain_ratio, all_new_area, all_hit_area = self._compute_group_gain_ratio(
                 candidates, prior_covered_mask
             )
-            if coverage_area <= 1e-12:
+            if all_hit_area <= 1e-12:
                 self._restore_current_partition_state(transaction_snapshot)
                 print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮候选组积分覆盖面积为0，结束规划"
+                    f"[{direction_name}扩展] 第{perp_iter}轮候选组细网格扫中面积为0，结束规划"
                 )
                 break
+
+            retained_candidates, filtered_candidates = (
+                self._filter_child_candidates_by_segment_gain(
+                    candidates, prior_covered_mask
+                )
+            )
+            if len(filtered_candidates) > 0:
+                print(
+                    f"[{direction_name}扩展 第{perp_iter}轮] 过滤低收益子段"
+                    f"{len(filtered_candidates)}段 | 保留候选{len(retained_candidates)}段"
+                )
+
+            if len(retained_candidates) == 0:
+                gain_ratio = all_gain_ratio
+                new_area = all_new_area
+                hit_area = all_hit_area
+                decision_candidates = candidates
+                print(
+                    f"[{direction_name}扩展 第{perp_iter}轮] 无单段收益率达到"
+                    f"{self.jump_line_gain_threshold:.0%}，候选组仅作为跳板评估"
+                )
+            else:
+                decision_candidates = retained_candidates
+                gain_ratio, new_area, hit_area = self._compute_group_gain_ratio(
+                    decision_candidates, prior_covered_mask
+                )
 
             is_jump_group = gain_ratio < self.jump_line_gain_threshold
             print(
                 f"[{direction_name}扩展 第{perp_iter}轮] 候选组收益率={gain_ratio:.2%} "
-                f"(新增={new_area:.2f}m² / 积分={coverage_area:.2f}m²)"
+                f"(新增={new_area:.2f}m² / 扫中={hit_area:.2f}m²)"
             )
 
             if is_jump_group:
@@ -1142,7 +1313,9 @@ class SurveyPlanner:
                     )
                     break
 
-                parent_segments = [candidate.line.copy() for candidate in candidates]
+                parent_segments = [
+                    candidate.line.copy() for candidate in decision_candidates
+                ]
                 parent_draw_allowed = False
                 print(
                     f"[{direction_name}扩展] 第{perp_iter}轮作为跳板组继续迭代 | "
@@ -1151,8 +1324,9 @@ class SurveyPlanner:
                 continue
 
             consecutive_jump_groups = 0
+            self._restore_current_partition_state(transaction_snapshot)
             added_points, line_counter = self._record_retained_child_group(
-                candidates,
+                decision_candidates,
                 partition_id,
                 lines_dir,
                 line_counter,
@@ -1160,7 +1334,7 @@ class SurveyPlanner:
                 prior_covered_mask,
             )
             total_points += added_points
-            parent_segments = [candidate.line.copy() for candidate in candidates]
+            parent_segments = [candidate.line.copy() for candidate in decision_candidates]
             parent_draw_allowed = True
 
         print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | 保留{total_points}点")
