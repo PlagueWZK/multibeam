@@ -14,7 +14,7 @@ class TerminationReason(Enum):
 
     NONE = auto()  # 未终止
     BOUNDARY = auto()  # 超出分区边界
-    LOW_VALUE = auto()  # 细网格收益不足
+    LOW_VALUE = auto()  # 全局网格收益不足
     SPIRAL = auto()  # 累计偏转角 > 360°
     INTERSECTION = auto()  # 与已有测线相交
     SATURATION = auto()  # 测线收缩至质心内侧覆盖范围内
@@ -35,6 +35,21 @@ class LineRecord:
     max_overlap_eta: float
     repeated_area: float
     terminated_by: str  # "boundary" / "low_value" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
+
+
+@dataclass
+class LinePartitionContribution:
+    """保留测线对目标分区的统计贡献。"""
+
+    line_id: int
+    owner_partition_id: int
+    target_partition_id: int
+    hit_area: float
+    new_area: float
+    repeated_area: float
+    hit_samples: int
+    new_samples: int
+    repeated_samples: int
 
 
 @dataclass

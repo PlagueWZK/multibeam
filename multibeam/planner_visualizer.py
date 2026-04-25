@@ -136,6 +136,7 @@ class SurveyVisualizer:
 
     def save_snapshot(self, path: Path):
         """保存当前画布"""
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.fig.savefig(path, dpi=200, bbox_inches="tight")
 
     def close_figure(self):
@@ -181,9 +182,16 @@ class SurveyVisualizer:
             zorder=1,
         )
 
-    def _draw_fine_grid_overlay_on_ax(self, ax, state_grid, show_legend=False):
+    def _draw_fine_grid_overlay_on_ax(
+        self, ax, state_grid, show_legend=False, partition_id=None
+    ):
         """在指定坐标轴上叠加细网格状态。"""
-        for cell in state_grid.iter_render_cells():
+        if hasattr(state_grid, "iter_render_cells_for_partition"):
+            cells = state_grid.iter_render_cells_for_partition(partition_id)
+        else:
+            cells = state_grid.iter_render_cells()
+
+        for cell in cells:
             style = self.FINE_GRID_STATE_STYLES[cell["state"]]
             alpha = style["alpha"] * max(0.35, min(1.0, cell["partition_area_ratio"]))
             ax.add_patch(
@@ -210,11 +218,13 @@ class SurveyVisualizer:
             ]
         return []
 
-    def draw_fine_grid_overlay(self, state_grid, show_legend=False):
+    def draw_fine_grid_overlay(self, state_grid, show_legend=False, partition_id=None):
         """在当前分区图中叠加细网格状态。"""
         if self.ax is None:
             return []
-        return self._draw_fine_grid_overlay_on_ax(self.ax, state_grid, show_legend)
+        return self._draw_fine_grid_overlay_on_ax(
+            self.ax, state_grid, show_legend, partition_id=partition_id
+        )
 
     def _setup_global_ax(self, title: str):
         fig = plt.figure(figsize=(16, 12))
@@ -373,12 +383,21 @@ class SurveyVisualizer:
         self._draw_partition_boundaries_on_ax(ax_fine, partition_ids)
         state_legend_elements = []
         if partition_state_grids:
-            for pid in partition_ids:
-                state_grid = partition_state_grids.get(int(pid))
-                if state_grid is not None:
+            if hasattr(partition_state_grids, "iter_render_cells_for_partition"):
+                for pid in partition_ids:
                     state_legend_elements = self._draw_fine_grid_overlay_on_ax(
-                        ax_fine, state_grid, show_legend=True
+                        ax_fine,
+                        partition_state_grids,
+                        show_legend=True,
+                        partition_id=int(pid),
                     )
+            else:
+                for pid in partition_ids:
+                    state_grid = partition_state_grids.get(int(pid))
+                    if state_grid is not None:
+                        state_legend_elements = self._draw_fine_grid_overlay_on_ax(
+                            ax_fine, state_grid, show_legend=True
+                        )
         self._draw_lines_on_ax(ax_fine, all_results, colors)
         seed_legend_elements = self._draw_seed_points_on_ax(ax_fine, seed_points)
         ax_fine.legend(

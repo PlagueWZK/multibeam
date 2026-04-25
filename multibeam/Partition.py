@@ -11,26 +11,8 @@ from tool.Data import get_gx, get_gy
 PRIMARY_FEATURES_BY_MODE = {
     "xy_coverage": ("X", "Y", "coverage_count"),
     "coverage_only": ("coverage_count",),
-    "xy_depth_coverage": ("X", "Y", "depth", "coverage_count"),
-    "direction_only": ("ux", "uy"),
-    "xy_depth_coverage_direction": (
-        "X",
-        "Y",
-        "depth",
-        "coverage_count",
-        "ux",
-        "uy",
-    ),
-    "coverage_direction": ("coverage_count", "ux", "uy"),
 }
-SECONDARY_FEATURES_BY_MODE = {
-    "direction_only": ("ux", "uy"),
-    "depth_coverage": ("depth", "coverage_count"),
-}
-SECONDARY_PARTITION_POLICIES = (
-    "auto_by_direction_dispersion",
-    "all_partitions",
-)
+SECONDARY_FEATURE_NAMES = ("ux", "uy")
 
 
 def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
@@ -98,11 +80,9 @@ def _build_feature_stacks(
     xs,
     ys,
     coverage_matrix,
-    depth_matrix=None,
     gx_matrix=None,
     gy_matrix=None,
     primary_feature_mode="coverage_only",
-    secondary_feature_mode="direction_only",
 ):
     rows, cols = coverage_matrix.shape
     grid_x, grid_y = np.meshgrid(xs, ys)
@@ -111,12 +91,6 @@ def _build_feature_stacks(
         raise ValueError(
             "不支持的一级分区特征模式："
             f"{primary_feature_mode}，可选={tuple(PRIMARY_FEATURES_BY_MODE)}"
-        )
-
-    if secondary_feature_mode not in SECONDARY_FEATURES_BY_MODE:
-        raise ValueError(
-            "不支持的二级分区特征模式："
-            f"{secondary_feature_mode}，可选={tuple(SECONDARY_FEATURES_BY_MODE)}"
         )
 
     if gx_matrix is not None or gy_matrix is not None:
@@ -143,15 +117,6 @@ def _build_feature_stacks(
         )
 
     feature_c = coverage_matrix.flatten().reshape(-1, 1)
-    feature_depth = None
-    if depth_matrix is not None:
-        depth_matrix = np.asarray(depth_matrix, dtype=float)
-        if depth_matrix.shape != (rows, cols):
-            raise ValueError(
-                "提供的深度矩阵尺寸与 coverage_matrix 不一致："
-                f"coverage={coverage_matrix.shape}, depth={depth_matrix.shape}"
-            )
-        feature_depth = depth_matrix.flatten().reshape(-1, 1)
 
     gx_matrix = gx_flat.reshape(rows, cols)
     gy_matrix = gy_flat.reshape(rows, cols)
@@ -166,57 +131,19 @@ def _build_feature_stacks(
         gy_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
     )
 
-    feature_x = grid_x.flatten().reshape(-1, 1)
-    feature_y = grid_y.flatten().reshape(-1, 1)
-    feature_ux = unit_gx_matrix.reshape(-1, 1)
-    feature_uy = unit_gy_matrix.reshape(-1, 1)
-
     if primary_feature_mode == "xy_coverage":
+        feature_x = grid_x.flatten().reshape(-1, 1)
+        feature_y = grid_y.flatten().reshape(-1, 1)
         primary_features = np.hstack((feature_x, feature_y, feature_c))
-    elif primary_feature_mode == "coverage_only":
+    else:
         primary_features = feature_c
-    elif primary_feature_mode == "xy_depth_coverage":
-        if feature_depth is None:
-            raise ValueError(
-                "primary_feature_mode='xy_depth_coverage' 需要提供 depth_matrix。"
-            )
-        primary_features = np.hstack((feature_x, feature_y, feature_depth, feature_c))
-    elif primary_feature_mode == "direction_only":
-        primary_features = np.hstack((feature_ux, feature_uy))
-    elif primary_feature_mode == "xy_depth_coverage_direction":
-        if feature_depth is None:
-            raise ValueError(
-                "primary_feature_mode='xy_depth_coverage_direction' 需要提供 depth_matrix。"
-            )
-        primary_features = np.hstack(
-            (feature_x, feature_y, feature_depth, feature_c, feature_ux, feature_uy)
-        )
-    elif primary_feature_mode == "coverage_direction":
-        primary_features = np.hstack((feature_c, feature_ux, feature_uy))
-    else:
-        raise ValueError(
-            "不支持的一级分区特征模式："
-            f"{primary_feature_mode}，可选={tuple(PRIMARY_FEATURES_BY_MODE)}"
-        )
 
-    if secondary_feature_mode == "direction_only":
-        secondary_features = np.hstack(
-            (
-                unit_gx_matrix.reshape(-1, 1),
-                unit_gy_matrix.reshape(-1, 1),
-            )
+    secondary_features = np.hstack(
+        (
+            unit_gx_matrix.reshape(-1, 1),
+            unit_gy_matrix.reshape(-1, 1),
         )
-    elif secondary_feature_mode == "depth_coverage":
-        if feature_depth is None:
-            raise ValueError(
-                "secondary_feature_mode='depth_coverage' 需要提供 depth_matrix。"
-            )
-        secondary_features = np.hstack((feature_depth, feature_c))
-    else:
-        raise ValueError(
-            "不支持的二级分区特征模式："
-            f"{secondary_feature_mode}，可选={tuple(SECONDARY_FEATURES_BY_MODE)}"
-        )
+    )
 
     return {
         "rows": rows,
@@ -231,30 +158,23 @@ def _build_feature_stacks(
         "unit_gy_matrix": unit_gy_matrix,
         "primary_feature_names": PRIMARY_FEATURES_BY_MODE[primary_feature_mode],
         "primary_features": primary_features,
-        "secondary_feature_names": SECONDARY_FEATURES_BY_MODE[secondary_feature_mode],
         "secondary_features": secondary_features,
     }
 
 
-def _scale_features_for_kmeans(valid_features, feature_scaling_mode="legacy_balanced"):
+def _scale_features_for_kmeans(valid_features):
     weighted_features = valid_features.copy().astype(float)
 
-    if feature_scaling_mode == "legacy_balanced":
-        if valid_features.shape[1] >= 3:
-            std_xy_raw = float(np.std(valid_features[:, :2]))
-            weighted_features[:, 2] *= std_xy_raw / (
-                float(np.std(valid_features[:, 2])) + 1e-6
-            )
-
-            if valid_features.shape[1] >= 5:
-                weighted_features[:, 3:5] *= std_xy_raw / (
-                    float(np.std(valid_features[:, 3:5])) + 1e-6
-                )
-    elif feature_scaling_mode != "equal_weight_standardized":
-        raise ValueError(
-            "不支持的特征缩放模式："
-            f"{feature_scaling_mode}，可选=('legacy_balanced', 'equal_weight_standardized')"
+    if valid_features.shape[1] >= 3:
+        std_xy_raw = float(np.std(valid_features[:, :2]))
+        weighted_features[:, 2] *= std_xy_raw / (
+            float(np.std(valid_features[:, 2])) + 1e-6
         )
+
+        if valid_features.shape[1] >= 5:
+            weighted_features[:, 3:5] *= std_xy_raw / (
+                float(np.std(valid_features[:, 3:5])) + 1e-6
+            )
 
     scaler = StandardScaler()
     return scaler.fit_transform(weighted_features)
@@ -269,7 +189,6 @@ def _cluster_with_selected_mask(
     k_max=10,
     output_dir=None,
     elbow_subdir=None,
-    feature_scaling_mode="legacy_balanced",
 ):
     valid_features = features[selected_mask_1d]
     n_samples = len(valid_features)
@@ -278,9 +197,7 @@ def _cluster_with_selected_mask(
     if n_samples < 3:
         raise ValueError(f"可用于聚类的数据点过少 (n={n_samples})，至少需要 3 个点。")
 
-    scaled_features = _scale_features_for_kmeans(
-        valid_features, feature_scaling_mode=feature_scaling_mode
-    )
+    scaled_features = _scale_features_for_kmeans(valid_features)
 
     if U is not None:
         if U < 2:
@@ -368,426 +285,512 @@ def _renumber_cluster_matrix(cluster_matrix):
     return renumbered, next_id
 
 
-def _split_disconnected_partitions(cluster_matrix, valid_mask=None):
-    """将同一分区标签下 4 邻接不连通的物理区域拆成不同分区。"""
-    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
-    rows_count, cols_count = cluster_matrix.shape
-    if valid_mask is None:
-        valid_mask = cluster_matrix >= 0
-    else:
-        valid_mask = np.asarray(valid_mask, dtype=bool)
+def _connected_component_offsets(connectivity):
+    if connectivity == 4:
+        return ((-1, 0), (1, 0), (0, -1), (0, 1))
+    if connectivity == 8:
+        return (
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        )
+    raise ValueError(
+        f"不支持的连通性定义 connectivity={connectivity}，仅支持 4 或 8。"
+    )
 
-    original_ids = [
+
+def _iter_connected_components(mask, connectivity=4):
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"连通组件掩码必须是二维矩阵，当前 ndim={mask.ndim}")
+
+    rows, cols = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    offsets = _connected_component_offsets(connectivity)
+
+    for start_row, start_col in np.argwhere(mask):
+        start_row = int(start_row)
+        start_col = int(start_col)
+        if visited[start_row, start_col]:
+            continue
+
+        stack = [(start_row, start_col)]
+        visited[start_row, start_col] = True
+        component_rows = []
+        component_cols = []
+
+        while stack:
+            row, col = stack.pop()
+            component_rows.append(row)
+            component_cols.append(col)
+
+            for d_row, d_col in offsets:
+                next_row = row + d_row
+                next_col = col + d_col
+                if next_row < 0 or next_row >= rows or next_col < 0 or next_col >= cols:
+                    continue
+                if visited[next_row, next_col] or not mask[next_row, next_col]:
+                    continue
+                visited[next_row, next_col] = True
+                stack.append((next_row, next_col))
+
+        yield np.array(component_rows, dtype=int), np.array(component_cols, dtype=int)
+
+
+def _split_disconnected_partitions(cluster_matrix, connectivity=4):
+    """将同一分区 ID 下的非连通区域拆为不同分区。"""
+    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
+    split_matrix = np.full_like(cluster_matrix, -1, dtype=int)
+    diagnostics = []
+    next_global_id = 0
+
+    partition_ids = [
         int(pid) for pid in sorted(np.unique(cluster_matrix).astype(int)) if pid >= 0
     ]
-    split_matrix = np.full_like(cluster_matrix, -1, dtype=int)
-    visited = np.zeros_like(cluster_matrix, dtype=bool)
-    next_id = 0
-    component_stats = []
+    for partition_id in partition_ids:
+        partition_mask = cluster_matrix == partition_id
+        components = []
 
-    for original_id in original_ids:
-        component_sizes = []
-        component_new_ids = []
-        candidate_cells = np.argwhere((cluster_matrix == original_id) & valid_mask)
-        for start_row, start_col in candidate_cells:
-            start_row = int(start_row)
-            start_col = int(start_col)
-            if visited[start_row, start_col]:
-                continue
-
-            stack = [(start_row, start_col)]
-            visited[start_row, start_col] = True
-            cells = []
-            while stack:
-                row, col = stack.pop()
-                cells.append((row, col))
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    nr = row + dr
-                    nc = col + dc
-                    if nr < 0 or nr >= rows_count or nc < 0 or nc >= cols_count:
-                        continue
-                    if visited[nr, nc]:
-                        continue
-                    if not valid_mask[nr, nc]:
-                        continue
-                    if int(cluster_matrix[nr, nc]) != original_id:
-                        continue
-                    visited[nr, nc] = True
-                    stack.append((nr, nc))
-
-            for row, col in cells:
-                split_matrix[row, col] = next_id
-            component_sizes.append(int(len(cells)))
-            component_new_ids.append(int(next_id))
-            next_id += 1
-
-        if component_sizes:
-            component_stats.append(
+        for component_rows, component_cols in _iter_connected_components(
+            partition_mask, connectivity=connectivity
+        ):
+            target_partition_id = next_global_id
+            split_matrix[component_rows, component_cols] = target_partition_id
+            components.append(
                 {
-                    "original_partition_id": int(original_id),
-                    "component_count": int(len(component_sizes)),
-                    "component_partition_ids": component_new_ids,
-                    "total_cells": int(sum(component_sizes)),
-                    "min_component_cells": int(min(component_sizes)),
-                    "max_component_cells": int(max(component_sizes)),
-                    "mean_component_cells": float(np.mean(component_sizes)),
+                    "target_partition_id": int(target_partition_id),
+                    "cell_count": int(len(component_rows)),
                 }
             )
+            next_global_id += 1
 
-    split_original_ids = [
-        item["original_partition_id"]
-        for item in component_stats
-        if item["component_count"] > 1
-    ]
-    summary = {
-        "enabled": True,
-        "applied": bool(split_original_ids),
-        "connectivity": "4-neighbor_shared_edge",
-        "pre_split_u": int(len(original_ids)),
-        "post_split_u": int(next_id),
-        "split_original_partition_ids": split_original_ids,
-        "additional_partition_count": int(next_id - len(original_ids)),
-        "components_by_original_partition": component_stats,
-    }
-    return split_matrix, summary
+        diagnostics.append(
+            {
+                "source_partition_id": int(partition_id),
+                "component_count": int(len(components)),
+                "split": bool(len(components) > 1),
+                "target_partition_ids": [
+                    item["target_partition_id"] for item in components
+                ],
+                "component_cell_counts": [item["cell_count"] for item in components],
+            }
+        )
+
+    return split_matrix, next_global_id, diagnostics
 
 
-def _compute_total_valid_area(valid_mask, cell_effective_area=None):
+def _build_partition_area_matrix(cluster_matrix, cell_effective_area=None):
+    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
     if cell_effective_area is None:
-        return float(np.count_nonzero(valid_mask))
-    return float(np.sum(np.asarray(cell_effective_area, dtype=float)[valid_mask]))
+        return np.ones_like(cluster_matrix, dtype=float), "cell_count"
+
+    area_matrix = np.asarray(cell_effective_area, dtype=float)
+    if area_matrix.shape != cluster_matrix.shape:
+        raise ValueError(
+            "cell_effective_area 尺寸必须与 cluster_matrix 一致："
+            f"area={area_matrix.shape}, cluster={cluster_matrix.shape}"
+        )
+    if np.any(area_matrix < 0):
+        raise ValueError("cell_effective_area 不能包含负面积。")
+    return np.nan_to_num(area_matrix, nan=0.0, posinf=0.0, neginf=0.0), "effective_area"
 
 
-def _compute_partition_area_map(cluster_matrix, valid_mask, cell_effective_area=None):
-    area_map = {}
-    for pid in sorted(np.unique(cluster_matrix).astype(int)):
-        if pid < 0:
+def _calculate_partition_areas(cluster_matrix, area_matrix):
+    areas = {}
+    for partition_id in sorted(np.unique(cluster_matrix).astype(int)):
+        if partition_id < 0:
             continue
-        partition_mask = (cluster_matrix == pid) & valid_mask
-        if cell_effective_area is None:
-            area_map[int(pid)] = float(np.count_nonzero(partition_mask))
-        else:
-            area_map[int(pid)] = float(
-                np.sum(np.asarray(cell_effective_area, dtype=float)[partition_mask])
+        areas[int(partition_id)] = float(np.sum(area_matrix[cluster_matrix == partition_id]))
+    return areas
+
+
+def _count_partition_contacts(cluster_matrix, partition_id):
+    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
+    contacts = {}
+
+    for left_or_top, right_or_bottom in (
+        (cluster_matrix[:-1, :], cluster_matrix[1:, :]),
+        (cluster_matrix[:, :-1], cluster_matrix[:, 1:]),
+    ):
+        source_on_first = (
+            (left_or_top == partition_id)
+            & (right_or_bottom >= 0)
+            & (right_or_bottom != partition_id)
+        )
+        if np.any(source_on_first):
+            neighbor_ids, edge_counts = np.unique(
+                right_or_bottom[source_on_first], return_counts=True
             )
-    return area_map
+            for neighbor_id, edge_count in zip(neighbor_ids, edge_counts):
+                neighbor_id = int(neighbor_id)
+                contacts[neighbor_id] = contacts.get(neighbor_id, 0) + int(edge_count)
+
+        source_on_second = (
+            (right_or_bottom == partition_id)
+            & (left_or_top >= 0)
+            & (left_or_top != partition_id)
+        )
+        if np.any(source_on_second):
+            neighbor_ids, edge_counts = np.unique(
+                left_or_top[source_on_second], return_counts=True
+            )
+            for neighbor_id, edge_count in zip(neighbor_ids, edge_counts):
+                neighbor_id = int(neighbor_id)
+                contacts[neighbor_id] = contacts.get(neighbor_id, 0) + int(edge_count)
+
+    return contacts
 
 
-def _build_partition_contact_edge_counts(cluster_matrix):
-    contact_counts = {}
+def _select_small_partition_merge_target(
+    cluster_matrix,
+    partition_id,
+    partition_areas,
+):
+    contacts = _count_partition_contacts(cluster_matrix, partition_id)
+    if not contacts:
+        return None, 0, contacts
 
-    def _add_contact(a, b):
-        a = int(a)
-        b = int(b)
-        if a < 0 or b < 0 or a == b:
-            return
-        contact_counts.setdefault(a, {})
-        contact_counts.setdefault(b, {})
-        contact_counts[a][b] = contact_counts[a].get(b, 0) + 1
-        contact_counts[b][a] = contact_counts[b].get(a, 0) + 1
-
-    upper = cluster_matrix[:-1, :]
-    lower = cluster_matrix[1:, :]
-    vertical_valid = (upper >= 0) & (lower >= 0) & (upper != lower)
-    for a, b in zip(upper[vertical_valid], lower[vertical_valid]):
-        _add_contact(a, b)
-
-    left = cluster_matrix[:, :-1]
-    right = cluster_matrix[:, 1:]
-    horizontal_valid = (left >= 0) & (right >= 0) & (left != right)
-    for a, b in zip(left[horizontal_valid], right[horizontal_valid]):
-        _add_contact(a, b)
-
-    return contact_counts
-
-
-def _select_best_merge_target(neighbor_counts, area_map):
-    if not neighbor_counts:
-        return None, 0
-
-    best_target, best_contact_count = min(
-        neighbor_counts.items(),
-        key=lambda item: (
-            -int(item[1]),
-            -float(area_map.get(int(item[0]), 0.0)),
-            int(item[0]),
+    target_partition_id = max(
+        contacts,
+        key=lambda neighbor_id: (
+            contacts[neighbor_id],
+            partition_areas.get(neighbor_id, 0.0),
+            -neighbor_id,
         ),
     )
-    return int(best_target), int(best_contact_count)
+    return target_partition_id, contacts[target_partition_id], contacts
 
 
 def _merge_small_partitions(
     cluster_matrix,
-    valid_mask,
-    total_valid_area,
-    *,
-    area_ratio_threshold=0.10,
     cell_effective_area=None,
+    small_partition_area_ratio=0.02,
+    max_iterations=None,
 ):
-    updated = np.array(cluster_matrix, copy=True)
-    merge_events = []
-    skipped_events = []
+    """将面积过小的分区迭代合并到接触边最多的相邻分区。"""
+    if small_partition_area_ratio < 0:
+        raise ValueError(
+            f"small_partition_area_ratio 必须 >= 0，当前为 {small_partition_area_ratio}"
+        )
 
-    while True:
-        merged_in_pass = False
-        partition_ids = [
-            int(pid) for pid in sorted(np.unique(updated).astype(int)) if int(pid) >= 0
+    working_matrix = np.asarray(cluster_matrix, dtype=int).copy()
+    area_matrix, area_source = _build_partition_area_matrix(
+        working_matrix,
+        cell_effective_area=cell_effective_area,
+    )
+    total_area = float(np.sum(area_matrix[working_matrix >= 0]))
+    threshold_area = float(total_area * small_partition_area_ratio)
+    diagnostics = {
+        "enabled": True,
+        "area_source": area_source,
+        "small_partition_area_ratio": float(small_partition_area_ratio),
+        "total_area": total_area,
+        "threshold_area": threshold_area,
+        "merge_count": 0,
+        "merges": [],
+        "remaining_small_partitions": [],
+    }
+
+    partition_areas = _calculate_partition_areas(working_matrix, area_matrix)
+    if max_iterations is None:
+        max_iterations = max(len(partition_areas), 1)
+
+    if total_area <= 0 or small_partition_area_ratio == 0:
+        renumbered_matrix, final_u = _renumber_cluster_matrix(working_matrix)
+        diagnostics["final_u"] = int(final_u)
+        return renumbered_matrix, final_u, diagnostics
+
+    iteration = 0
+    while iteration < max_iterations:
+        partition_areas = _calculate_partition_areas(working_matrix, area_matrix)
+        small_partition_ids = [
+            partition_id
+            for partition_id, area in partition_areas.items()
+            if area < threshold_area
         ]
-        for pid in partition_ids:
-            if not np.any(updated == pid):
-                continue
+        if not small_partition_ids:
+            break
 
-            area_map = _compute_partition_area_map(
-                updated, valid_mask, cell_effective_area=cell_effective_area
+        merge_candidates = []
+        no_neighbor_partitions = []
+        for partition_id in small_partition_ids:
+            target_partition_id, contact_edges, contacts = (
+                _select_small_partition_merge_target(
+                    working_matrix,
+                    partition_id,
+                    partition_areas,
+                )
             )
-            partition_area = float(area_map.get(pid, 0.0))
-            area_ratio = partition_area / total_valid_area if total_valid_area > 0 else 0.0
-            if area_ratio >= area_ratio_threshold:
-                continue
-
-            contact_counts = _build_partition_contact_edge_counts(updated).get(pid, {})
-            target_pid, contact_edge_count = _select_best_merge_target(
-                contact_counts, area_map
-            )
-            if target_pid is None:
-                skipped_events.append(
+            if target_partition_id is None:
+                no_neighbor_partitions.append(
                     {
-                        "rule": "small_partition_merge",
-                        "source_partition_id": int(pid),
-                        "source_area": partition_area,
-                        "source_area_ratio": float(area_ratio),
-                        "status": "skipped_no_adjacent_partition",
+                        "partition_id": int(partition_id),
+                        "area": float(partition_areas[partition_id]),
+                        "area_ratio": float(partition_areas[partition_id] / total_area),
                     }
                 )
                 continue
 
-            target_area_before_merge = float(area_map.get(target_pid, 0.0))
-            updated[updated == pid] = target_pid
-            merge_events.append(
+            merge_candidates.append(
                 {
-                    "rule": "small_partition_merge",
-                    "source_partition_id": int(pid),
-                    "target_partition_id": int(target_pid),
-                    "source_area": partition_area,
-                    "source_area_ratio": float(area_ratio),
-                    "target_area_before_merge": target_area_before_merge,
-                    "contact_edge_count": int(contact_edge_count),
+                    "partition_id": int(partition_id),
+                    "target_partition_id": int(target_partition_id),
+                    "area": float(partition_areas[partition_id]),
+                    "area_ratio": float(partition_areas[partition_id] / total_area),
+                    "target_area_before": float(partition_areas[target_partition_id]),
+                    "contact_edges": int(contact_edges),
+                    "neighbor_contact_edges": {
+                        str(int(neighbor_id)): int(edge_count)
+                        for neighbor_id, edge_count in sorted(contacts.items())
+                    },
                 }
             )
-            merged_in_pass = True
 
-        if not merged_in_pass:
+        if not merge_candidates:
+            diagnostics["remaining_small_partitions"] = no_neighbor_partitions
             break
 
-    return updated, merge_events, skipped_events
+        merge_action = min(
+            merge_candidates,
+            key=lambda item: (item["area"], item["partition_id"]),
+        )
+        source_partition_id = merge_action["partition_id"]
+        target_partition_id = merge_action["target_partition_id"]
+        working_matrix[working_matrix == source_partition_id] = target_partition_id
 
+        merge_action["iteration"] = int(iteration + 1)
+        diagnostics["merges"].append(merge_action)
+        diagnostics["merge_count"] = int(len(diagnostics["merges"]))
+        iteration += 1
 
-def _compute_partition_neighbor_boundary_summary(cluster_matrix, partition_id):
-    rows, cols = np.where(cluster_matrix == partition_id)
-    if len(rows) == 0:
-        return {
-            "eligible_boundary_cells": 0,
-            "neighbor_boundary_cell_counts": {},
+    renumbered_matrix, final_u = _renumber_cluster_matrix(working_matrix)
+    final_areas = _calculate_partition_areas(renumbered_matrix, area_matrix)
+    diagnostics["final_u"] = int(final_u)
+    diagnostics["remaining_small_partitions"] = [
+        {
+            "partition_id": int(partition_id),
+            "area": float(area),
+            "area_ratio": float(area / total_area),
         }
+        for partition_id, area in final_areas.items()
+        if area < threshold_area
+    ]
+    return renumbered_matrix, final_u, diagnostics
 
-    rows_count, cols_count = cluster_matrix.shape
-    eligible_boundary_cells = 0
-    neighbor_boundary_cell_counts = {}
-    for row, col in zip(rows.tolist(), cols.tolist()):
-        neighbor_ids = set()
-        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nr = row + dr
-            nc = col + dc
-            if nr < 0 or nr >= rows_count or nc < 0 or nc >= cols_count:
+
+def _count_partition_boundary_grid_contacts(cluster_matrix, partition_id):
+    """统计分区自身边界网格数，以及这些边界网格接触各相邻分区的数量。"""
+    cluster_matrix = np.asarray(cluster_matrix, dtype=int)
+    rows, cols = cluster_matrix.shape
+    total_boundary_cells = 0
+    neighbor_contact_cells = {}
+
+    for row, col in np.argwhere(cluster_matrix == partition_id):
+        row = int(row)
+        col = int(col)
+        is_boundary_cell = False
+        touched_neighbor_ids = set()
+
+        for d_row, d_col in _connected_component_offsets(4):
+            next_row = row + d_row
+            next_col = col + d_col
+            if next_row < 0 or next_row >= rows or next_col < 0 or next_col >= cols:
+                is_boundary_cell = True
                 continue
-            neighbor_pid = int(cluster_matrix[nr, nc])
-            if neighbor_pid >= 0 and neighbor_pid != partition_id:
-                neighbor_ids.add(neighbor_pid)
 
-        if not neighbor_ids:
+            neighbor_id = int(cluster_matrix[next_row, next_col])
+            if neighbor_id == partition_id:
+                continue
+
+            is_boundary_cell = True
+            if neighbor_id >= 0:
+                touched_neighbor_ids.add(neighbor_id)
+
+        if not is_boundary_cell:
             continue
 
-        eligible_boundary_cells += 1
-        for neighbor_pid in neighbor_ids:
-            neighbor_boundary_cell_counts[neighbor_pid] = (
-                neighbor_boundary_cell_counts.get(neighbor_pid, 0) + 1
+        total_boundary_cells += 1
+        for neighbor_id in touched_neighbor_ids:
+            neighbor_contact_cells[neighbor_id] = (
+                neighbor_contact_cells.get(neighbor_id, 0) + 1
             )
 
-    return {
-        "eligible_boundary_cells": int(eligible_boundary_cells),
-        "neighbor_boundary_cell_counts": {
-            int(pid): int(count)
-            for pid, count in sorted(neighbor_boundary_cell_counts.items())
-        },
+    return total_boundary_cells, neighbor_contact_cells
+
+
+def _select_boundary_dominance_merge_target(
+    cluster_matrix,
+    partition_id,
+    partition_areas,
+    boundary_contact_ratio_threshold,
+):
+    total_boundary_cells, neighbor_contact_cells = (
+        _count_partition_boundary_grid_contacts(cluster_matrix, partition_id)
+    )
+    if total_boundary_cells == 0 or not neighbor_contact_cells:
+        return None, total_boundary_cells, neighbor_contact_cells
+
+    eligible_neighbors = []
+    for neighbor_id, contact_cells in neighbor_contact_cells.items():
+        contact_ratio = contact_cells / total_boundary_cells
+        if contact_ratio > boundary_contact_ratio_threshold:
+            eligible_neighbors.append((neighbor_id, contact_cells, contact_ratio))
+
+    if not eligible_neighbors:
+        return None, total_boundary_cells, neighbor_contact_cells
+
+    target_partition_id, _, _ = max(
+        eligible_neighbors,
+        key=lambda item: (
+            item[2],
+            item[1],
+            partition_areas.get(item[0], 0.0),
+            -item[0],
+        ),
+    )
+    return target_partition_id, total_boundary_cells, neighbor_contact_cells
+
+
+def _merge_boundary_dominant_partitions(
+    cluster_matrix,
+    cell_effective_area=None,
+    boundary_partition_area_ratio=0.10,
+    boundary_contact_ratio_threshold=0.50,
+    max_iterations=None,
+):
+    """将边界主要接触同一邻区的 10% 以下分区合并到该邻区。"""
+    if boundary_partition_area_ratio < 0:
+        raise ValueError(
+            "boundary_partition_area_ratio 必须 >= 0，"
+            f"当前为 {boundary_partition_area_ratio}"
+        )
+    if not 0 <= boundary_contact_ratio_threshold <= 1:
+        raise ValueError(
+            "boundary_contact_ratio_threshold 必须位于 [0, 1]，"
+            f"当前为 {boundary_contact_ratio_threshold}"
+        )
+
+    working_matrix = np.asarray(cluster_matrix, dtype=int).copy()
+    area_matrix, area_source = _build_partition_area_matrix(
+        working_matrix,
+        cell_effective_area=cell_effective_area,
+    )
+    total_area = float(np.sum(area_matrix[working_matrix >= 0]))
+    threshold_area = float(total_area * boundary_partition_area_ratio)
+    diagnostics = {
+        "enabled": True,
+        "area_source": area_source,
+        "boundary_partition_area_ratio": float(boundary_partition_area_ratio),
+        "boundary_contact_ratio_threshold": float(boundary_contact_ratio_threshold),
+        "total_area": total_area,
+        "threshold_area": threshold_area,
+        "merge_count": 0,
+        "merges": [],
+        "remaining_under_threshold_partitions": [],
     }
 
+    partition_areas = _calculate_partition_areas(working_matrix, area_matrix)
+    if max_iterations is None:
+        max_iterations = max(len(partition_areas), 1)
 
-def _merge_enclosed_partitions(
-    cluster_matrix,
-    *,
-    boundary_ratio_threshold=0.50,
-    valid_mask=None,
-    cell_effective_area=None,
-    total_valid_area=None,
-    source_area_ratio_min=None,
-    source_area_ratio_max=None,
-):
-    updated = np.array(cluster_matrix, copy=True)
-    merge_events = []
+    if total_area <= 0 or boundary_partition_area_ratio == 0:
+        renumbered_matrix, final_u = _renumber_cluster_matrix(working_matrix)
+        diagnostics["final_u"] = int(final_u)
+        return renumbered_matrix, final_u, diagnostics
 
-    while True:
-        merged_in_pass = False
-        partition_ids = [
-            int(pid) for pid in sorted(np.unique(updated).astype(int)) if int(pid) >= 0
+    iteration = 0
+    while iteration < max_iterations:
+        partition_areas = _calculate_partition_areas(working_matrix, area_matrix)
+        candidate_ids = [
+            partition_id
+            for partition_id, area in partition_areas.items()
+            if area < threshold_area
         ]
-        for pid in partition_ids:
-            if not np.any(updated == pid):
-                continue
-
-            area_map = None
-            if valid_mask is not None:
-                area_map = _compute_partition_area_map(
-                    updated, valid_mask, cell_effective_area=cell_effective_area
-                )
-            else:
-                area_map = {int(pid_): 0.0 for pid_ in partition_ids}
-
-            source_area = float(area_map.get(pid, 0.0))
-            source_area_ratio = (
-                source_area / float(total_valid_area)
-                if total_valid_area is not None and float(total_valid_area) > 0
-                else 0.0
-            )
-            if (
-                source_area_ratio_min is not None
-                and source_area_ratio < float(source_area_ratio_min)
-            ):
-                continue
-            if (
-                source_area_ratio_max is not None
-                and source_area_ratio > float(source_area_ratio_max)
-            ):
-                continue
-
-            summary = _compute_partition_neighbor_boundary_summary(updated, pid)
-            eligible_boundary_cells = int(summary["eligible_boundary_cells"])
-            if eligible_boundary_cells <= 0:
-                continue
-
-            target_pid, adjacent_boundary_cell_count = _select_best_merge_target(
-                summary["neighbor_boundary_cell_counts"], area_map
-            )
-            if target_pid is None:
-                continue
-
-            boundary_ratio = (
-                adjacent_boundary_cell_count / eligible_boundary_cells
-                if eligible_boundary_cells > 0
-                else 0.0
-            )
-            if boundary_ratio <= boundary_ratio_threshold:
-                continue
-
-            updated[updated == pid] = target_pid
-            merge_events.append(
-                {
-                    "rule": "enclosed_partition_merge",
-                    "source_partition_id": int(pid),
-                    "target_partition_id": int(target_pid),
-                    "source_area": source_area,
-                    "source_area_ratio": float(source_area_ratio),
-                    "eligible_boundary_cells": int(eligible_boundary_cells),
-                    "adjacent_boundary_cell_count": int(adjacent_boundary_cell_count),
-                    "boundary_ratio": float(boundary_ratio),
-                }
-            )
-            merged_in_pass = True
-
-        if not merged_in_pass:
+        if not candidate_ids:
             break
 
-    return updated, merge_events
+        merge_candidates = []
+        for partition_id in candidate_ids:
+            target_partition_id, total_boundary_cells, neighbor_contact_cells = (
+                _select_boundary_dominance_merge_target(
+                    working_matrix,
+                    partition_id,
+                    partition_areas,
+                    boundary_contact_ratio_threshold,
+                )
+            )
+            neighbor_contact_ratios = {
+                int(neighbor_id): (
+                    contact_cells / total_boundary_cells
+                    if total_boundary_cells > 0
+                    else 0.0
+                )
+                for neighbor_id, contact_cells in neighbor_contact_cells.items()
+            }
+            if target_partition_id is None:
+                continue
 
+            contact_cells = int(neighbor_contact_cells[target_partition_id])
+            contact_ratio = float(neighbor_contact_ratios[target_partition_id])
+            merge_candidates.append(
+                {
+                    "partition_id": int(partition_id),
+                    "target_partition_id": int(target_partition_id),
+                    "area": float(partition_areas[partition_id]),
+                    "area_ratio": float(partition_areas[partition_id] / total_area),
+                    "target_area_before": float(partition_areas[target_partition_id]),
+                    "total_boundary_cells": int(total_boundary_cells),
+                    "target_contact_boundary_cells": contact_cells,
+                    "target_contact_boundary_ratio": contact_ratio,
+                    "neighbor_contact_boundary_cells": {
+                        str(int(neighbor_id)): int(contact_cells)
+                        for neighbor_id, contact_cells in sorted(
+                            neighbor_contact_cells.items()
+                        )
+                    },
+                    "neighbor_contact_boundary_ratios": {
+                        str(int(neighbor_id)): float(contact_ratio)
+                        for neighbor_id, contact_ratio in sorted(
+                            neighbor_contact_ratios.items()
+                        )
+                    },
+                }
+            )
 
-def _postprocess_partition_matrix(
-    cluster_matrix,
-    valid_mask,
-    *,
-    cell_effective_area=None,
-    merge_small_partitions=False,
-    small_partition_area_ratio_threshold=0.10,
-    merge_enclosed_partitions=False,
-    enclosed_partition_boundary_ratio_threshold=0.50,
-    enclosed_partition_source_area_ratio_min=None,
-    enclosed_partition_source_area_ratio_max=None,
-):
-    total_valid_area = _compute_total_valid_area(
-        valid_mask, cell_effective_area=cell_effective_area
-    )
-    pre_postprocess_u = int(
-        np.count_nonzero(np.unique(cluster_matrix.astype(int)) >= 0)
-    )
-    area_unit = "effective_area_m2" if cell_effective_area is not None else "grid_cells"
-    payload = {
-        "enabled": bool(merge_small_partitions or merge_enclosed_partitions),
-        "area_unit": area_unit,
-        "total_valid_area": float(total_valid_area),
-        "small_partition_merge_enabled": bool(merge_small_partitions),
-        "small_partition_area_ratio_threshold": float(
-            small_partition_area_ratio_threshold
-        ),
-        "enclosed_partition_merge_enabled": bool(merge_enclosed_partitions),
-        "enclosed_partition_boundary_ratio_threshold": float(
-            enclosed_partition_boundary_ratio_threshold
-        ),
-        "enclosed_partition_source_area_ratio_min": (
-            None
-            if enclosed_partition_source_area_ratio_min is None
-            else float(enclosed_partition_source_area_ratio_min)
-        ),
-        "enclosed_partition_source_area_ratio_max": (
-            None
-            if enclosed_partition_source_area_ratio_max is None
-            else float(enclosed_partition_source_area_ratio_max)
-        ),
-        "pre_postprocess_final_u": int(pre_postprocess_u),
-        "postprocess_changed": False,
-        "small_partition_merges": [],
-        "small_partition_skipped": [],
-        "enclosed_partition_merges": [],
-        "final_u_after_postprocess": int(pre_postprocess_u),
-    }
-    if not payload["enabled"]:
-        return np.array(cluster_matrix, copy=True), payload
+        if not merge_candidates:
+            break
 
-    updated = np.array(cluster_matrix, copy=True)
-    if merge_small_partitions:
-        updated, merge_events, skipped_events = _merge_small_partitions(
-            updated,
-            valid_mask,
-            total_valid_area,
-            area_ratio_threshold=small_partition_area_ratio_threshold,
-            cell_effective_area=cell_effective_area,
+        merge_action = min(
+            merge_candidates,
+            key=lambda item: (item["area"], item["partition_id"]),
         )
-        payload["small_partition_merges"] = merge_events
-        payload["small_partition_skipped"] = skipped_events
+        source_partition_id = merge_action["partition_id"]
+        target_partition_id = merge_action["target_partition_id"]
+        working_matrix[working_matrix == source_partition_id] = target_partition_id
 
-    if merge_enclosed_partitions:
-        updated, merge_events = _merge_enclosed_partitions(
-            updated,
-            boundary_ratio_threshold=enclosed_partition_boundary_ratio_threshold,
-            valid_mask=valid_mask,
-            cell_effective_area=cell_effective_area,
-            total_valid_area=total_valid_area,
-            source_area_ratio_min=enclosed_partition_source_area_ratio_min,
-            source_area_ratio_max=enclosed_partition_source_area_ratio_max,
-        )
-        payload["enclosed_partition_merges"] = merge_events
+        merge_action["iteration"] = int(iteration + 1)
+        diagnostics["merges"].append(merge_action)
+        diagnostics["merge_count"] = int(len(diagnostics["merges"]))
+        iteration += 1
 
-    updated, final_u = _renumber_cluster_matrix(updated)
-    payload["postprocess_changed"] = not np.array_equal(updated, cluster_matrix)
-    payload["final_u_after_postprocess"] = int(final_u)
-    return updated, payload
+    renumbered_matrix, final_u = _renumber_cluster_matrix(working_matrix)
+    final_areas = _calculate_partition_areas(renumbered_matrix, area_matrix)
+    diagnostics["final_u"] = int(final_u)
+    diagnostics["remaining_under_threshold_partitions"] = [
+        {
+            "partition_id": int(partition_id),
+            "area": float(area),
+            "area_ratio": float(area / total_area),
+        }
+        for partition_id, area in final_areas.items()
+        if area < threshold_area
+    ]
+    return renumbered_matrix, final_u, diagnostics
 
 
 def _summarize_partition_gradient_complexity(
@@ -828,7 +831,7 @@ def _summarize_partition_gradient_complexity(
         trigger_reasons.append("too_small_for_secondary")
         triggered = False
     else:
-        if direction_dispersion > direction_dispersion_threshold:
+        if direction_dispersion >= direction_dispersion_threshold:
             trigger_reasons.append("direction_dispersion")
         triggered = bool(trigger_reasons)
 
@@ -849,19 +852,12 @@ def _summarize_partition_gradient_complexity(
 def _write_secondary_partition_diagnostics(
     output_dir,
     first_stage_u,
-    pre_postprocess_u,
     final_u,
     primary_feature_names,
-    secondary_feature_names,
-    primary_connected_component_split,
     diagnostics,
     direction_dispersion_threshold,
     min_partition_size_for_secondary,
     secondary_k_max,
-    enable_secondary_partition,
-    feature_scaling_mode,
-    secondary_partition_policy,
-    postprocess_summary,
 ):
     if output_dir is None:
         return
@@ -871,53 +867,96 @@ def _write_secondary_partition_diagnostics(
     diagnostics_path = partition_dir / "secondary_partition_diagnostics.json"
     payload = {
         "primary_features": list(primary_feature_names),
-        "secondary_features": list(secondary_feature_names),
+        "secondary_features": list(SECONDARY_FEATURE_NAMES),
         "first_stage_u": int(first_stage_u),
-        "pre_postprocess_u": int(pre_postprocess_u),
         "final_u": int(final_u),
-        "secondary_partition_enabled": bool(enable_secondary_partition),
-        "secondary_partition_policy": secondary_partition_policy,
-        "feature_scaling_mode": feature_scaling_mode,
-        "primary_connected_component_split": primary_connected_component_split,
         "secondary_detection_thresholds": {
             "direction_dispersion_threshold": float(direction_dispersion_threshold),
             "min_partition_size_for_secondary": int(min_partition_size_for_secondary),
             "secondary_k_max": int(secondary_k_max),
         },
-        "postprocess": postprocess_summary,
         "partitions": diagnostics,
     }
     with diagnostics_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _write_connectivity_partition_diagnostics(
+    output_dir,
+    pre_connectivity_u,
+    final_u,
+    connectivity,
+    diagnostics,
+):
+    if output_dir is None:
+        return
+
+    partition_dir = Path(output_dir) / "partition"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = partition_dir / "connectivity_partition_diagnostics.json"
+    split_partition_count = int(
+        sum(1 for diagnostic in diagnostics if diagnostic["split"])
+    )
+    payload = {
+        "connectivity": int(connectivity),
+        "connectivity_definition": (
+            "edge-connected grid cells"
+            if connectivity == 4
+            else "edge-or-corner connected grid cells"
+        ),
+        "pre_connectivity_u": int(pre_connectivity_u),
+        "final_u": int(final_u),
+        "split_partition_count": split_partition_count,
+        "added_partition_count": int(final_u - pre_connectivity_u),
+        "partitions": diagnostics,
+    }
+    with diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _write_small_partition_merge_diagnostics(output_dir, diagnostics):
+    if output_dir is None:
+        return
+
+    partition_dir = Path(output_dir) / "partition"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = partition_dir / "small_partition_merge_diagnostics.json"
+    with diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+
+
+def _write_boundary_dominance_merge_diagnostics(output_dir, diagnostics):
+    if output_dir is None:
+        return
+
+    partition_dir = Path(output_dir) / "partition"
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_path = partition_dir / "boundary_dominance_merge_diagnostics.json"
+    with diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+
+
 def partition_coverage_matrix(
     xs,
     ys,
     coverage_matrix,
-    depth_matrix=None,
     U=None,
     k_max=10,
     output_dir=None,
     boundary_mask=None,
-    cell_effective_area=None,
     gx_matrix=None,
     gy_matrix=None,
     primary_feature_mode="coverage_only",
-    feature_scaling_mode="legacy_balanced",
-    enable_secondary_partition=True,
-    secondary_feature_mode="direction_only",
-    secondary_partition_policy="auto_by_direction_dispersion",
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
     direction_dispersion_threshold=0.30,
-    split_disconnected_primary_partitions=False,
-    postprocess_merge_small_partitions=False,
-    postprocess_small_partition_area_ratio_threshold=0.10,
-    postprocess_merge_enclosed_partitions=False,
-    enclosed_partition_boundary_ratio_threshold=0.50,
-    enclosed_partition_source_area_ratio_min=None,
-    enclosed_partition_source_area_ratio_max=None,
+    connectivity=4,
+    cell_effective_area=None,
+    merge_small_partitions=True,
+    small_partition_area_ratio=0.02,
+    merge_boundary_dominance_partitions=True,
+    boundary_partition_area_ratio=0.10,
+    boundary_contact_ratio_threshold=0.50,
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
@@ -925,21 +964,25 @@ def partition_coverage_matrix(
     参数:
         xs, ys: 坐标数组
         coverage_matrix: 覆盖次数矩阵
-        depth_matrix: 深度矩阵（当一级特征包含 depth 时必需）
         U: 指定分区数量（可选）。若传入则直接使用，若为 None 则使用 Elbow 法则自动确定
         k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
         boundary_mask: 有效海域掩码。若提供，则仅对有效格聚类，其余位置标记为 -1
+        connectivity: 分区后处理的连通性定义。默认 4 表示边连通；8 表示边或角连通
+        cell_effective_area: 每个网格在待测海域内的真实有效面积；提供时用于小面积分区合并
+        merge_small_partitions: 是否在连通性拆分后合并小于阈值的小面积分区
+        small_partition_area_ratio: 小面积分区阈值，默认 0.02 表示待测海域总面积的 2%
+        merge_boundary_dominance_partitions: 是否启用 10% 以下分区边界占比合并
+        boundary_partition_area_ratio: 边界占比合并候选面积阈值，默认 0.10 表示 10%
+        boundary_contact_ratio_threshold: 相邻分区接触边界网格占比阈值，默认 0.50
     """
     feature_bundle = _build_feature_stacks(
         xs,
         ys,
         coverage_matrix,
-        depth_matrix=depth_matrix,
         gx_matrix=gx_matrix,
         gy_matrix=gy_matrix,
         primary_feature_mode=primary_feature_mode,
-        secondary_feature_mode=secondary_feature_mode,
     )
     rows = feature_bundle["rows"]
     cols = feature_bundle["cols"]
@@ -951,43 +994,19 @@ def partition_coverage_matrix(
     unit_gy_matrix = feature_bundle["unit_gy_matrix"]
     primary_feature_names = feature_bundle["primary_feature_names"]
     primary_features = feature_bundle["primary_features"]
-    secondary_feature_names = feature_bundle["secondary_feature_names"]
     secondary_features = feature_bundle["secondary_features"]
 
-    if secondary_partition_policy not in SECONDARY_PARTITION_POLICIES:
-        raise ValueError(
-            "不支持的二次分区策略："
-            f"{secondary_partition_policy}，可选={SECONDARY_PARTITION_POLICIES}"
-        )
-
     if boundary_mask is None:
-        valid_mask_2d = np.ones((rows, cols), dtype=bool)
         valid_mask_1d = np.ones(rows * cols, dtype=bool)
     else:
-        valid_mask_2d = np.asarray(boundary_mask, dtype=bool)
-        if valid_mask_2d.shape != (rows, cols):
-            raise ValueError(
-                "boundary_mask 尺寸与 coverage_matrix 不一致："
-                f"coverage={coverage_matrix.shape}, boundary_mask={valid_mask_2d.shape}"
-            )
-        valid_mask_1d = valid_mask_2d.reshape(-1)
-
-    if cell_effective_area is not None:
-        cell_effective_area = np.asarray(cell_effective_area, dtype=float)
-        if cell_effective_area.shape != (rows, cols):
-            raise ValueError(
-                "cell_effective_area 尺寸与 coverage_matrix 不一致："
-                f"coverage={coverage_matrix.shape}, cell_effective_area={cell_effective_area.shape}"
-            )
+        valid_mask_1d = np.asarray(boundary_mask, dtype=bool).reshape(-1)
 
     if not np.any(valid_mask_1d):
         raise ValueError("无有效海域网格可用于聚类，请检查 boundary_mask。")
 
     print(
         "[分区] 一级分区特征 = "
-        f"{primary_feature_names} | 特征缩放 = {feature_scaling_mode} | "
-        f"二级分区启用 = {enable_secondary_partition} | 二级分区策略 = {secondary_partition_policy} | "
-        f"二级分区特征 = {secondary_feature_names}"
+        f"{primary_feature_names} | 二级分区特征 = {SECONDARY_FEATURE_NAMES}"
     )
     first_stage_cluster_matrix, first_stage_u = _cluster_with_selected_mask(
         primary_features,
@@ -998,30 +1017,7 @@ def partition_coverage_matrix(
         k_max=k_max,
         output_dir=output_dir,
         elbow_subdir="stage1",
-        feature_scaling_mode=feature_scaling_mode,
     )
-    primary_split_summary = {
-        "enabled": bool(split_disconnected_primary_partitions),
-        "applied": False,
-        "connectivity": "4-neighbor_shared_edge",
-        "pre_split_u": int(first_stage_u),
-        "post_split_u": int(first_stage_u),
-        "split_original_partition_ids": [],
-        "additional_partition_count": 0,
-        "components_by_original_partition": [],
-    }
-    if split_disconnected_primary_partitions:
-        first_stage_cluster_matrix, primary_split_summary = _split_disconnected_partitions(
-            first_stage_cluster_matrix,
-            valid_mask=valid_mask_2d,
-        )
-        first_stage_u = int(primary_split_summary["post_split_u"])
-        print(
-            "[一级分区连通性] "
-            f"启用4邻接拆分 | 原始U={primary_split_summary['pre_split_u']} | "
-            f"拆分后U={first_stage_u} | "
-            f"新增分区数={primary_split_summary['additional_partition_count']}"
-        )
     _save_partition_plot(
         first_stage_cluster_matrix,
         xs,
@@ -1029,6 +1025,14 @@ def partition_coverage_matrix(
         output_dir,
         f"partition_stage1_U={first_stage_u}.png",
         f"Stage-1 Partitioning (U={first_stage_u})",
+    )
+    _save_partition_plot(
+        first_stage_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage1_primary_U={first_stage_u}.png",
+        f"Stage 1: Primary Partitioning (U={first_stage_u})",
     )
 
     merged_cluster_matrix = np.full_like(first_stage_cluster_matrix, -1, dtype=int)
@@ -1053,24 +1057,15 @@ def partition_coverage_matrix(
             direction_dispersion_threshold=direction_dispersion_threshold,
         )
 
-        diagnostic["auto_triggered_secondary_partition"] = bool(
-            diagnostic["triggered_secondary_partition"]
-        )
-        diagnostic["auto_trigger_reasons"] = list(diagnostic["trigger_reasons"])
-        if secondary_partition_policy == "all_partitions":
-            diagnostic["triggered_secondary_partition"] = True
-            diagnostic["trigger_reasons"] = ["all_partitions_policy"]
-
         print(
             f"[分区检测] 一级分区{partition_id} | cells={diagnostic['cell_count']} | "
             f"dispersion={diagnostic['direction_dispersion']:.3f} | "
             f"unit_like={diagnostic['unit_like_gradient']} | "
-            f"自动触发={diagnostic['auto_triggered_secondary_partition']} | "
-            f"实际二次分区={diagnostic['triggered_secondary_partition']} | "
+            f"二次分区={diagnostic['triggered_secondary_partition']} | "
             f"reasons={diagnostic['trigger_reasons']}"
         )
 
-        if enable_secondary_partition and diagnostic["triggered_secondary_partition"]:
+        if diagnostic["triggered_secondary_partition"]:
             local_mask_1d = partition_mask.reshape(-1)
             if np.count_nonzero(local_mask_1d) >= 3:
                 local_cluster_matrix, local_u = _cluster_with_selected_mask(
@@ -1082,9 +1077,16 @@ def partition_coverage_matrix(
                     k_max=secondary_k_max,
                     output_dir=output_dir,
                     elbow_subdir=f"stage2_partition_{partition_id}",
-                    feature_scaling_mode="equal_weight_standardized",
                 )
                 diagnostic["secondary_partition_count"] = int(local_u)
+                _save_partition_plot(
+                    local_cluster_matrix,
+                    xs,
+                    ys,
+                    output_dir,
+                    f"partition_stage2_secondary_source_{partition_id}_U={local_u}.png",
+                    f"Stage 2: Secondary Partitioning for Source {partition_id} (U={local_u})",
+                )
                 for local_label in sorted(np.unique(local_cluster_matrix).astype(int)):
                     if local_label < 0:
                         continue
@@ -1096,16 +1098,6 @@ def partition_coverage_matrix(
                 diagnostic["trigger_reasons"] = ["insufficient_local_samples"]
                 merged_cluster_matrix[partition_mask] = next_global_id
                 next_global_id += 1
-        elif not enable_secondary_partition:
-            diagnostic["would_trigger_secondary_partition"] = bool(
-                diagnostic["triggered_secondary_partition"]
-            )
-            diagnostic["would_trigger_reasons"] = list(diagnostic["trigger_reasons"])
-            diagnostic["triggered_secondary_partition"] = False
-            diagnostic["trigger_reasons"] = ["disabled_by_configuration"]
-            diagnostic["secondary_partition_count"] = 1
-            merged_cluster_matrix[partition_mask] = next_global_id
-            next_global_id += 1
         else:
             diagnostic["secondary_partition_count"] = 1
             merged_cluster_matrix[partition_mask] = next_global_id
@@ -1116,22 +1108,88 @@ def partition_coverage_matrix(
     post_secondary_cluster_matrix, post_secondary_u = _renumber_cluster_matrix(
         merged_cluster_matrix
     )
-    final_cluster_matrix, postprocess_summary = _postprocess_partition_matrix(
+    _save_partition_plot(
         post_secondary_cluster_matrix,
-        valid_mask_2d,
-        cell_effective_area=cell_effective_area,
-        merge_small_partitions=postprocess_merge_small_partitions,
-        small_partition_area_ratio_threshold=postprocess_small_partition_area_ratio_threshold,
-        merge_enclosed_partitions=postprocess_merge_enclosed_partitions,
-        enclosed_partition_boundary_ratio_threshold=enclosed_partition_boundary_ratio_threshold,
-        enclosed_partition_source_area_ratio_min=enclosed_partition_source_area_ratio_min,
-        enclosed_partition_source_area_ratio_max=enclosed_partition_source_area_ratio_max,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage2_secondary_merged_U={post_secondary_u}.png",
+        f"Stage 2: Secondary-Merged Global Partitioning (U={post_secondary_u})",
     )
-    final_cluster_matrix, final_u = _renumber_cluster_matrix(final_cluster_matrix)
-    final_partition_title = (
-        f"Two-Stage Partitioning (U={final_u})"
-        if enable_secondary_partition
-        else f"Single-Stage Partitioning (U={final_u})"
+    connected_cluster_matrix, connected_u, connectivity_diagnostics = (
+        _split_disconnected_partitions(
+            post_secondary_cluster_matrix,
+            connectivity=connectivity,
+        )
+    )
+    _save_partition_plot(
+        connected_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage3_connectivity_split_U={connected_u}.png",
+        f"Stage 3: Connectivity Split Partitioning (U={connected_u})",
+    )
+    if merge_small_partitions:
+        final_cluster_matrix, final_u, small_merge_diagnostics = _merge_small_partitions(
+            connected_cluster_matrix,
+            cell_effective_area=cell_effective_area,
+            small_partition_area_ratio=small_partition_area_ratio,
+        )
+    else:
+        final_cluster_matrix = connected_cluster_matrix
+        final_u = connected_u
+        small_merge_diagnostics = {
+            "enabled": False,
+            "small_partition_area_ratio": float(small_partition_area_ratio),
+            "pre_merge_u": int(connected_u),
+            "final_u": int(final_u),
+            "merge_count": 0,
+            "merges": [],
+            "remaining_small_partitions": [],
+        }
+
+    _save_partition_plot(
+        final_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage4_small_area_merged_U={final_u}.png",
+        f"Stage 4: Small-Area-Merged Final Partitioning (U={final_u})",
+    )
+
+    small_merged_cluster_matrix = final_cluster_matrix
+    small_merged_u = final_u
+    if merge_boundary_dominance_partitions:
+        final_cluster_matrix, final_u, boundary_dominance_diagnostics = (
+            _merge_boundary_dominant_partitions(
+                small_merged_cluster_matrix,
+                cell_effective_area=cell_effective_area,
+                boundary_partition_area_ratio=boundary_partition_area_ratio,
+                boundary_contact_ratio_threshold=boundary_contact_ratio_threshold,
+            )
+        )
+    else:
+        boundary_dominance_diagnostics = {
+            "enabled": False,
+            "boundary_partition_area_ratio": float(boundary_partition_area_ratio),
+            "boundary_contact_ratio_threshold": float(
+                boundary_contact_ratio_threshold
+            ),
+            "pre_merge_u": int(small_merged_u),
+            "final_u": int(final_u),
+            "merge_count": 0,
+            "merges": [],
+            "remaining_under_threshold_partitions": [],
+        }
+
+    _save_partition_plot(
+        final_cluster_matrix,
+        xs,
+        ys,
+        output_dir,
+        f"partition_stage5_boundary_dominance_merged_U={final_u}.png",
+        f"Stage 5: Boundary-Dominance-Merged Final Partitioning (U={final_u})",
     )
     _save_partition_plot(
         final_cluster_matrix,
@@ -1139,7 +1197,7 @@ def partition_coverage_matrix(
         ys,
         output_dir,
         f"partition_final_U={final_u}.png",
-        final_partition_title,
+        f"Connected and Small-Merged Final Partitioning (U={final_u})",
     )
     _save_partition_plot(
         final_cluster_matrix,
@@ -1147,46 +1205,50 @@ def partition_coverage_matrix(
         ys,
         output_dir,
         f"partition_U={final_u}.png",
-        final_partition_title,
+        f"Connected and Small-Merged Final Partitioning (U={final_u})",
     )
     _write_secondary_partition_diagnostics(
         output_dir,
         first_stage_u,
         post_secondary_u,
-        final_u,
         primary_feature_names,
-        secondary_feature_names,
-        primary_split_summary,
         diagnostics,
         direction_dispersion_threshold,
         min_partition_size_for_secondary,
         secondary_k_max,
-        enable_secondary_partition,
-        feature_scaling_mode,
-        secondary_partition_policy,
-        postprocess_summary,
+    )
+    _write_connectivity_partition_diagnostics(
+        output_dir,
+        post_secondary_u,
+        connected_u,
+        connectivity,
+        connectivity_diagnostics,
+    )
+    _write_small_partition_merge_diagnostics(
+        output_dir,
+        small_merge_diagnostics,
+    )
+    _write_boundary_dominance_merge_diagnostics(
+        output_dir,
+        boundary_dominance_diagnostics,
     )
 
-    if postprocess_summary["enabled"]:
-        print(
-            f"[分区后处理] 小面积合并={len(postprocess_summary['small_partition_merges'])} | "
-            f"被包围合并={len(postprocess_summary['enclosed_partition_merges'])} | "
-            f"后处理生效={postprocess_summary['postprocess_changed']}"
-        )
-
-    intermediate_label = (
-        "二次分区后总分区数" if enable_secondary_partition else "单阶段后总分区数"
+    split_partition_count = sum(
+        1 for diagnostic in connectivity_diagnostics if diagnostic["split"]
     )
-    final_label = (
-        "后处理后总分区数"
-        if postprocess_summary["enabled"]
-        else ("二次分区合并后总分区数" if enable_secondary_partition else "单阶段最终总分区数")
+    small_merge_count = int(small_merge_diagnostics.get("merge_count", 0))
+    boundary_dominance_merge_count = int(
+        boundary_dominance_diagnostics.get("merge_count", 0)
     )
-
     print(
         f"[分区] 一级分区数={first_stage_u} | "
-        f"{intermediate_label}={post_secondary_u} | "
-        f"{final_label}={final_u}"
+        f"二次分区合并后总分区数={post_secondary_u} | "
+        f"连通性拆分后总分区数={connected_u} | "
+        f"小面积合并后总分区数={small_merged_u} | "
+        f"边界占比合并后总分区数={final_u} | "
+        f"发生拆分的分区数={split_partition_count} | "
+        f"小面积合并次数={small_merge_count} | "
+        f"边界占比合并次数={boundary_dominance_merge_count}"
     )
     return final_cluster_matrix, final_u
 
