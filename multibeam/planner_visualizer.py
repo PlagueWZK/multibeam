@@ -136,6 +136,7 @@ class SurveyVisualizer:
 
     def save_snapshot(self, path: Path):
         """保存当前画布"""
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.fig.savefig(path, dpi=200, bbox_inches="tight")
 
     def close_figure(self):

@@ -95,7 +95,7 @@ class SurveyPlanner:
         self.current_microstep = self.legacy_microstep
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
-        self.jump_line_gain_threshold = 0.75
+        self.jump_line_gain_threshold = 0.4
         self.max_consecutive_jump_lines = 3
         self.start_point_strategy = str(start_point_strategy).strip().lower()
         self.supported_start_point_strategies = {"deepest", "coordinate_center"}
@@ -374,18 +374,61 @@ class SurveyPlanner:
             )
         return self._select_deepest_partition_start_point(partition_id, rows, cols)
 
-    def _candidate_point_has_value(self, point) -> bool:
+    def _compute_partition_mean_depth(self, partition_id: int) -> float:
+        """计算分区有效网格的平均水深，用于全局规划顺序排序。"""
+
+        partition_id = int(partition_id)
+        partition_mask = (self.cluster_matrix == partition_id) & self.boundary_mask
+        rows, cols = np.where(partition_mask)
+        if len(rows) == 0:
+            rows, cols = np.where(self.cluster_matrix == partition_id)
+        if len(rows) == 0:
+            return float("-inf")
+
+        if self.depth_matrix is not None:
+            depths = np.asarray(self.depth_matrix[rows, cols], dtype=float)
+        else:
+            depths = np.array(
+                [
+                    get_height(float(self.xs[col]), float(self.ys[row]))
+                    for row, col in zip(rows, cols)
+                ],
+                dtype=float,
+            )
+        finite_depths = depths[np.isfinite(depths)]
+        if len(finite_depths) == 0:
+            return float("-inf")
+        return float(np.mean(finite_depths))
+
+    def _order_partition_ids_by_mean_depth(self, partition_ids):
+        mean_depth_by_pid = {
+            int(pid): self._compute_partition_mean_depth(int(pid))
+            for pid in partition_ids
+        }
+        ordered_partition_ids = sorted(
+            [int(pid) for pid in partition_ids],
+            key=lambda pid: (-mean_depth_by_pid[int(pid)], int(pid)),
+        )
+        return ordered_partition_ids, mean_depth_by_pid
+
+    def _candidate_point_has_value(self, point, prior_covered_mask=None) -> bool:
         """全局统计网格驱动的点保留判断。"""
         if self.metrics_state_grid is None:
             return True
-        return self.metrics_state_grid.would_point_add_value(np.asarray(point, dtype=float))
+        return self.metrics_state_grid.would_point_add_value(
+            np.asarray(point, dtype=float), prior_covered_mask=prior_covered_mask
+        )
 
-    def _candidate_segment_has_value(self, start_point, end_point) -> bool:
+    def _candidate_segment_has_value(
+        self, start_point, end_point, prior_covered_mask=None
+    ) -> bool:
         """全局统计网格驱动的线段保留/终止判断。"""
         if self.metrics_state_grid is None:
             return True
         return self.metrics_state_grid.would_segment_add_value(
-            np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
+            np.asarray(start_point, dtype=float),
+            np.asarray(end_point, dtype=float),
+            prior_covered_mask=prior_covered_mask,
         )
 
     @staticmethod
@@ -717,7 +760,7 @@ class SurveyPlanner:
         )
 
     def _compute_perpendicular_candidate_point(
-        self, parent_point, direction, target_partition_id
+        self, parent_point, direction, target_partition_id, prior_covered_mask=None
     ):
         x, y = float(parent_point[0]), float(parent_point[1])
         alpha = float(self._get_alpha(x, y))
@@ -762,7 +805,9 @@ class SurveyPlanner:
         candidate_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
         if not self._is_finite_candidate_point(candidate_point):
             return None, None, "low_value"
-        if not self._candidate_point_has_value(candidate_point):
+        if not self._candidate_point_has_value(
+            candidate_point, prior_covered_mask=prior_covered_mask
+        ):
             return None, None, "low_value"
 
         overlap_rate = self._compute_parent_child_overlap_rate(
@@ -779,7 +824,7 @@ class SurveyPlanner:
         )
 
     def _generate_initial_child_candidates(
-        self, parent_segments, direction, target_partition_id
+        self, parent_segments, direction, target_partition_id, prior_covered_mask=None
     ):
         candidates: list[_ChildLineCandidate] = []
         current_points = []
@@ -806,7 +851,10 @@ class SurveyPlanner:
             for parent_point in parent_arr:
                 candidate_point, overlap_rate, reject_reason = (
                     self._compute_perpendicular_candidate_point(
-                        parent_point, direction, target_partition_id
+                        parent_point,
+                        direction,
+                        target_partition_id,
+                        prior_covered_mask=prior_covered_mask,
                     )
                 )
                 if candidate_point is None:
@@ -820,17 +868,17 @@ class SurveyPlanner:
                 current_points.append(candidate_point)
                 current_rates.append(overlap_rate)
                 valid_points += 1
-                if len(current_points) >= 2:
-                    self._mark_global_segment_covered_for_planning(
-                        current_points[-2], current_points[-1]
-                    )
 
             flush_current_run()
 
         return candidates, valid_points, boundary_rejects, low_value_rejects
 
     def _extend_child_candidate(
-        self, candidate: _ChildLineCandidate, target_partition_id, direction_name
+        self,
+        candidate: _ChildLineCandidate,
+        target_partition_id,
+        direction_name,
+        prior_covered_mask=None,
     ) -> _ChildLineCandidate:
         line = [np.asarray(point, dtype=float) for point in candidate.line]
         if len(line) < 2:
@@ -877,7 +925,9 @@ class SurveyPlanner:
                 anchor_point = line[-1] if extend_front else line[0]
                 if not self._is_finite_candidate_point(new_point):
                     stop_reason = TerminationReason.LOW_VALUE
-                elif not self._candidate_segment_has_value(anchor_point, new_point):
+                elif not self._candidate_segment_has_value(
+                    anchor_point, new_point, prior_covered_mask=prior_covered_mask
+                ):
                     stop_reason = TerminationReason.LOW_VALUE
                 else:
                     stop_reason = TerminationReason.NONE
@@ -900,11 +950,9 @@ class SurveyPlanner:
                 continue
 
             if extend_front:
-                self._mark_global_segment_covered_for_planning(line[-1], new_point)
                 line.append(new_point)
                 front_x, front_y = new_x, new_y
             else:
-                self._mark_global_segment_covered_for_planning(new_point, line[0])
                 line.insert(0, new_point)
                 back_x, back_y = new_x, new_y
 
@@ -921,7 +969,11 @@ class SurveyPlanner:
         return candidate
 
     def _extend_child_group_external_ends(
-        self, candidates: list[_ChildLineCandidate], target_partition_id, direction_name
+        self,
+        candidates: list[_ChildLineCandidate],
+        target_partition_id,
+        direction_name,
+        prior_covered_mask=None,
     ) -> list[_ChildLineCandidate]:
         """仅延伸测线组作为逻辑整体时的两个外端。"""
         candidates = [c for c in candidates if self._line_has_enough_points(c.line)]
@@ -981,7 +1033,9 @@ class SurveyPlanner:
                 new_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
                 if not self._is_finite_candidate_point(new_point):
                     stop_reason = TerminationReason.LOW_VALUE
-                elif not self._candidate_segment_has_value(anchor_point, new_point):
+                elif not self._candidate_segment_has_value(
+                    anchor_point, new_point, prior_covered_mask=prior_covered_mask
+                ):
                     stop_reason = TerminationReason.LOW_VALUE
                 else:
                     stop_reason = TerminationReason.NONE
@@ -1004,11 +1058,9 @@ class SurveyPlanner:
                 continue
 
             if extend_front:
-                self._mark_global_segment_covered_for_planning(anchor_point, new_point)
                 line_lists[front_idx].append(new_point)
                 front_x, front_y = new_x, new_y
             else:
-                self._mark_global_segment_covered_for_planning(new_point, anchor_point)
                 line_lists[back_idx].insert(0, new_point)
                 back_x, back_y = new_x, new_y
 
@@ -1032,15 +1084,26 @@ class SurveyPlanner:
         return candidates
 
     def _generate_candidate_group(
-        self, parent_segments, direction, target_partition_id, direction_name
+        self,
+        parent_segments,
+        direction,
+        target_partition_id,
+        direction_name,
+        prior_covered_mask=None,
     ):
         candidates, valid_points, boundary_rejects, low_value_rejects = (
             self._generate_initial_child_candidates(
-                parent_segments, direction, target_partition_id
+                parent_segments,
+                direction,
+                target_partition_id,
+                prior_covered_mask=prior_covered_mask,
             )
         )
         extended_candidates = self._extend_child_group_external_ends(
-            candidates, target_partition_id, direction_name
+            candidates,
+            target_partition_id,
+            direction_name,
+            prior_covered_mask=prior_covered_mask,
         )
         return extended_candidates, valid_points, boundary_rejects, low_value_rejects
 
@@ -1148,7 +1211,11 @@ class SurveyPlanner:
 
             candidates, valid_points, boundary_rejects, low_value_rejects = (
                 self._generate_candidate_group(
-                    parent_segments, direction, target_partition_id, direction_name
+                    parent_segments,
+                    direction,
+                    target_partition_id,
+                    direction_name,
+                    prior_covered_mask=prior_covered_mask,
                 )
             )
 
@@ -1448,12 +1515,23 @@ class SurveyPlanner:
         lines_dir.mkdir(parents=True, exist_ok=True)
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
-        partition_ids = [
+        detected_partition_ids = [
             int(pid)
             for pid in sorted(np.unique(self.cluster_matrix).astype(int))
             if pid >= 0
         ]
-        print(f"[全局规划] 检测到 {len(partition_ids)} 个分区: {partition_ids}")
+        partition_ids, mean_depth_by_pid = self._order_partition_ids_by_mean_depth(
+            detected_partition_ids
+        )
+        order_desc = ", ".join(
+            f"{pid}(mean_depth={mean_depth_by_pid[pid]:.2f}m)"
+            for pid in partition_ids
+        )
+        print(
+            f"[全局规划] 检测到 {len(detected_partition_ids)} 个分区: "
+            f"{detected_partition_ids}"
+        )
+        print(f"[全局规划] 按平均水深由深到浅规划: [{order_desc}]")
 
         all_results = []
         for pid in partition_ids:
