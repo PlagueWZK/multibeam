@@ -14,7 +14,7 @@ class TerminationReason(Enum):
 
     NONE = auto()  # 未终止
     BOUNDARY = auto()  # 超出分区边界
-    LOW_VALUE = auto()  # 细网格收益不足
+    LOW_VALUE = auto()  # 全局网格收益不足
     SPIRAL = auto()  # 累计偏转角 > 360°
     INTERSECTION = auto()  # 与已有测线相交
     SATURATION = auto()  # 测线收缩至质心内侧覆盖范围内

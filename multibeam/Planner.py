@@ -15,7 +15,6 @@ import numpy as np
 # 从拆分后的模块导入
 from multibeam.coverage_state_grid import (
     GlobalCoverageMetricsGrid,
-    PartitionCoverageStateGrid,
     infer_uniform_cell_size,
 )
 from multibeam.models import (
@@ -94,11 +93,9 @@ class SurveyPlanner:
         self.microstep_max = 70.0
         self.legacy_microstep = 35.0
         self.current_microstep = self.legacy_microstep
-        self.current_partition_grid = None
-        self.partition_state_grids = {}
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
-        self.jump_line_gain_threshold = 0.5
+        self.jump_line_gain_threshold = 0.75
         self.max_consecutive_jump_lines = 3
         self.start_point_strategy = str(start_point_strategy).strip().lower()
         self.supported_start_point_strategies = {"deepest", "coordinate_center"}
@@ -378,18 +375,16 @@ class SurveyPlanner:
         return self._select_deepest_partition_start_point(partition_id, rows, cols)
 
     def _candidate_point_has_value(self, point) -> bool:
-        """细网格状态驱动的点保留判断。"""
-        if self.current_partition_grid is None:
+        """全局统计网格驱动的点保留判断。"""
+        if self.metrics_state_grid is None:
             return True
-        return self.current_partition_grid.would_point_add_value(
-            np.asarray(point, dtype=float)
-        )
+        return self.metrics_state_grid.would_point_add_value(np.asarray(point, dtype=float))
 
     def _candidate_segment_has_value(self, start_point, end_point) -> bool:
-        """细网格状态驱动的线段保留判断。"""
-        if self.current_partition_grid is None:
+        """全局统计网格驱动的线段保留/终止判断。"""
+        if self.metrics_state_grid is None:
             return True
-        return self.current_partition_grid.would_segment_add_value(
+        return self.metrics_state_grid.would_segment_add_value(
             np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
         )
 
@@ -433,13 +428,13 @@ class SurveyPlanner:
         self.all_records.append(record)
 
         if self.metrics_state_grid is not None:
-            self.line_partition_contributions.extend(
-                self.metrics_state_grid.record_polyline_contribution(
-                    pts,
-                    line_id=record.line_id,
-                    owner_partition_id=partition_id,
-                )
+            contributions = self.metrics_state_grid.record_polyline_contribution(
+                pts,
+                line_id=record.line_id,
+                owner_partition_id=partition_id,
             )
+            self.line_partition_contributions.extend(contributions)
+            record.repeated_area = float(sum(c.repeated_area for c in contributions))
 
         self._line_counter += 1
         return record
@@ -520,17 +515,20 @@ class SurveyPlanner:
 
         return float(total_length)
 
-    def _snapshot_current_covered_mask(self):
-        if self.current_partition_grid is None:
+    def _snapshot_global_metrics_state(self):
+        if self.metrics_state_grid is None:
             return None
-        return np.array(self.current_partition_grid.covered_sample_mask, copy=True)
+        return self.metrics_state_grid.snapshot_state()
 
-    def _accumulate_current_partition_repeated_area(self, line, prior_covered_mask) -> float:
-        if self.current_partition_grid is None or prior_covered_mask is None:
-            return 0.0
-        return self.current_partition_grid.accumulate_polyline_repeat_area(
-            line, prior_covered_mask=prior_covered_mask
-        )
+    def _snapshot_global_covered_mask(self):
+        if self.metrics_state_grid is None:
+            return None
+        return np.array(self.metrics_state_grid.covered_sample_mask, copy=True)
+
+    def _restore_global_metrics_state(self, snapshot) -> None:
+        if self.metrics_state_grid is None or snapshot is None:
+            return
+        self.metrics_state_grid.restore_state(snapshot)
 
     def _point_with_width(self, x, y):
         """返回 [x, y, 覆盖宽度(w_total)]。"""
@@ -549,19 +547,19 @@ class SurveyPlanner:
         """使用当前分区的差分步长计算坡度角。"""
         return get_alpha(x, y, microstep=self.current_microstep)
 
-    def _update_current_partition_grid_with_segment(self, start_point, end_point):
-        """将新线段写入当前分区细网格状态。"""
-        if self.current_partition_grid is None:
+    def _mark_global_segment_covered_for_planning(self, start_point, end_point):
+        """规划期临时写入全局覆盖状态；不累计统计指标。"""
+        if self.metrics_state_grid is None:
             return
-        self.current_partition_grid.update_segment(
+        self.metrics_state_grid.mark_segment_covered_for_planning(
             np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
         )
 
-    def _update_current_partition_grid_with_polyline(self, points):
-        """将整条折线写入当前分区细网格状态。"""
-        if self.current_partition_grid is None:
+    def _mark_global_polyline_covered_for_planning(self, points):
+        """规划期临时写入整条测线覆盖状态；不累计统计指标。"""
+        if self.metrics_state_grid is None:
             return
-        self.current_partition_grid.update_polyline(points)
+        self.metrics_state_grid.mark_polyline_covered_for_planning(points)
 
     # ------------------------------------------------------------------
     # 核心测线生成算法
@@ -571,10 +569,10 @@ class SurveyPlanner:
         """
         双向延伸生成主测线
 
-        从起点向正反两个方向交替延伸，按边界与细网格收益决定是否继续。
+        从起点向正反两个方向交替延伸，按当前分区边界与全局网格收益决定是否继续。
         """
+        transaction_snapshot = self._snapshot_global_metrics_state()
         line = [self._point_with_width(start_x, start_y)]
-        prior_covered_mask = self._snapshot_current_covered_mask()
 
         ext_step = step
         ext_loop = 0
@@ -629,21 +627,21 @@ class SurveyPlanner:
             anchor_point = line[-1] if extend_front else line[0]
             if not self._candidate_segment_has_value(anchor_point, new_point):
                 if extend_front:
-                    print(f"  [主测线延伸-前端] 新线段对应细网格收益不足，停止该端")
+                    print(f"  [主测线延伸-前端] 新线段对应全局网格收益不足，停止该端")
                     front_stopped = True
                     front_stop_reason = TerminationReason.LOW_VALUE
                 else:
-                    print(f"  [主测线延伸-后端] 新线段对应细网格收益不足，停止该端")
+                    print(f"  [主测线延伸-后端] 新线段对应全局网格收益不足，停止该端")
                     back_stopped = True
                     back_stop_reason = TerminationReason.LOW_VALUE
                 extend_front = not extend_front
                 continue
 
             if extend_front:
-                self._update_current_partition_grid_with_segment(line[-1], new_point)
+                self._mark_global_segment_covered_for_planning(line[-1], new_point)
                 line.append(new_point)
             else:
-                self._update_current_partition_grid_with_segment(new_point, line[0])
+                self._mark_global_segment_covered_for_planning(new_point, line[0])
                 line.insert(0, new_point)
 
             if extend_front:
@@ -658,7 +656,7 @@ class SurveyPlanner:
             front_stop_reason, back_stop_reason
         )
         status = (
-            "细网格收益终止"
+            "全局网格收益终止"
             if terminated_reason == TerminationReason.LOW_VALUE
             else "边界终止"
         )
@@ -671,104 +669,27 @@ class SurveyPlanner:
             f"[主测线1] 完成 | 共{len(line)}个点 | {status} | "
             f"起点({line[0][0]:.1f},{line[0][1]:.1f}) 终点({line[-1][0]:.1f},{line[-1][1]:.1f})"
         )
-        repeated_area = self._accumulate_current_partition_repeated_area(
-            line, prior_covered_mask
-        )
-        return line, terminated_by, 0.0, 0.0, repeated_area
+        self._restore_global_metrics_state(transaction_snapshot)
+        return line, terminated_by, 0.0, 0.0, 0.0
 
     @staticmethod
     def _line_has_enough_points(line) -> bool:
         return len(np.asarray(line)) >= 2
 
-    def _snapshot_current_partition_state(self):
-        if self.current_partition_grid is None:
-            return None
-        return {
-            "covered_sample_mask": np.array(
-                self.current_partition_grid.covered_sample_mask, copy=True
-            ),
-            "repeated_sample_mask": np.array(
-                self.current_partition_grid.repeated_sample_mask, copy=True
-            ),
-            "cumulative_repeated_area": float(
-                self.current_partition_grid.cumulative_repeated_area
-            ),
-        }
-
-    def _restore_current_partition_state(self, snapshot) -> None:
-        if self.current_partition_grid is None or snapshot is None:
-            return
-        self.current_partition_grid.covered_sample_mask = np.array(
-            snapshot["covered_sample_mask"], copy=True
-        )
-        self.current_partition_grid.repeated_sample_mask = np.array(
-            snapshot["repeated_sample_mask"], copy=True
-        )
-        self.current_partition_grid.cumulative_repeated_area = float(
-            snapshot["cumulative_repeated_area"]
-        )
-
-    def _area_from_current_partition_sample_mask(self, sample_mask) -> float:
-        grid = self.current_partition_grid
-        if grid is None or sample_mask is None or not np.any(sample_mask):
-            return 0.0
-        masked = np.asarray(sample_mask, dtype=bool) & grid.partition_sample_mask
-        sample_counts = np.sum(masked, axis=2)
-        valid_domain_cells = grid.domain_sample_counts > 0
-        ratio_against_domain = np.zeros_like(sample_counts, dtype=float)
-        ratio_against_domain[valid_domain_cells] = (
-            sample_counts[valid_domain_cells]
-            / grid.domain_sample_counts[valid_domain_cells]
-        )
-        return float(np.sum(ratio_against_domain * grid.cell_domain_area))
-
-    def _compute_group_hit_mask(self, lines):
-        if self.current_partition_grid is None:
-            return None
-        hit_mask = np.zeros_like(
-            self.current_partition_grid.partition_sample_mask, dtype=bool
-        )
-        for line in lines:
-            if self._line_has_enough_points(line):
-                hit_mask |= self.current_partition_grid.compute_polyline_hit_mask(line)
-        return hit_mask
-
     def _compute_line_gain_ratio(self, line, prior_covered_mask):
-        if self.current_partition_grid is None or not self._line_has_enough_points(line):
+        if self.metrics_state_grid is None or not self._line_has_enough_points(line):
             return 0.0, 0.0, 0.0
-
-        line_hit_mask = self.current_partition_grid.compute_polyline_hit_mask(line)
-        hit_area = self._area_from_current_partition_sample_mask(line_hit_mask)
-        if hit_area <= 1e-12:
-            return 0.0, 0.0, hit_area
-
-        prior_mask = (
-            np.asarray(prior_covered_mask, dtype=bool)
-            if prior_covered_mask is not None
-            else self.current_partition_grid.covered_sample_mask
+        return self.metrics_state_grid.compute_polyline_gain(
+            line, prior_covered_mask=prior_covered_mask
         )
-        new_mask = line_hit_mask & (~prior_mask)
-        new_area = self._area_from_current_partition_sample_mask(new_mask)
-        return new_area / hit_area, new_area, hit_area
 
     def _compute_group_gain_ratio(self, candidates, prior_covered_mask):
         lines = [candidate.line for candidate in candidates]
-        group_hit_mask = self._compute_group_hit_mask(lines)
-        if group_hit_mask is None:
+        if self.metrics_state_grid is None:
             return 0.0, 0.0, 0.0
-
-        hit_area = self._area_from_current_partition_sample_mask(group_hit_mask)
-        if hit_area <= 1e-12:
-            return 0.0, 0.0, hit_area
-
-        prior_mask = (
-            np.asarray(prior_covered_mask, dtype=bool)
-            if prior_covered_mask is not None
-            else self.current_partition_grid.covered_sample_mask
+        return self.metrics_state_grid.compute_cumulative_polyline_group_gain(
+            lines, prior_covered_mask=prior_covered_mask
         )
-        new_mask = group_hit_mask & (~prior_mask)
-        new_area = self._area_from_current_partition_sample_mask(new_mask)
-        return new_area / hit_area, new_area, hit_area
 
     def _filter_child_candidates_by_segment_gain(self, candidates, prior_covered_mask):
         retained = []
@@ -780,7 +701,7 @@ class SurveyPlanner:
             candidate.gain_ratio = float(gain_ratio)
             candidate.new_area = float(new_area)
             candidate.hit_area = float(hit_area)
-            if hit_area > 1e-12 and gain_ratio >= self.jump_line_gain_threshold:
+            if hit_area > 1e-12 and gain_ratio > self.jump_line_gain_threshold:
                 retained.append(candidate)
             else:
                 filtered.append(candidate)
@@ -900,7 +821,7 @@ class SurveyPlanner:
                 current_rates.append(overlap_rate)
                 valid_points += 1
                 if len(current_points) >= 2:
-                    self._update_current_partition_grid_with_segment(
+                    self._mark_global_segment_covered_for_planning(
                         current_points[-2], current_points[-1]
                     )
 
@@ -979,11 +900,11 @@ class SurveyPlanner:
                 continue
 
             if extend_front:
-                self._update_current_partition_grid_with_segment(line[-1], new_point)
+                self._mark_global_segment_covered_for_planning(line[-1], new_point)
                 line.append(new_point)
                 front_x, front_y = new_x, new_y
             else:
-                self._update_current_partition_grid_with_segment(new_point, line[0])
+                self._mark_global_segment_covered_for_planning(new_point, line[0])
                 line.insert(0, new_point)
                 back_x, back_y = new_x, new_y
 
@@ -1083,11 +1004,11 @@ class SurveyPlanner:
                 continue
 
             if extend_front:
-                self._update_current_partition_grid_with_segment(anchor_point, new_point)
+                self._mark_global_segment_covered_for_planning(anchor_point, new_point)
                 line_lists[front_idx].append(new_point)
                 front_x, front_y = new_x, new_y
             else:
-                self._update_current_partition_grid_with_segment(new_point, anchor_point)
+                self._mark_global_segment_covered_for_planning(new_point, anchor_point)
                 line_lists[back_idx].insert(0, new_point)
                 back_x, back_y = new_x, new_y
 
@@ -1130,28 +1051,13 @@ class SurveyPlanner:
         lines_dir,
         line_counter,
         perp_iter,
-        prior_covered_mask,
     ):
         total_points = 0
-        simulated_prior = (
-            np.array(prior_covered_mask, copy=True)
-            if prior_covered_mask is not None
-            else None
-        )
 
         for segment_index, candidate in enumerate(candidates, start=1):
             line = np.asarray(candidate.line, dtype=float)
             if not self._line_has_enough_points(line):
                 continue
-
-            repeated_area = 0.0
-            if self.current_partition_grid is not None and simulated_prior is not None:
-                repeated_area = self.current_partition_grid.compute_polyline_repeat_area(
-                    line, prior_covered_mask=simulated_prior
-                )
-                self.current_partition_grid.cumulative_repeated_area += repeated_area
-                simulated_prior |= self.current_partition_grid.compute_polyline_hit_mask(line)
-            self._update_current_partition_grid_with_polyline(line)
 
             overlap_excess_length = self._compute_overlap_excess_length(
                 candidate.initial_line, candidate.overlap_rates, threshold=0.2
@@ -1172,7 +1078,6 @@ class SurveyPlanner:
                 terminated_by,
                 overlap_excess_length=overlap_excess_length,
                 max_overlap_eta=max_overlap_eta,
-                repeated_area=repeated_area,
             )
             if record is None:
                 continue
@@ -1230,7 +1135,7 @@ class SurveyPlanner:
 
         while True:
             perp_iter += 1
-            transaction_snapshot = self._snapshot_current_partition_state()
+            transaction_snapshot = self._snapshot_global_metrics_state()
             prior_covered_mask = (
                 np.array(transaction_snapshot["covered_sample_mask"], copy=True)
                 if transaction_snapshot is not None
@@ -1254,7 +1159,7 @@ class SurveyPlanner:
             )
 
             if len(candidates) == 0:
-                self._restore_current_partition_state(transaction_snapshot)
+                self._restore_global_metrics_state(transaction_snapshot)
                 print(
                     f"[{direction_name}扩展] 第{perp_iter}轮无有效子测线，结束规划 | "
                     f"边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
@@ -1265,9 +1170,9 @@ class SurveyPlanner:
                 candidates, prior_covered_mask
             )
             if all_hit_area <= 1e-12:
-                self._restore_current_partition_state(transaction_snapshot)
+                self._restore_global_metrics_state(transaction_snapshot)
                 print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮候选组细网格扫中面积为0，结束规划"
+                    f"[{direction_name}扩展] 第{perp_iter}轮候选组全局扫中面积为0，结束规划"
                 )
                 break
 
@@ -1288,7 +1193,7 @@ class SurveyPlanner:
                 hit_area = all_hit_area
                 decision_candidates = candidates
                 print(
-                    f"[{direction_name}扩展 第{perp_iter}轮] 无单段收益率达到"
+                    f"[{direction_name}扩展 第{perp_iter}轮] 无单段收益率超过"
                     f"{self.jump_line_gain_threshold:.0%}，候选组仅作为跳板评估"
                 )
             else:
@@ -1297,7 +1202,7 @@ class SurveyPlanner:
                     decision_candidates, prior_covered_mask
                 )
 
-            is_jump_group = gain_ratio < self.jump_line_gain_threshold
+            is_jump_group = gain_ratio <= self.jump_line_gain_threshold
             print(
                 f"[{direction_name}扩展 第{perp_iter}轮] 候选组收益率={gain_ratio:.2%} "
                 f"(新增={new_area:.2f}m² / 扫中={hit_area:.2f}m²)"
@@ -1305,10 +1210,10 @@ class SurveyPlanner:
 
             if is_jump_group:
                 consecutive_jump_groups += 1
-                self._restore_current_partition_state(transaction_snapshot)
+                self._restore_global_metrics_state(transaction_snapshot)
                 if consecutive_jump_groups > self.max_consecutive_jump_lines:
                     print(
-                        f"[{direction_name}扩展] 连续第{consecutive_jump_groups}个跳板组仍低于"
+                        f"[{direction_name}扩展] 连续第{consecutive_jump_groups}个跳板组仍未超过"
                         f"{self.jump_line_gain_threshold:.0%}，终止该方向测线生成"
                     )
                     break
@@ -1324,14 +1229,13 @@ class SurveyPlanner:
                 continue
 
             consecutive_jump_groups = 0
-            self._restore_current_partition_state(transaction_snapshot)
+            self._restore_global_metrics_state(transaction_snapshot)
             added_points, line_counter = self._record_retained_child_group(
                 decision_candidates,
                 partition_id,
                 lines_dir,
                 line_counter,
                 perp_iter,
-                prior_covered_mask,
             )
             total_points += added_points
             parent_segments = [candidate.line.copy() for candidate in decision_candidates]
@@ -1379,39 +1283,17 @@ class SurveyPlanner:
                 f"回退到最深网格中心 | depth={start_depth:.2f}m"
             )
 
-        state_grid = PartitionCoverageStateGrid(
-            partition_id,
-            self.xs,
-            self.ys,
-            self.cluster_matrix,
-            theta=self.theta,
-            x_min=self.x_min,
-            x_max=self.x_max,
-            y_min=self.y_min,
-            y_max=self.y_max,
-            boundary_mask=self.boundary_mask,
-            cell_effective_area=self.cell_effective_area,
-            cell_size=self.grid_cell_size,
-            sampling_points=self.fine_grid_sampling_points,
-            full_threshold=self.fine_grid_full_threshold,
-            step_scale=self.step_scale,
-            microstep_min=self.microstep_min,
-            microstep_max=self.microstep_max,
-            legacy_microstep=self.legacy_microstep,
-        )
-        self.partition_state_grids[partition_id] = state_grid
+        initial_summary = self.metrics_state_grid.summarize_partition(partition_id)
 
         previous_step = self.step
         previous_microstep = self.current_microstep
-        previous_partition_grid = self.current_partition_grid
-        self.step = state_grid.planning_step
-        self.current_microstep = state_grid.microstep
-        self.current_partition_grid = state_grid
+        self.step = self.metrics_state_grid.planning_step
+        self.current_microstep = self.metrics_state_grid.microstep
 
         print(
-            f"[分区{partition_id}] 统一网格初始化 | d={state_grid.cell_size:.2f}m | "
+            f"[分区{partition_id}] 全局统计网格视图 | d={self.metrics_state_grid.cell_size:.2f}m | "
             f"step={self.step:.2f}m | microstep={self.current_microstep:.2f}m | "
-            f"cells={state_grid.total_cells}"
+            f"cells={initial_summary.total_cells}"
         )
 
         try:
@@ -1466,7 +1348,7 @@ class SurveyPlanner:
 
             # 保存最终图
             overlay_legend = self.visualizer.draw_fine_grid_overlay(
-                state_grid, show_legend=True
+                self.metrics_state_grid, show_legend=True, partition_id=partition_id
             )
             final_path = lines_dir / "plan_line_final.png"
             handles, labels = self.visualizer.ax.get_legend_handles_labels()
@@ -1482,7 +1364,7 @@ class SurveyPlanner:
 
             save_dot_csv(partition_all_lines, dot_dir)
 
-            coverage_summary = state_grid.summarize()
+            coverage_summary = self.metrics_state_grid.summarize_partition(partition_id)
             self.partition_coverage_summaries[partition_id] = coverage_summary
 
             print(
@@ -1500,7 +1382,6 @@ class SurveyPlanner:
         finally:
             self.step = previous_step
             self.current_microstep = previous_microstep
-            self.current_partition_grid = previous_partition_grid
 
     # ------------------------------------------------------------------
     # 公共 API
@@ -1653,7 +1534,7 @@ class SurveyPlanner:
                     "细网格覆盖面积-新口径(m²)": round(
                         coverage_summary.covered_area if coverage_summary else 0.0, 2
                     ),
-                    "细网格重复测量面积-新口径(m²)": round(
+                    "累计冗余扫测面积-新口径(m²)": round(
                         coverage_summary.repeated_area if coverage_summary else 0.0, 2
                     ),
                     "细网格覆盖率-新口径": (
@@ -1751,15 +1632,15 @@ class SurveyPlanner:
                 "值": round(global_new_covered_area, 2),
             },
             {
-                "指标": "细网格重复测量面积-新口径(m²)",
+                "指标": "累计冗余扫测面积-新口径(m²)",
                 "值": round(global_repeated_area, 2),
             },
-            {"指标": "累积重复率-新口径", "值": f"{repeated_rate:.4%}"},
+            {"指标": "累计冗余扫测率-新口径", "值": f"{repeated_rate:.4%}"},
             {"指标": "细网格覆盖率-新口径", "值": f"{new_coverage_rate:.4%}"},
             {"指标": "细网格漏测率-新口径", "值": f"{new_miss_rate:.4%}"},
             {
                 "指标": "新口径统计说明",
-                "值": "全局统计网格记录所有已保留测线对所有分区的贡献；测线取舍仍只使用当前分区规划网格。",
+                "值": "全局统计网格记录所有已保留测线对所有分区的贡献；测线取舍使用全局网格收益，测线端点仍受当前分区边界约束；跳板测线不绘制、不统计、不提交覆盖。",
             },
             {
                 "指标": "跨分区贡献记录数",
@@ -1800,10 +1681,10 @@ class SurveyPlanner:
                     ),
                     "扫中面积(m²)": round(contribution.hit_area, 2),
                     "新增覆盖面积(m²)": round(contribution.new_area, 2),
-                    "重复测量面积(m²)": round(contribution.repeated_area, 2),
+                    "冗余扫测面积(m²)": round(contribution.repeated_area, 2),
                     "扫中样本数": int(contribution.hit_samples),
                     "新增覆盖样本数": int(contribution.new_samples),
-                    "重复测量样本数": int(contribution.repeated_samples),
+                    "冗余扫测样本数": int(contribution.repeated_samples),
                 }
             )
 
@@ -1817,10 +1698,10 @@ class SurveyPlanner:
                 "是否跨分区贡献",
                 "扫中面积(m²)",
                 "新增覆盖面积(m²)",
-                "重复测量面积(m²)",
+                "冗余扫测面积(m²)",
                 "扫中样本数",
                 "新增覆盖样本数",
-                "重复测量样本数",
+                "冗余扫测样本数",
             ],
         )
 

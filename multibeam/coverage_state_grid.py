@@ -855,6 +855,86 @@ class GlobalCoverageMetricsGrid:
             points_x, points_y, start, end
         )
 
+    def snapshot_state(self) -> dict:
+        """复制全局统计网格状态，用于规划期事务/跳板回滚。"""
+
+        return {
+            "covered_sample_mask": np.array(self.covered_sample_mask, copy=True),
+            "repeated_sample_mask": np.array(self.repeated_sample_mask, copy=True),
+            "cumulative_repeated_area_by_partition": dict(
+                self.cumulative_repeated_area_by_partition
+            ),
+        }
+
+    def restore_state(self, snapshot: dict | None) -> None:
+        """恢复全局统计网格状态。"""
+
+        if snapshot is None:
+            return
+        self.covered_sample_mask = np.array(
+            snapshot["covered_sample_mask"], copy=True
+        )
+        self.repeated_sample_mask = np.array(
+            snapshot["repeated_sample_mask"], copy=True
+        )
+        self.cumulative_repeated_area_by_partition = dict(
+            snapshot["cumulative_repeated_area_by_partition"]
+        )
+
+    def _resolve_prior_covered_mask(
+        self, prior_covered_mask: np.ndarray | None = None
+    ) -> np.ndarray:
+        if prior_covered_mask is None:
+            return self.covered_sample_mask
+        return np.asarray(prior_covered_mask, dtype=bool)
+
+    def compute_segment_hit_mask(self, start: np.ndarray, end: np.ndarray) -> np.ndarray:
+        """计算单段/零长点扫幅在全局有效样本上的命中 mask。"""
+
+        start = np.asarray(start, dtype=float)
+        end = np.asarray(end, dtype=float)
+        hit_mask = np.zeros_like(self.valid_sample_mask, dtype=bool)
+        radius = max(float(start[2]), float(end[2])) / 2.0
+        if radius <= 0:
+            return hit_mask
+
+        x_low = min(float(start[0]), float(end[0])) - radius
+        x_high = max(float(start[0]), float(end[0])) + radius
+        y_low = min(float(start[1]), float(end[1])) - radius
+        y_high = max(float(start[1]), float(end[1])) + radius
+
+        row_start, row_end = self._candidate_index_range(
+            self.y_centers, y_low, y_high
+        )
+        col_start, col_end = self._candidate_index_range(
+            self.x_centers, x_low, x_high
+        )
+        if row_end < row_start or col_end < col_start:
+            return hit_mask
+
+        for i in range(row_start, row_end + 1):
+            for j in range(col_start, col_end + 1):
+                sample_indices = np.where(self.valid_sample_mask[i, j])[0]
+                if len(sample_indices) == 0:
+                    continue
+
+                covered_now = self._points_within_segment_swath(
+                    self.sample_x[i, j, sample_indices],
+                    self.sample_y[i, j, sample_indices],
+                    start,
+                    end,
+                )
+                if np.any(covered_now):
+                    hit_mask[i, j, sample_indices[covered_now]] = True
+
+        return hit_mask
+
+    def compute_point_hit_mask(self, point: np.ndarray) -> np.ndarray:
+        """计算候选点零长扫幅在全局有效样本上的命中 mask。"""
+
+        point_arr = np.asarray(point, dtype=float)
+        return self.compute_segment_hit_mask(point_arr, point_arr)
+
     def compute_polyline_hit_mask(
         self, line: np.ndarray | list[list[float]]
     ) -> np.ndarray:
@@ -864,42 +944,105 @@ class GlobalCoverageMetricsGrid:
             return hit_mask
 
         for start, end in zip(line_arr[:-1], line_arr[1:]):
-            start = np.asarray(start, dtype=float)
-            end = np.asarray(end, dtype=float)
-            radius = max(float(start[2]), float(end[2])) / 2.0
-            if radius <= 0:
-                continue
-
-            x_low = min(float(start[0]), float(end[0])) - radius
-            x_high = max(float(start[0]), float(end[0])) + radius
-            y_low = min(float(start[1]), float(end[1])) - radius
-            y_high = max(float(start[1]), float(end[1])) + radius
-
-            row_start, row_end = self._candidate_index_range(
-                self.y_centers, y_low, y_high
-            )
-            col_start, col_end = self._candidate_index_range(
-                self.x_centers, x_low, x_high
-            )
-            if row_end < row_start or col_end < col_start:
-                continue
-
-            for i in range(row_start, row_end + 1):
-                for j in range(col_start, col_end + 1):
-                    sample_indices = np.where(self.valid_sample_mask[i, j])[0]
-                    if len(sample_indices) == 0:
-                        continue
-
-                    covered_now = self._points_within_segment_swath(
-                        self.sample_x[i, j, sample_indices],
-                        self.sample_y[i, j, sample_indices],
-                        start,
-                        end,
-                    )
-                    if np.any(covered_now):
-                        hit_mask[i, j, sample_indices[covered_now]] = True
+            hit_mask |= self.compute_segment_hit_mask(start, end)
 
         return hit_mask
+
+    def sample_mask_has_new_coverage(
+        self,
+        sample_mask: np.ndarray,
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> bool:
+        prior_mask = self._resolve_prior_covered_mask(prior_covered_mask)
+        return bool(np.any(np.asarray(sample_mask, dtype=bool) & (~prior_mask)))
+
+    def would_point_add_value(
+        self,
+        point: np.ndarray,
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> bool:
+        """候选点收益：零长扫幅内是否存在全局未覆盖样本。"""
+
+        return self.sample_mask_has_new_coverage(
+            self.compute_point_hit_mask(point), prior_covered_mask=prior_covered_mask
+        )
+
+    def would_segment_add_value(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> bool:
+        """候选线段收益：扫幅内是否存在全局未覆盖样本。"""
+
+        return self.sample_mask_has_new_coverage(
+            self.compute_segment_hit_mask(start, end),
+            prior_covered_mask=prior_covered_mask,
+        )
+
+    def compute_polyline_gain(
+        self,
+        line: np.ndarray | list[list[float]],
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> tuple[float, float, float]:
+        """计算单条测线的全局收益率、新增面积、实际扫中面积。"""
+
+        line_hit_mask = self.compute_polyline_hit_mask(line)
+        hit_area = self._area_from_sample_mask(line_hit_mask)
+        if hit_area <= 1e-12:
+            return 0.0, 0.0, hit_area
+
+        prior_mask = self._resolve_prior_covered_mask(prior_covered_mask)
+        new_area = self._area_from_sample_mask(line_hit_mask & (~prior_mask))
+        return float(new_area / hit_area), float(new_area), float(hit_area)
+
+    def compute_cumulative_polyline_group_gain(
+        self,
+        lines: list[np.ndarray],
+        prior_covered_mask: np.ndarray | None = None,
+    ) -> tuple[float, float, float]:
+        """按最终累计冗余口径，逐条模拟测线组收益。"""
+
+        simulated_prior = np.array(
+            self._resolve_prior_covered_mask(prior_covered_mask), copy=True
+        )
+        total_new_area = 0.0
+        total_hit_area = 0.0
+
+        for line in lines:
+            line_arr = np.asarray(line, dtype=float)
+            if len(line_arr) < 2:
+                continue
+            line_hit_mask = self.compute_polyline_hit_mask(line_arr)
+            hit_area = self._area_from_sample_mask(line_hit_mask)
+            if hit_area <= 1e-12:
+                continue
+            new_area = self._area_from_sample_mask(line_hit_mask & (~simulated_prior))
+            total_hit_area += hit_area
+            total_new_area += new_area
+            simulated_prior |= line_hit_mask
+
+        if total_hit_area <= 1e-12:
+            return 0.0, 0.0, total_hit_area
+        return (
+            float(total_new_area / total_hit_area),
+            float(total_new_area),
+            float(total_hit_area),
+        )
+
+    def mark_segment_covered_for_planning(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> None:
+        """规划期临时提交覆盖状态；不累计统计指标。"""
+
+        self.covered_sample_mask |= self.compute_segment_hit_mask(start, end)
+
+    def mark_polyline_covered_for_planning(
+        self, line: np.ndarray | list[list[float]]
+    ) -> None:
+        """规划期临时提交整条测线覆盖状态；不累计统计指标。"""
+
+        self.covered_sample_mask |= self.compute_polyline_hit_mask(line)
 
     def _area_from_sample_mask(self, sample_mask: np.ndarray) -> float:
         if not np.any(sample_mask):

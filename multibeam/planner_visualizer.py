@@ -217,11 +217,13 @@ class SurveyVisualizer:
             ]
         return []
 
-    def draw_fine_grid_overlay(self, state_grid, show_legend=False):
+    def draw_fine_grid_overlay(self, state_grid, show_legend=False, partition_id=None):
         """在当前分区图中叠加细网格状态。"""
         if self.ax is None:
             return []
-        return self._draw_fine_grid_overlay_on_ax(self.ax, state_grid, show_legend)
+        return self._draw_fine_grid_overlay_on_ax(
+            self.ax, state_grid, show_legend, partition_id=partition_id
+        )
 
     def _setup_global_ax(self, title: str):
         fig = plt.figure(figsize=(16, 12))
