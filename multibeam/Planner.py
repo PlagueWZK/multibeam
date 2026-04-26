@@ -75,7 +75,7 @@ class SurveyPlanner:
         grid_cell_size=None,
         depth_matrix=None,
         start_point_strategy="deepest",
-        jump_line_gain_threshold=0.5,
+        jump_line_gain_threshold=0.75,
     ):
         self.xs = xs
         self.ys = ys

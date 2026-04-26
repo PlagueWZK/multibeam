@@ -49,11 +49,10 @@ if __name__ == "__main__":
     START_POINT_LABEL = "geocenter"
     SECONDARY_DIRECTION_DISPERSION_THRESHOLD = 0.20
     SECONDARY_THRESHOLD_LABEL = "sec0p2"
-    LINE_GAIN_THRESHOLD = 0.50
-    LINE_GAIN_THRESHOLD_LABEL = "gain-threshold-0p5"
-    TARGET_PARTITION_ID = 1
+    LINE_GAIN_THRESHOLD = 0.75
+    LINE_GAIN_THRESHOLD_LABEL = "gain-threshold-0p75"
     REFERENCE_POINT = (1000.0, 5000.0)
-    PLANNING_SCOPE_LABEL = "partition-1_pt1000-5000"
+    PLANNING_SCOPE_LABEL = "point-1000-5000_partition-auto"
     output_base = (
         f"./multibeam/output/{current_time}_covg_"
         f"{PRIMARY_FEATURE_LABEL}_{SECONDARY_FEATURE_LABEL}_{START_POINT_LABEL}_"
@@ -99,20 +98,14 @@ if __name__ == "__main__":
         y_max=Y_MAX,
     )
     print(
-        "[主流程] 单分区规划范围 | "
-        f"目标分区={TARGET_PARTITION_ID} | "
+        "[主流程] 单点所在分区规划范围 | "
         f"参考点=({REFERENCE_POINT[0]:.1f}, {REFERENCE_POINT[1]:.1f}) | "
         f"参考点所属分区={reference_partition_id}"
     )
-    if reference_partition_id != TARGET_PARTITION_ID:
-        print(
-            "[主流程][提示] 参考点所属分区与目标分区不一致；"
-            "本次仍按用户指定仅规划目标分区。"
-        )
 
     from multibeam.Planner import SurveyPlanner
 
-    print("[主流程] 当前轮次将仅执行单分区测线规划。")
+    print("[主流程] 当前轮次将仅执行参考点所在分区测线规划。")
     planner = SurveyPlanner(
         xs,
         ys,
@@ -128,5 +121,5 @@ if __name__ == "__main__":
         start_point_strategy=START_POINT_STRATEGY,
         jump_line_gain_threshold=LINE_GAIN_THRESHOLD,
     )
-    planner.plan_partition(TARGET_PARTITION_ID, output_dir=output_base)
+    planner.plan_line(REFERENCE_POINT[0], REFERENCE_POINT[1], output_dir=output_base)
     # planner.plan_all(output_dir=output_base)
