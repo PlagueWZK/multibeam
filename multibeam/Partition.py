@@ -824,9 +824,14 @@ def _summarize_partition_gradient_complexity(
     unit_gy_matrix,
     direction_valid_mask,
     min_partition_size_for_secondary=12,
-    direction_dispersion_threshold=0.30,
+    partition_area=0.0,
+    total_area=0.0,
+    min_partition_area_ratio_for_secondary=0.05,
 ):
     cell_count = int(np.count_nonzero(partition_mask))
+    partition_area = float(partition_area)
+    total_area = float(total_area)
+    area_ratio = float(partition_area / total_area) if total_area > 0 else 0.0
 
     gx_values = gx_matrix[partition_mask]
     gy_values = gy_matrix[partition_mask]
@@ -848,26 +853,143 @@ def _summarize_partition_gradient_complexity(
         mean_resultant_length = float(np.hypot(np.mean(ux), np.mean(uy)))
         direction_dispersion = float(max(0.0, 1.0 - mean_resultant_length))
 
-    trigger_reasons = []
+    candidate_reject_reasons = []
     if cell_count < min_partition_size_for_secondary:
-        trigger_reasons.append("too_small_for_secondary")
-        triggered = False
-    else:
-        if direction_dispersion >= direction_dispersion_threshold:
-            trigger_reasons.append("direction_dispersion")
-        triggered = bool(trigger_reasons)
+        candidate_reject_reasons.append("too_small_for_secondary")
+    if total_area <= 0:
+        candidate_reject_reasons.append("invalid_total_area_for_secondary")
+    elif area_ratio < min_partition_area_ratio_for_secondary:
+        candidate_reject_reasons.append("area_below_secondary_min")
+
+    secondary_candidate = not candidate_reject_reasons
 
     return {
         "partition_id": int(partition_id),
         "cell_count": cell_count,
+        "area": partition_area,
+        "area_ratio": area_ratio,
         "direction_points": direction_points,
         "mean_gradient_magnitude": mean_magnitude,
         "std_gradient_magnitude": std_magnitude,
         "unit_like_gradient": unit_like_gradient,
         "mean_resultant_length": mean_resultant_length,
         "direction_dispersion": direction_dispersion,
-        "triggered_secondary_partition": triggered,
-        "trigger_reasons": trigger_reasons,
+        "secondary_candidate": bool(secondary_candidate),
+        "candidate_reject_reasons": candidate_reject_reasons,
+        "effective_direction_dispersion_threshold": None,
+        "trigger_comparison": "direction_dispersion > effective_direction_dispersion_threshold",
+        "triggered_secondary_partition": False,
+        "trigger_reasons": list(candidate_reject_reasons),
+    }
+
+
+def _resolve_adaptive_secondary_trigger_rule(
+    diagnostics,
+    minimum_direction_dispersion_threshold=0.10,
+):
+    """基于候选分区离散度最大间隔，计算本轮二次分区自适应阈值。"""
+    minimum_direction_dispersion_threshold = float(
+        minimum_direction_dispersion_threshold
+    )
+    if minimum_direction_dispersion_threshold < 0:
+        raise ValueError(
+            "minimum_direction_dispersion_threshold 必须 >= 0，当前为 "
+            f"{minimum_direction_dispersion_threshold}"
+        )
+
+    candidate_diagnostics = [
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.get("secondary_candidate", False)
+    ]
+    sorted_candidates = sorted(
+        candidate_diagnostics,
+        key=lambda diagnostic: (
+            float(diagnostic["direction_dispersion"]),
+            int(diagnostic["partition_id"]),
+        ),
+    )
+    sorted_dispersions = [
+        float(diagnostic["direction_dispersion"])
+        for diagnostic in sorted_candidates
+    ]
+
+    effective_threshold = minimum_direction_dispersion_threshold
+    threshold_source = "minimum_direction_dispersion_threshold"
+    max_gap = None
+    gap_lower_value = None
+    gap_upper_value = None
+    gap_midpoint = None
+
+    if len(sorted_dispersions) == 0:
+        threshold_method = "no_secondary_candidate"
+    elif len(sorted_dispersions) == 1:
+        threshold_method = "single_candidate_minimum_threshold"
+    else:
+        gaps = np.diff(np.asarray(sorted_dispersions, dtype=float))
+        max_gap_index = int(np.argmax(gaps))
+        max_gap = float(gaps[max_gap_index])
+        gap_lower_value = float(sorted_dispersions[max_gap_index])
+        gap_upper_value = float(sorted_dispersions[max_gap_index + 1])
+        gap_midpoint = float((gap_lower_value + gap_upper_value) / 2.0)
+        effective_threshold = float(
+            max(minimum_direction_dispersion_threshold, gap_midpoint)
+        )
+        threshold_source = (
+            "max_gap_midpoint"
+            if gap_midpoint >= minimum_direction_dispersion_threshold
+            else "minimum_direction_dispersion_threshold"
+        )
+        threshold_method = "adaptive_max_gap_midpoint"
+
+    triggered_partition_ids = []
+    for diagnostic in diagnostics:
+        diagnostic["effective_direction_dispersion_threshold"] = float(
+            effective_threshold
+        )
+        if not diagnostic.get("secondary_candidate", False):
+            diagnostic["triggered_secondary_partition"] = False
+            diagnostic["trigger_reasons"] = list(
+                diagnostic.get("candidate_reject_reasons", [])
+            )
+            continue
+
+        if float(diagnostic["direction_dispersion"]) > effective_threshold:
+            diagnostic["triggered_secondary_partition"] = True
+            diagnostic["trigger_reasons"] = ["direction_dispersion_adaptive"]
+            triggered_partition_ids.append(int(diagnostic["partition_id"]))
+        else:
+            diagnostic["triggered_secondary_partition"] = False
+            diagnostic["trigger_reasons"] = [
+                "direction_dispersion_below_adaptive_threshold"
+            ]
+
+    return {
+        "threshold_mode": "adaptive_max_gap",
+        "threshold_method": threshold_method,
+        "threshold_source": threshold_source,
+        "minimum_direction_dispersion_threshold": float(
+            minimum_direction_dispersion_threshold
+        ),
+        "effective_direction_dispersion_threshold": float(effective_threshold),
+        "candidate_count": int(len(sorted_candidates)),
+        "candidate_partition_ids": [
+            int(diagnostic["partition_id"]) for diagnostic in sorted_candidates
+        ],
+        "sorted_candidate_dispersions": [
+            {
+                "partition_id": int(diagnostic["partition_id"]),
+                "direction_dispersion": float(diagnostic["direction_dispersion"]),
+                "area_ratio": float(diagnostic["area_ratio"]),
+            }
+            for diagnostic in sorted_candidates
+        ],
+        "max_gap": max_gap,
+        "gap_lower_value": gap_lower_value,
+        "gap_upper_value": gap_upper_value,
+        "gap_midpoint": gap_midpoint,
+        "trigger_comparison": "direction_dispersion > effective_direction_dispersion_threshold",
+        "triggered_partition_ids": triggered_partition_ids,
     }
 
 
@@ -879,7 +1001,9 @@ def _write_secondary_partition_diagnostics(
     diagnostics,
     direction_dispersion_threshold,
     min_partition_size_for_secondary,
+    min_partition_area_ratio_for_secondary,
     secondary_k_max,
+    secondary_trigger_rule,
 ):
     if output_dir is None:
         return
@@ -893,9 +1017,49 @@ def _write_secondary_partition_diagnostics(
         "first_stage_u": int(first_stage_u),
         "final_u": int(final_u),
         "secondary_detection_thresholds": {
-            "direction_dispersion_threshold": float(direction_dispersion_threshold),
+            "threshold_mode": secondary_trigger_rule.get(
+                "threshold_mode", "adaptive_max_gap"
+            ),
+            "threshold_method": secondary_trigger_rule.get("threshold_method"),
+            "threshold_source": secondary_trigger_rule.get("threshold_source"),
+            "direction_dispersion_threshold": float(
+                secondary_trigger_rule.get(
+                    "effective_direction_dispersion_threshold",
+                    direction_dispersion_threshold,
+                )
+            ),
+            "minimum_direction_dispersion_threshold": float(
+                direction_dispersion_threshold
+            ),
+            "effective_direction_dispersion_threshold": float(
+                secondary_trigger_rule.get(
+                    "effective_direction_dispersion_threshold",
+                    direction_dispersion_threshold,
+                )
+            ),
+            "min_partition_area_ratio_for_secondary": float(
+                min_partition_area_ratio_for_secondary
+            ),
             "min_partition_size_for_secondary": int(min_partition_size_for_secondary),
             "secondary_k_max": int(secondary_k_max),
+            "candidate_count": int(secondary_trigger_rule.get("candidate_count", 0)),
+            "candidate_partition_ids": secondary_trigger_rule.get(
+                "candidate_partition_ids", []
+            ),
+            "sorted_candidate_dispersions": secondary_trigger_rule.get(
+                "sorted_candidate_dispersions", []
+            ),
+            "max_gap": secondary_trigger_rule.get("max_gap"),
+            "gap_lower_value": secondary_trigger_rule.get("gap_lower_value"),
+            "gap_upper_value": secondary_trigger_rule.get("gap_upper_value"),
+            "gap_midpoint": secondary_trigger_rule.get("gap_midpoint"),
+            "trigger_comparison": secondary_trigger_rule.get(
+                "trigger_comparison",
+                "direction_dispersion > effective_direction_dispersion_threshold",
+            ),
+            "triggered_partition_ids": secondary_trigger_rule.get(
+                "triggered_partition_ids", []
+            ),
         },
         "partitions": diagnostics,
     }
@@ -971,7 +1135,8 @@ def partition_coverage_matrix(
     primary_feature_mode="coverage_only",
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
-    direction_dispersion_threshold=0.30,
+    direction_dispersion_threshold=0.10,
+    min_partition_area_ratio_for_secondary=0.05,
     connectivity=4,
     cell_effective_area=None,
     merge_small_partitions=True,
@@ -994,6 +1159,8 @@ def partition_coverage_matrix(
         gx_matrix, gy_matrix: 梯度矩阵；若提供则复用 Coverage 阶段预计算结果
         primary_feature_mode: 一级分区特征模式。xy_coverage_depth 表示 X/Y/覆盖次数/深度
         depth_matrix: 深度矩阵；primary_feature_mode=xy_coverage_depth 时必须提供
+        direction_dispersion_threshold: 自适应二次分区触发的最低有效方向离散度阈值
+        min_partition_area_ratio_for_secondary: 二次分区候选最小面积占比，默认 0.05 表示总待测海域的 5%
         connectivity: 分区后处理的连通性定义。默认 4 表示边连通；8 表示边或角连通
         cell_effective_area: 每个网格在待测海域内的真实有效面积；提供时用于小面积分区合并
         merge_small_partitions: 是否在连通性拆分后合并小于阈值的小面积分区
@@ -1030,6 +1197,11 @@ def partition_coverage_matrix(
 
     if not np.any(valid_mask_1d):
         raise ValueError("无有效海域网格可用于聚类，请检查 boundary_mask。")
+    if min_partition_area_ratio_for_secondary < 0:
+        raise ValueError(
+            "min_partition_area_ratio_for_secondary 必须 >= 0，当前为 "
+            f"{min_partition_area_ratio_for_secondary}"
+        )
 
     print(
         "[分区] 一级分区特征 = "
@@ -1065,6 +1237,20 @@ def partition_coverage_matrix(
     merged_cluster_matrix = np.full_like(first_stage_cluster_matrix, -1, dtype=int)
     diagnostics = []
     next_global_id = 0
+    secondary_area_matrix, secondary_area_source = _build_partition_area_matrix(
+        first_stage_cluster_matrix,
+        cell_effective_area=cell_effective_area,
+    )
+    secondary_total_area = float(
+        np.sum(secondary_area_matrix[first_stage_cluster_matrix >= 0])
+    )
+    secondary_min_area = float(
+        secondary_total_area * min_partition_area_ratio_for_secondary
+    )
+    first_stage_partition_areas = _calculate_partition_areas(
+        first_stage_cluster_matrix,
+        secondary_area_matrix,
+    )
     partition_ids = [
         int(pid)
         for pid in sorted(np.unique(first_stage_cluster_matrix).astype(int))
@@ -1081,12 +1267,40 @@ def partition_coverage_matrix(
             unit_gy_matrix,
             direction_valid_mask,
             min_partition_size_for_secondary=min_partition_size_for_secondary,
-            direction_dispersion_threshold=direction_dispersion_threshold,
+            partition_area=first_stage_partition_areas.get(partition_id, 0.0),
+            total_area=secondary_total_area,
+            min_partition_area_ratio_for_secondary=(
+                min_partition_area_ratio_for_secondary
+            ),
         )
+        diagnostics.append(diagnostic)
+
+    secondary_trigger_rule = _resolve_adaptive_secondary_trigger_rule(
+        diagnostics,
+        minimum_direction_dispersion_threshold=direction_dispersion_threshold,
+    )
+
+    print(
+        "[分区检测] 自适应二次触发 | "
+        f"面积口径={secondary_area_source} | "
+        f"最低有效离散阈值={direction_dispersion_threshold:.3f} | "
+        f"有效阈值={secondary_trigger_rule['effective_direction_dispersion_threshold']:.3f} | "
+        f"候选最小面积={secondary_min_area:.2f} "
+        f"({min_partition_area_ratio_for_secondary:.2%}) | "
+        f"候选数={secondary_trigger_rule['candidate_count']} | "
+        f"触发分区={secondary_trigger_rule['triggered_partition_ids']}"
+    )
+
+    for diagnostic in diagnostics:
+        partition_id = int(diagnostic["partition_id"])
+        partition_mask = first_stage_cluster_matrix == partition_id
 
         print(
             f"[分区检测] 一级分区{partition_id} | cells={diagnostic['cell_count']} | "
+            f"area_ratio={diagnostic['area_ratio']:.2%} | "
             f"dispersion={diagnostic['direction_dispersion']:.3f} | "
+            f"effective_threshold={diagnostic['effective_direction_dispersion_threshold']:.3f} | "
+            f"candidate={diagnostic['secondary_candidate']} | "
             f"unit_like={diagnostic['unit_like_gradient']} | "
             f"二次分区={diagnostic['triggered_secondary_partition']} | "
             f"reasons={diagnostic['trigger_reasons']}"
@@ -1129,8 +1343,6 @@ def partition_coverage_matrix(
             diagnostic["secondary_partition_count"] = 1
             merged_cluster_matrix[partition_mask] = next_global_id
             next_global_id += 1
-
-        diagnostics.append(diagnostic)
 
     post_secondary_cluster_matrix, post_secondary_u = _renumber_cluster_matrix(
         merged_cluster_matrix
@@ -1242,7 +1454,9 @@ def partition_coverage_matrix(
         diagnostics,
         direction_dispersion_threshold,
         min_partition_size_for_secondary,
+        min_partition_area_ratio_for_secondary,
         secondary_k_max,
+        secondary_trigger_rule,
     )
     _write_connectivity_partition_diagnostics(
         output_dir,

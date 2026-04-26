@@ -47,8 +47,9 @@ if __name__ == "__main__":
     SECONDARY_FEATURE_LABEL = "grad"
     START_POINT_STRATEGY = "geometric_center"
     START_POINT_LABEL = "geocenter"
-    SECONDARY_DIRECTION_DISPERSION_THRESHOLD = 0.20
-    SECONDARY_THRESHOLD_LABEL = "sec0p2"
+    SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD = 0.10
+    SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY = 0.05
+    SECONDARY_THRESHOLD_LABEL = "sec-adaptive-min0p1-area5pct"
     LINE_GAIN_THRESHOLD = 0.75
     LINE_GAIN_THRESHOLD_LABEL = "gain-threshold-0p75"
     REFERENCE_POINT = (1000.0, 5000.0)
@@ -63,7 +64,9 @@ if __name__ == "__main__":
         "[主流程] 当前配置 | "
         f"一级分区特征={PRIMARY_FEATURE_MODE} | "
         f"二级分区特征=gradient-direction | "
-        f"二次触发阈值={SECONDARY_DIRECTION_DISPERSION_THRESHOLD:.2f} | "
+        "二次触发规则=adaptive-maxgap | "
+        f"最低有效离散阈值={SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD:.2f} | "
+        f"候选最小面积占比={SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY:.0%} | "
         f"起点策略={START_POINT_STRATEGY} | "
         f"测线取舍收益率阈值={LINE_GAIN_THRESHOLD:.0%}"
     )
@@ -80,7 +83,8 @@ if __name__ == "__main__":
         gy_matrix=gy_matrix,
         depth_matrix=depth_matrix,
         primary_feature_mode=PRIMARY_FEATURE_MODE,
-        direction_dispersion_threshold=SECONDARY_DIRECTION_DISPERSION_THRESHOLD,
+        direction_dispersion_threshold=SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD,
+        min_partition_area_ratio_for_secondary=SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY,
         cell_effective_area=coarse_cell_effective_area,
     )
 
