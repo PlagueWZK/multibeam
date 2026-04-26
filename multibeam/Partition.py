@@ -11,6 +11,7 @@ from tool.Data import get_gx, get_gy
 PRIMARY_FEATURES_BY_MODE = {
     "xy_coverage": ("X", "Y", "coverage_count"),
     "xy_coverage_depth": ("X", "Y", "coverage_count", "depth"),
+    "coverage_depth": ("coverage_count", "depth"),
     "coverage_only": ("coverage_count",),
 }
 SECONDARY_FEATURE_NAMES = ("ux", "uy")
@@ -107,7 +108,7 @@ def _build_feature_stacks(
         and depth_matrix is None
     ):
         raise ValueError(
-            "一级分区特征模式 xy_coverage_depth 需要提供 depth_matrix。"
+            f"一级分区特征模式 {primary_feature_mode} 需要提供 depth_matrix。"
         )
 
     if gx_matrix is not None or gy_matrix is not None:
@@ -157,6 +158,9 @@ def _build_feature_stacks(
         feature_y = grid_y.flatten().reshape(-1, 1)
         feature_depth = depth_matrix.flatten().reshape(-1, 1)
         primary_features = np.hstack((feature_x, feature_y, feature_c, feature_depth))
+    elif primary_feature_mode == "coverage_depth":
+        feature_depth = depth_matrix.flatten().reshape(-1, 1)
+        primary_features = np.hstack((feature_c, feature_depth))
     else:
         primary_features = feature_c
 
