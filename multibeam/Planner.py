@@ -75,6 +75,7 @@ class SurveyPlanner:
         grid_cell_size=None,
         depth_matrix=None,
         start_point_strategy="deepest",
+        jump_line_gain_threshold=0.5,
     ):
         self.xs = xs
         self.ys = ys
@@ -95,10 +96,19 @@ class SurveyPlanner:
         self.current_microstep = self.legacy_microstep
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
-        self.jump_line_gain_threshold = 0.4
+        self.jump_line_gain_threshold = float(jump_line_gain_threshold)
+        if not 0.0 <= self.jump_line_gain_threshold <= 1.0:
+            raise ValueError(
+                "测线取舍收益率阈值必须位于 [0, 1] 区间："
+                f"{jump_line_gain_threshold}"
+            )
         self.max_consecutive_jump_lines = 3
         self.start_point_strategy = str(start_point_strategy).strip().lower()
-        self.supported_start_point_strategies = {"deepest", "coordinate_center"}
+        self.supported_start_point_strategies = {
+            "deepest",
+            "coordinate_center",
+            "geometric_center",
+        }
         if self.start_point_strategy not in self.supported_start_point_strategies:
             raise ValueError(
                 "不支持的起点选择策略："
@@ -335,8 +345,11 @@ class SurveyPlanner:
             "strategy": "deepest",
         }
 
-    def _select_coordinate_center_partition_start_point(self, partition_id, rows, cols):
-        """选择最接近分区有效网格坐标中心的网格中心作为起始点。"""
+    def _select_coordinate_center_partition_start_point(
+        self, partition_id, rows, cols, strategy="coordinate_center"
+    ):
+        """选择最接近分区有效网格坐标/几何中心的网格中心作为起始点。"""
+        strategy = str(strategy).strip().lower()
         valid_rows, valid_cols = self._get_valid_partition_cells(
             partition_id, rows, cols
         )
@@ -351,6 +364,11 @@ class SurveyPlanner:
         start_x = float(self.xs[start_col])
         start_y = float(self.ys[start_row])
         start_depth = float(self._get_depth_at_cells([start_row], [start_col])[0])
+        rule = (
+            "geometric_center_nearest_cell"
+            if strategy == "geometric_center"
+            else "coordinate_center_nearest_cell"
+        )
         return {
             "x": start_x,
             "y": start_y,
@@ -361,16 +379,16 @@ class SurveyPlanner:
             "boundary_distance": None,
             "boundary_depth": None,
             "delta_r": None,
-            "rule": "coordinate_center_nearest_cell",
-            "strategy": "coordinate_center",
+            "rule": rule,
+            "strategy": strategy,
             "target_center_x": center_x,
             "target_center_y": center_y,
         }
 
     def _select_partition_start_point(self, partition_id, rows, cols):
-        if self.start_point_strategy == "coordinate_center":
+        if self.start_point_strategy in {"coordinate_center", "geometric_center"}:
             return self._select_coordinate_center_partition_start_point(
-                partition_id, rows, cols
+                partition_id, rows, cols, strategy=self.start_point_strategy
             )
         return self._select_deepest_partition_start_point(partition_id, rows, cols)
 
@@ -1338,10 +1356,18 @@ class SurveyPlanner:
                 f"最深可行网格中心 | depth={start_depth:.2f}m | "
                 f"distance={start_info['boundary_distance']:.2f}m | Δr={start_info['delta_r']:.2f}m"
             )
-        elif start_info["rule"] == "coordinate_center_nearest_cell":
+        elif start_info["rule"] in {
+            "coordinate_center_nearest_cell",
+            "geometric_center_nearest_cell",
+        }:
+            center_label = (
+                "分区几何中心最近网格中心"
+                if start_info["rule"] == "geometric_center_nearest_cell"
+                else "坐标中心最近网格中心"
+            )
             print(
                 f"[分区{partition_id}] 开始规划 | 起点: ({start_x:.1f}, {start_y:.1f}) | "
-                f"坐标中心最近网格中心 | depth={start_depth:.2f}m | "
+                f"{center_label} | depth={start_depth:.2f}m | "
                 f"target=({start_info['target_center_x']:.1f}, {start_info['target_center_y']:.1f})"
             )
         else:
@@ -1456,8 +1482,36 @@ class SurveyPlanner:
 
     def plan_line(self, start_x, start_y, output_dir=None):
         """单分区测线规划"""
+        target_partition_id = get_partition_for_point(
+            start_x,
+            start_y,
+            self.xs,
+            self.ys,
+            self.cluster_matrix,
+            x_min=self.x_min,
+            x_max=self.x_max,
+            y_min=self.y_min,
+            y_max=self.y_max,
+        )
+        print(
+            f"[单分区规划] 参考点 ({float(start_x):.1f}, {float(start_y):.1f}) "
+            f"映射到分区 {target_partition_id}"
+        )
+        return self.plan_partition(target_partition_id, output_dir=output_dir)
+
+    def plan_partition(self, partition_id, output_dir=None):
+        """按明确分区 ID 执行单分区测线规划。"""
         if output_dir is None:
             output_dir = "./multibeam/output"
+
+        target_partition_id = int(partition_id)
+        available_partition_ids = {
+            int(pid) for pid in np.unique(self.cluster_matrix).astype(int) if pid >= 0
+        }
+        if target_partition_id not in available_partition_ids:
+            raise ValueError(
+                f"目标分区 {target_partition_id} 不存在，可选={sorted(available_partition_ids)}"
+            )
 
         output_path = Path(output_dir)
         is_timestamped = self._is_timestamped_output_name(output_path.name)
@@ -1473,16 +1527,9 @@ class SurveyPlanner:
         lines_dir.mkdir(parents=True, exist_ok=True)
         metrics_dir.mkdir(parents=True, exist_ok=True)
 
-        target_partition_id = get_partition_for_point(
-            start_x,
-            start_y,
-            self.xs,
-            self.ys,
-            self.cluster_matrix,
-            x_min=self.x_min,
-            x_max=self.x_max,
-            y_min=self.y_min,
-            y_max=self.y_max,
+        print(
+            f"[单分区规划] 仅规划分区 {target_partition_id} | "
+            f"测线取舍收益率阈值={self.jump_line_gain_threshold:.0%}"
         )
 
         pid_dir = lines_dir / str(target_partition_id)
@@ -1597,6 +1644,11 @@ class SurveyPlanner:
             overlap_excess_length = sum(r.overlap_excess_length for r in recs)
             max_overlap_eta = max((r.max_overlap_eta for r in recs), default=0.0)
             coverage_summary = self.partition_coverage_summaries.get(pid)
+            repeated_rate = 0.0
+            if coverage_summary and coverage_summary.total_area > 0:
+                repeated_rate = (
+                    coverage_summary.repeated_area / coverage_summary.total_area
+                )
 
             partition_rows.append(
                 {
@@ -1615,6 +1667,7 @@ class SurveyPlanner:
                     "累计冗余扫测面积-新口径(m²)": round(
                         coverage_summary.repeated_area if coverage_summary else 0.0, 2
                     ),
+                    "累计冗余扫测率-新口径": f"{repeated_rate:.4%}",
                     "细网格覆盖率-新口径": (
                         f"{coverage_summary.coverage_rate:.4%}"
                         if coverage_summary

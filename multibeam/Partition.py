@@ -10,6 +10,7 @@ from tool.Data import get_gx, get_gy
 
 PRIMARY_FEATURES_BY_MODE = {
     "xy_coverage": ("X", "Y", "coverage_count"),
+    "xy_coverage_depth": ("X", "Y", "coverage_count", "depth"),
     "coverage_only": ("coverage_count",),
 }
 SECONDARY_FEATURE_NAMES = ("ux", "uy")
@@ -83,6 +84,7 @@ def _build_feature_stacks(
     gx_matrix=None,
     gy_matrix=None,
     primary_feature_mode="coverage_only",
+    depth_matrix=None,
 ):
     rows, cols = coverage_matrix.shape
     grid_x, grid_y = np.meshgrid(xs, ys)
@@ -91,6 +93,21 @@ def _build_feature_stacks(
         raise ValueError(
             "不支持的一级分区特征模式："
             f"{primary_feature_mode}，可选={tuple(PRIMARY_FEATURES_BY_MODE)}"
+        )
+
+    if depth_matrix is not None:
+        depth_matrix = np.asarray(depth_matrix, dtype=float)
+        if depth_matrix.shape != (rows, cols):
+            raise ValueError(
+                "提供的深度矩阵尺寸与 coverage_matrix 不一致："
+                f"coverage={coverage_matrix.shape}, depth={depth_matrix.shape}"
+            )
+    if (
+        "depth" in PRIMARY_FEATURES_BY_MODE[primary_feature_mode]
+        and depth_matrix is None
+    ):
+        raise ValueError(
+            "一级分区特征模式 xy_coverage_depth 需要提供 depth_matrix。"
         )
 
     if gx_matrix is not None or gy_matrix is not None:
@@ -135,6 +152,11 @@ def _build_feature_stacks(
         feature_x = grid_x.flatten().reshape(-1, 1)
         feature_y = grid_y.flatten().reshape(-1, 1)
         primary_features = np.hstack((feature_x, feature_y, feature_c))
+    elif primary_feature_mode == "xy_coverage_depth":
+        feature_x = grid_x.flatten().reshape(-1, 1)
+        feature_y = grid_y.flatten().reshape(-1, 1)
+        feature_depth = depth_matrix.flatten().reshape(-1, 1)
+        primary_features = np.hstack((feature_x, feature_y, feature_c, feature_depth))
     else:
         primary_features = feature_c
 
@@ -957,6 +979,7 @@ def partition_coverage_matrix(
     merge_boundary_dominance_partitions=True,
     boundary_partition_area_ratio=0.10,
     boundary_contact_ratio_threshold=0.50,
+    depth_matrix=None,
 ):
     """
     对覆盖次数矩阵进行 K-means 空间聚类并可视化边界
@@ -968,6 +991,9 @@ def partition_coverage_matrix(
         k_max: Elbow 法则搜索的最大簇数（仅在 U=None 时生效）
         output_dir: 输出目录路径。若传入则保存分区图到 output_dir/partition/，否则保存到默认路径
         boundary_mask: 有效海域掩码。若提供，则仅对有效格聚类，其余位置标记为 -1
+        gx_matrix, gy_matrix: 梯度矩阵；若提供则复用 Coverage 阶段预计算结果
+        primary_feature_mode: 一级分区特征模式。xy_coverage_depth 表示 X/Y/覆盖次数/深度
+        depth_matrix: 深度矩阵；primary_feature_mode=xy_coverage_depth 时必须提供
         connectivity: 分区后处理的连通性定义。默认 4 表示边连通；8 表示边或角连通
         cell_effective_area: 每个网格在待测海域内的真实有效面积；提供时用于小面积分区合并
         merge_small_partitions: 是否在连通性拆分后合并小于阈值的小面积分区
@@ -983,6 +1009,7 @@ def partition_coverage_matrix(
         gx_matrix=gx_matrix,
         gy_matrix=gy_matrix,
         primary_feature_mode=primary_feature_mode,
+        depth_matrix=depth_matrix,
     )
     rows = feature_bundle["rows"]
     cols = feature_bundle["cols"]
