@@ -760,6 +760,79 @@ class SurveyPlanner:
     def _line_has_enough_points(line) -> bool:
         return len(np.asarray(line)) >= 2
 
+    @staticmethod
+    def _with_iteration_validity(point, is_valid=True) -> np.ndarray:
+        point_arr = np.asarray(point, dtype=float).reshape(-1)
+        if point_arr.shape[0] < 3:
+            padded = np.zeros(3, dtype=float)
+            padded[: point_arr.shape[0]] = point_arr
+            point_arr = padded
+        else:
+            point_arr = point_arr[:3].copy()
+        return np.concatenate(
+            [point_arr, np.array([1.0 if is_valid else 0.0], dtype=float)]
+        )
+
+    @staticmethod
+    def _make_invalid_iteration_point(x, y) -> np.ndarray | None:
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        return np.array([float(x), float(y), 0.0, 0.0], dtype=float)
+
+    @staticmethod
+    def _valid_point_mask(points) -> np.ndarray:
+        points_arr = np.asarray(points, dtype=float)
+        if points_arr.ndim != 2 or len(points_arr) == 0:
+            return np.zeros(0, dtype=bool)
+        if points_arr.shape[1] < 4:
+            return np.ones(len(points_arr), dtype=bool)
+        return points_arr[:, 3] >= 0.5
+
+    @classmethod
+    def _iter_valid_point_runs(cls, points, min_points=2):
+        points_arr = np.asarray(points, dtype=float)
+        if points_arr.ndim != 2 or len(points_arr) == 0:
+            return
+        valid_mask = cls._valid_point_mask(points_arr)
+        current_run = []
+        for point, is_valid in zip(points_arr, valid_mask):
+            if is_valid:
+                current_run.append(point)
+                continue
+            if len(current_run) >= min_points:
+                yield np.asarray(current_run, dtype=float)
+            current_run = []
+        if len(current_run) >= min_points:
+            yield np.asarray(current_run, dtype=float)
+
+    @staticmethod
+    def _point_key(point, decimals=6):
+        point_arr = np.asarray(point, dtype=float).reshape(-1)
+        return tuple(np.round(point_arr[:2], decimals=decimals))
+
+    def _mark_logical_parent_validity(self, logical_segments, retained_candidates):
+        retained_point_keys = {
+            self._point_key(point)
+            for candidate in retained_candidates
+            for point in np.asarray(candidate.line, dtype=float)
+        }
+        marked_segments = []
+        for segment in logical_segments:
+            segment_arr = np.asarray(segment, dtype=float)
+            marked_points = []
+            for point in segment_arr:
+                already_invalid = (
+                    point.shape[0] >= 4 and float(point[3]) < 0.5
+                )
+                is_valid = (
+                    (not already_invalid)
+                    and self._point_key(point) in retained_point_keys
+                )
+                marked_points.append(self._with_iteration_validity(point, is_valid))
+            if marked_points:
+                marked_segments.append(np.asarray(marked_points, dtype=float))
+        return marked_segments
+
     def _compute_line_gain_ratio(self, line, prior_covered_mask):
         if self.metrics_state_grid is None or not self._line_has_enough_points(line):
             return 0.0, 0.0, 0.0
@@ -849,7 +922,7 @@ class SurveyPlanner:
         alpha = float(self._get_alpha(x, y))
         h = float(get_height(x, y))
         if not np.isfinite(alpha) or not np.isfinite(h) or h <= 0:
-            return None, None, "low_value"
+            return None, None, "low_value", None
 
         if alpha <= 0.005:
             d = 2 * h * np.tan(self.theta_rad / 2) * (1 - self.n)
@@ -859,11 +932,11 @@ class SurveyPlanner:
             alpha_rad = np.radians(alpha)
             sin_alpha = np.sin(alpha_rad)
             if abs(sin_alpha) <= 1e-12:
-                return None, None, "low_value"
+                return None, None, "low_value", None
             A = np.sin(np.radians(90) - self.theta_rad / 2 + alpha_rad)
             B = np.sin(np.radians(90) - self.theta_rad / 2 - alpha_rad)
             if abs(A) <= 1e-12 or abs(B) <= 1e-12:
-                return None, None, "low_value"
+                return None, None, "low_value", None
             C = np.sin(self.theta_rad / 2) / A - 1 / sin_alpha
             D = (
                 self.n * np.sin(self.theta_rad / 2) * (1 / A + 1 / B)
@@ -871,28 +944,30 @@ class SurveyPlanner:
                 - 1 / sin_alpha
             )
             if abs(D) <= 1e-12:
-                return None, None, "low_value"
+                return None, None, "low_value", None
             next_h = h * C / D
             if not np.isfinite(next_h):
-                return None, None, "low_value"
+                return None, None, "low_value", None
             tx = (h - next_h) / np.tan(alpha_rad) * get_gx(x, y)
             ty = (h - next_h) / np.tan(alpha_rad) * get_gy(x, y)
 
         new_x = x - direction * tx
         new_y = y - direction * ty
         if not np.isfinite(new_x) or not np.isfinite(new_y):
-            return None, None, "low_value"
+            return None, None, "low_value", None
+        invalid_iteration_point = self._make_invalid_iteration_point(new_x, new_y)
         if not self._is_in_partition(new_x, new_y, target_partition_id):
-            return None, None, "boundary"
+            return None, None, "boundary", invalid_iteration_point
 
         candidate_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
         if not self._is_finite_candidate_point(candidate_point):
-            return None, None, "low_value"
+            return None, None, "low_value", invalid_iteration_point
+        candidate_point = self._with_iteration_validity(candidate_point, True)
 
         overlap_rate = self._compute_parent_child_overlap_rate(
             parent_point, candidate_point
         )
-        return candidate_point, overlap_rate, None
+        return candidate_point, overlap_rate, None, None
 
     @staticmethod
     def _make_child_candidate(points, overlap_rates) -> _ChildLineCandidate:
@@ -906,8 +981,10 @@ class SurveyPlanner:
         self, parent_segments, direction, target_partition_id, prior_covered_mask=None
     ):
         candidates: list[_ChildLineCandidate] = []
+        logical_segments = []
         current_points = []
         current_rates = []
+        current_logical_points = []
         valid_points = 0
         boundary_rejects = 0
         low_value_rejects = 0
@@ -921,14 +998,23 @@ class SurveyPlanner:
             current_points = []
             current_rates = []
 
+        def flush_current_logical_segment():
+            nonlocal current_logical_points
+            if len(current_logical_points) > 0:
+                logical_segments.append(
+                    np.asarray(current_logical_points, dtype=float)
+                )
+            current_logical_points = []
+
         for parent_segment in parent_segments:
             flush_current_run()
+            flush_current_logical_segment()
             parent_arr = np.asarray(parent_segment, dtype=float)
             if len(parent_arr) == 0:
                 continue
 
             for parent_point in parent_arr:
-                candidate_point, overlap_rate, reject_reason = (
+                candidate_point, overlap_rate, reject_reason, rejected_point = (
                     self._compute_perpendicular_candidate_point(
                         parent_point,
                         direction,
@@ -936,6 +1022,8 @@ class SurveyPlanner:
                     )
                 )
                 if candidate_point is None:
+                    if rejected_point is not None:
+                        current_logical_points.append(rejected_point)
                     if reject_reason == "boundary":
                         boundary_rejects += 1
                     else:
@@ -959,17 +1047,22 @@ class SurveyPlanner:
                             candidate_point, prior_covered_mask=prior_covered_mask
                         )
                 if not has_value:
+                    current_logical_points.append(
+                        self._with_iteration_validity(candidate_point, False)
+                    )
                     low_value_rejects += 1
                     flush_current_run()
                     continue
 
                 current_points.append(candidate_point)
+                current_logical_points.append(candidate_point)
                 current_rates.append(overlap_rate)
                 valid_points += 1
 
             flush_current_run()
+            flush_current_logical_segment()
 
-        return candidates, valid_points, boundary_rejects, low_value_rejects
+        return candidates, logical_segments, valid_points, boundary_rejects, low_value_rejects
 
     def _extend_child_candidate(
         self,
@@ -1072,11 +1165,35 @@ class SurveyPlanner:
         target_partition_id,
         direction_name,
         prior_covered_mask=None,
+        logical_segments=None,
     ) -> list[_ChildLineCandidate]:
         """仅延伸测线组作为逻辑整体时的两个外端。"""
         candidates = [c for c in candidates if self._line_has_enough_points(c.line)]
         if not candidates:
-            return []
+            return [], logical_segments or []
+
+        logical_segment_lists = [
+            [self._with_iteration_validity(point, point.shape[0] < 4 or point[3] >= 0.5)
+             for point in np.asarray(segment, dtype=float)]
+            for segment in (logical_segments or [])
+            if len(np.asarray(segment, dtype=float)) > 0
+        ]
+        if not logical_segment_lists:
+            logical_segment_lists = [
+                [self._with_iteration_validity(point, True) for point in candidate.line]
+                for candidate in candidates
+            ]
+
+        def append_logical_front(point, is_valid):
+            logical_segment_lists[-1].append(
+                self._with_iteration_validity(point, is_valid)
+            )
+
+        def prepend_logical_back(point, is_valid):
+            logical_segment_lists[0].insert(
+                0,
+                self._with_iteration_validity(point, is_valid),
+            )
 
         line_lists = [
             [np.asarray(point, dtype=float) for point in candidate.line]
@@ -1125,20 +1242,31 @@ class SurveyPlanner:
 
             if not np.isfinite(new_x) or not np.isfinite(new_y):
                 stop_reason = TerminationReason.LOW_VALUE
+                invalid_stop_point = None
             elif not self._is_in_partition(new_x, new_y, target_partition_id):
                 stop_reason = TerminationReason.BOUNDARY
+                invalid_stop_point = self._make_invalid_iteration_point(new_x, new_y)
             else:
                 new_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
                 if not self._is_finite_candidate_point(new_point):
                     stop_reason = TerminationReason.LOW_VALUE
+                    invalid_stop_point = self._make_invalid_iteration_point(new_x, new_y)
                 elif not self._candidate_segment_has_value(
                     anchor_point, new_point, prior_covered_mask=prior_covered_mask
                 ):
                     stop_reason = TerminationReason.LOW_VALUE
+                    invalid_stop_point = self._with_iteration_validity(new_point, False)
                 else:
                     stop_reason = TerminationReason.NONE
+                    invalid_stop_point = None
+                    new_point = self._with_iteration_validity(new_point, True)
 
             if stop_reason != TerminationReason.NONE:
+                if invalid_stop_point is not None:
+                    if extend_front:
+                        append_logical_front(invalid_stop_point, False)
+                    else:
+                        prepend_logical_back(invalid_stop_point, False)
                 side_name = "前端" if extend_front else "后端"
                 if stop_reason == TerminationReason.BOUNDARY:
                     print(f"  [测线组外端延伸-{side_name}] 延伸{ext_loop}步后超出边界")
@@ -1157,9 +1285,11 @@ class SurveyPlanner:
 
             if extend_front:
                 line_lists[front_idx].append(new_point)
+                append_logical_front(new_point, True)
                 front_x, front_y = new_x, new_y
             else:
                 line_lists[back_idx].insert(0, new_point)
+                prepend_logical_back(new_point, True)
                 back_x, back_y = new_x, new_y
 
             extend_front = not extend_front
@@ -1179,7 +1309,12 @@ class SurveyPlanner:
             f"  [{direction_name}子测线组] 外端延伸完成 | 共{len(candidates)}段 | "
             f"前端={front_stop_reason.name.lower()} | 后端={back_stop_reason.name.lower()}"
         )
-        return candidates
+        updated_logical_segments = [
+            np.asarray(segment, dtype=float)
+            for segment in logical_segment_lists
+            if len(segment) > 0
+        ]
+        return candidates, updated_logical_segments
 
     def _generate_candidate_group(
         self,
@@ -1189,7 +1324,7 @@ class SurveyPlanner:
         direction_name,
         prior_covered_mask=None,
     ):
-        candidates, valid_points, boundary_rejects, low_value_rejects = (
+        candidates, logical_segments, valid_points, boundary_rejects, low_value_rejects = (
             self._generate_initial_child_candidates(
                 parent_segments,
                 direction,
@@ -1197,13 +1332,20 @@ class SurveyPlanner:
                 prior_covered_mask=prior_covered_mask,
             )
         )
-        extended_candidates = self._extend_child_group_external_ends(
+        extended_candidates, logical_segments = self._extend_child_group_external_ends(
             candidates,
             target_partition_id,
             direction_name,
             prior_covered_mask=prior_covered_mask,
+            logical_segments=logical_segments,
         )
-        return extended_candidates, valid_points, boundary_rejects, low_value_rejects
+        return (
+            extended_candidates,
+            logical_segments,
+            valid_points,
+            boundary_rejects,
+            low_value_rejects,
+        )
 
     def _record_retained_child_group(
         self,
@@ -1266,8 +1408,7 @@ class SurveyPlanner:
         if not (draw_first_line or perp_iter > 1):
             return
         for segment in parent_segments:
-            line = np.asarray(segment, dtype=float)
-            if len(line) > 1:
+            for line in self._iter_valid_point_runs(segment, min_points=2):
                 self.visualizer.draw_light_line(line)
 
     def _generate_perpendicular_lines(
@@ -1311,7 +1452,13 @@ class SurveyPlanner:
                 parent_segments, parent_draw_allowed, draw_first_line, perp_iter
             )
 
-            candidates, valid_points, boundary_rejects, low_value_rejects = (
+            (
+                candidates,
+                logical_parent_segments,
+                valid_points,
+                boundary_rejects,
+                low_value_rejects,
+            ) = (
                 self._generate_candidate_group(
                     parent_segments,
                     direction,
@@ -1371,9 +1518,10 @@ class SurveyPlanner:
                     )
                     break
 
-                parent_segments = [
-                    candidate.line.copy() for candidate in candidates
-                ]
+                parent_segments = self._mark_logical_parent_validity(
+                    logical_parent_segments,
+                    [],
+                ) or [candidate.line.copy() for candidate in candidates]
                 parent_draw_allowed = False
                 print(
                     f"[{direction_name}扩展] 第{perp_iter}轮作为跳板组继续迭代 | "
@@ -1402,7 +1550,10 @@ class SurveyPlanner:
                 perp_iter,
             )
             total_points += added_points
-            parent_segments = [candidate.line.copy() for candidate in decision_candidates]
+            parent_segments = self._mark_logical_parent_validity(
+                logical_parent_segments,
+                decision_candidates,
+            ) or [candidate.line.copy() for candidate in decision_candidates]
             parent_gain_ratio = gain_ratio if hit_area > 1e-12 else parent_gain_ratio
             parent_draw_allowed = True
 
