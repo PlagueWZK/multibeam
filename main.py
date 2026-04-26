@@ -50,14 +50,15 @@ if __name__ == "__main__":
     SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD = 0.10
     SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY = 0.05
     SECONDARY_THRESHOLD_LABEL = "sec-adaptive-min0p1-area5pct"
-    LINE_GAIN_THRESHOLD = 0.75
-    LINE_GAIN_THRESHOLD_LABEL = "gain-threshold-0p75"
+    CHILD_LINE_PARENT_GAIN_FACTOR = 0.80
+    CHILD_LINE_MIN_GAIN_THRESHOLD = 0.30
+    LINE_GAIN_RULE_LABEL = "gain-adaptive-parent80pct-floor30pct"
     REFERENCE_POINT = (1000.0, 5000.0)
     PLANNING_SCOPE_LABEL = "point-1000-5000_partition-auto"
     output_base = (
         f"./multibeam/output/{current_time}_covg_"
         f"{PRIMARY_FEATURE_LABEL}_{SECONDARY_FEATURE_LABEL}_{START_POINT_LABEL}_"
-        f"{SECONDARY_THRESHOLD_LABEL}_{LINE_GAIN_THRESHOLD_LABEL}_"
+        f"{SECONDARY_THRESHOLD_LABEL}_{LINE_GAIN_RULE_LABEL}_"
         f"{PLANNING_SCOPE_LABEL}"
     )
     print(
@@ -68,7 +69,9 @@ if __name__ == "__main__":
         f"最低有效离散阈值={SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD:.2f} | "
         f"候选最小面积占比={SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY:.0%} | "
         f"起点策略={START_POINT_STRATEGY} | "
-        f"测线取舍收益率阈值={LINE_GAIN_THRESHOLD:.0%}"
+        "测线取舍规则=adaptive-parent-gain | "
+        f"父收益折减={CHILD_LINE_PARENT_GAIN_FACTOR:.0%} | "
+        f"最低阈值={CHILD_LINE_MIN_GAIN_THRESHOLD:.0%}"
     )
     print(f"[主流程] 输出目录: {output_base}")
 
@@ -123,7 +126,8 @@ if __name__ == "__main__":
         cell_effective_area=coarse_cell_effective_area,
         grid_cell_size=d_optimal,
         start_point_strategy=START_POINT_STRATEGY,
-        jump_line_gain_threshold=LINE_GAIN_THRESHOLD,
+        child_line_parent_gain_factor=CHILD_LINE_PARENT_GAIN_FACTOR,
+        child_line_min_gain_threshold=CHILD_LINE_MIN_GAIN_THRESHOLD,
     )
     planner.plan_line(REFERENCE_POINT[0], REFERENCE_POINT[1], output_dir=output_base)
     # planner.plan_all(output_dir=output_base)

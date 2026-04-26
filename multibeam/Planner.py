@@ -53,6 +53,8 @@ class _ChildLineCandidate:
     gain_ratio: float = 0.0
     new_area: float = 0.0
     hit_area: float = 0.0
+    parent_gain_ratio: float = 1.0
+    gain_threshold: float = 0.0
 
 
 class SurveyPlanner:
@@ -76,6 +78,9 @@ class SurveyPlanner:
         depth_matrix=None,
         start_point_strategy="deepest",
         jump_line_gain_threshold=0.75,
+        child_line_parent_gain_factor=0.80,
+        child_line_min_gain_threshold=0.30,
+        main_line_parent_gain_ratio=1.0,
     ):
         self.xs = xs
         self.ys = ys
@@ -101,6 +106,24 @@ class SurveyPlanner:
             raise ValueError(
                 "测线取舍收益率阈值必须位于 [0, 1] 区间："
                 f"{jump_line_gain_threshold}"
+            )
+        self.child_line_parent_gain_factor = float(child_line_parent_gain_factor)
+        if not 0.0 <= self.child_line_parent_gain_factor <= 1.0:
+            raise ValueError(
+                "子测线父收益折减系数必须位于 [0, 1] 区间："
+                f"{child_line_parent_gain_factor}"
+            )
+        self.child_line_min_gain_threshold = float(child_line_min_gain_threshold)
+        if not 0.0 <= self.child_line_min_gain_threshold <= 1.0:
+            raise ValueError(
+                "子测线最低收益率阈值必须位于 [0, 1] 区间："
+                f"{child_line_min_gain_threshold}"
+            )
+        self.main_line_parent_gain_ratio = float(main_line_parent_gain_ratio)
+        if not 0.0 <= self.main_line_parent_gain_ratio <= 1.0:
+            raise ValueError(
+                "主测线参考父收益率必须位于 [0, 1] 区间："
+                f"{main_line_parent_gain_ratio}"
             )
         self.max_consecutive_jump_lines = 3
         self.start_point_strategy = str(start_point_strategy).strip().lower()
@@ -752,21 +775,63 @@ class SurveyPlanner:
             lines, prior_covered_mask=prior_covered_mask
         )
 
-    def _filter_child_candidates_by_segment_gain(self, candidates, prior_covered_mask):
+    def _resolve_child_line_gain_threshold(self, parent_gain_ratio):
+        parent_gain_ratio = float(np.clip(parent_gain_ratio, 0.0, 1.0))
+        return float(
+            max(
+                self.child_line_min_gain_threshold,
+                parent_gain_ratio * self.child_line_parent_gain_factor,
+            )
+        )
+
+    def _filter_child_candidates_by_segment_gain(
+        self, candidates, prior_covered_mask, parent_gain_ratio
+    ):
         retained = []
         filtered = []
-        for candidate in candidates:
-            gain_ratio, new_area, hit_area = self._compute_line_gain_ratio(
-                candidate.line, prior_covered_mask
+        gain_threshold = self._resolve_child_line_gain_threshold(parent_gain_ratio)
+        if self.metrics_state_grid is None:
+            for candidate in candidates:
+                candidate.parent_gain_ratio = float(parent_gain_ratio)
+                candidate.gain_threshold = float(gain_threshold)
+                candidate.gain_ratio = 1.0
+                candidate.new_area = 0.0
+                candidate.hit_area = 0.0
+                retained.append(candidate)
+            return retained, filtered, gain_threshold
+
+        if prior_covered_mask is None:
+            simulated_prior = np.array(
+                self.metrics_state_grid.covered_sample_mask, copy=True
             )
+        else:
+            simulated_prior = np.array(prior_covered_mask, dtype=bool, copy=True)
+
+        for candidate in candidates:
+            line_hit_mask = self.metrics_state_grid.compute_polyline_hit_mask(
+                candidate.line
+            )
+            hit_area = self.metrics_state_grid._area_from_sample_mask(line_hit_mask)
+            if hit_area > 1e-12:
+                new_area = self.metrics_state_grid._area_from_sample_mask(
+                    line_hit_mask & (~simulated_prior)
+                )
+                gain_ratio = float(new_area / hit_area)
+            else:
+                new_area = 0.0
+                gain_ratio = 0.0
+
+            candidate.parent_gain_ratio = float(parent_gain_ratio)
+            candidate.gain_threshold = float(gain_threshold)
             candidate.gain_ratio = float(gain_ratio)
             candidate.new_area = float(new_area)
             candidate.hit_area = float(hit_area)
-            if hit_area > 1e-12 and gain_ratio > self.jump_line_gain_threshold:
+            if hit_area > 1e-12 and gain_ratio >= gain_threshold:
                 retained.append(candidate)
+                simulated_prior |= line_hit_mask
             else:
                 filtered.append(candidate)
-        return retained, filtered
+        return retained, filtered, gain_threshold
 
     @staticmethod
     def _is_finite_candidate_point(point) -> bool:
@@ -778,7 +843,7 @@ class SurveyPlanner:
         )
 
     def _compute_perpendicular_candidate_point(
-        self, parent_point, direction, target_partition_id, prior_covered_mask=None
+        self, parent_point, direction, target_partition_id
     ):
         x, y = float(parent_point[0]), float(parent_point[1])
         alpha = float(self._get_alpha(x, y))
@@ -822,10 +887,6 @@ class SurveyPlanner:
 
         candidate_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
         if not self._is_finite_candidate_point(candidate_point):
-            return None, None, "low_value"
-        if not self._candidate_point_has_value(
-            candidate_point, prior_covered_mask=prior_covered_mask
-        ):
             return None, None, "low_value"
 
         overlap_rate = self._compute_parent_child_overlap_rate(
@@ -872,7 +933,6 @@ class SurveyPlanner:
                         parent_point,
                         direction,
                         target_partition_id,
-                        prior_covered_mask=prior_covered_mask,
                     )
                 )
                 if candidate_point is None:
@@ -880,6 +940,26 @@ class SurveyPlanner:
                         boundary_rejects += 1
                     else:
                         low_value_rejects += 1
+                    flush_current_run()
+                    continue
+
+                if len(current_points) == 0:
+                    has_value = self._candidate_point_has_value(
+                        candidate_point, prior_covered_mask=prior_covered_mask
+                    )
+                else:
+                    has_value = self._candidate_segment_has_value(
+                        current_points[-1],
+                        candidate_point,
+                        prior_covered_mask=prior_covered_mask,
+                    )
+                    if not has_value:
+                        flush_current_run()
+                        has_value = self._candidate_point_has_value(
+                            candidate_point, prior_covered_mask=prior_covered_mask
+                        )
+                if not has_value:
+                    low_value_rejects += 1
                     flush_current_run()
                     continue
 
@@ -1210,9 +1290,13 @@ class SurveyPlanner:
         consecutive_jump_groups = 0
         perp_iter = 0
         total_points = 0
+        parent_gain_ratio = self.main_line_parent_gain_ratio
 
         direction_name = "正向" if direction == 1 else "反向"
-        print(f"\n[{direction_name}扩展] 开始从主测线扩展...")
+        print(
+            f"\n[{direction_name}扩展] 开始从主测线扩展... | "
+            f"初始父收益率={parent_gain_ratio:.2%}"
+        )
 
         while True:
             perp_iter += 1
@@ -1261,57 +1345,52 @@ class SurveyPlanner:
                 )
                 break
 
-            retained_candidates, filtered_candidates = (
+            retained_candidates, filtered_candidates, gain_threshold = (
                 self._filter_child_candidates_by_segment_gain(
-                    candidates, prior_covered_mask
+                    candidates, prior_covered_mask, parent_gain_ratio
                 )
             )
             if len(filtered_candidates) > 0:
                 print(
-                    f"[{direction_name}扩展 第{perp_iter}轮] 过滤低收益子段"
-                    f"{len(filtered_candidates)}段 | 保留候选{len(retained_candidates)}段"
+                    f"[{direction_name}扩展 第{perp_iter}轮] 累计过滤低收益子段"
+                    f"{len(filtered_candidates)}段 | 保留候选{len(retained_candidates)}段 | "
+                    f"父收益率={parent_gain_ratio:.2%} | 阈值={gain_threshold:.2%}"
                 )
 
             if len(retained_candidates) == 0:
-                gain_ratio = all_gain_ratio
-                new_area = all_new_area
-                hit_area = all_hit_area
-                decision_candidates = candidates
                 print(
-                    f"[{direction_name}扩展 第{perp_iter}轮] 无单段收益率超过"
-                    f"{self.jump_line_gain_threshold:.0%}，候选组仅作为跳板评估"
+                    f"[{direction_name}扩展 第{perp_iter}轮] 无子段达到累计收益阈值"
+                    f"{gain_threshold:.2%}，候选组仅作为跳板评估"
                 )
-            else:
-                decision_candidates = retained_candidates
-                gain_ratio, new_area, hit_area = self._compute_group_gain_ratio(
-                    decision_candidates, prior_covered_mask
-                )
-
-            is_jump_group = gain_ratio <= self.jump_line_gain_threshold
-            print(
-                f"[{direction_name}扩展 第{perp_iter}轮] 候选组收益率={gain_ratio:.2%} "
-                f"(新增={new_area:.2f}m² / 扫中={hit_area:.2f}m²)"
-            )
-
-            if is_jump_group:
                 consecutive_jump_groups += 1
                 self._restore_global_metrics_state(transaction_snapshot)
                 if consecutive_jump_groups > self.max_consecutive_jump_lines:
                     print(
-                        f"[{direction_name}扩展] 连续第{consecutive_jump_groups}个跳板组仍未超过"
-                        f"{self.jump_line_gain_threshold:.0%}，终止该方向测线生成"
+                        f"[{direction_name}扩展] 连续第{consecutive_jump_groups}个跳板组仍无子段达标，"
+                        "终止该方向测线生成"
                     )
                     break
 
                 parent_segments = [
-                    candidate.line.copy() for candidate in decision_candidates
+                    candidate.line.copy() for candidate in candidates
                 ]
                 parent_draw_allowed = False
                 print(
                     f"[{direction_name}扩展] 第{perp_iter}轮作为跳板组继续迭代 | "
-                    f"连续跳板={consecutive_jump_groups}/{self.max_consecutive_jump_lines}"
+                    f"连续跳板={consecutive_jump_groups}/{self.max_consecutive_jump_lines} | "
+                    f"父收益率保持={parent_gain_ratio:.2%}"
                 )
                 continue
+
+            decision_candidates = retained_candidates
+            gain_ratio, new_area, hit_area = self._compute_group_gain_ratio(
+                decision_candidates, prior_covered_mask
+            )
+            print(
+                f"[{direction_name}扩展 第{perp_iter}轮] 保留组累计收益率={gain_ratio:.2%} "
+                f"(新增={new_area:.2f}m² / 扫中={hit_area:.2f}m²) | "
+                "仅用于下一轮父收益率"
+            )
 
             consecutive_jump_groups = 0
             self._restore_global_metrics_state(transaction_snapshot)
@@ -1324,6 +1403,7 @@ class SurveyPlanner:
             )
             total_points += added_points
             parent_segments = [candidate.line.copy() for candidate in decision_candidates]
+            parent_gain_ratio = gain_ratio if hit_area > 1e-12 else parent_gain_ratio
             parent_draw_allowed = True
 
         print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | 保留{total_points}点")
@@ -1529,7 +1609,9 @@ class SurveyPlanner:
 
         print(
             f"[单分区规划] 仅规划分区 {target_partition_id} | "
-            f"测线取舍收益率阈值={self.jump_line_gain_threshold:.0%}"
+            "测线取舍规则=adaptive-parent-gain | "
+            f"父收益折减={self.child_line_parent_gain_factor:.0%} | "
+            f"最低阈值={self.child_line_min_gain_threshold:.0%}"
         )
 
         pid_dir = lines_dir / str(target_partition_id)
