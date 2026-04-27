@@ -6,9 +6,12 @@
 """
 
 import datetime
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import RLock
 
 import numpy as np
 
@@ -102,6 +105,10 @@ class SurveyPlanner:
         main_line_parent_gain_ratio=None,
         target_line_gain_ratio=0.80,
         gain_relocation_max_steps=5,
+        parallel_planning=True,
+        max_planning_workers=None,
+        parallel_candidate_points=True,
+        parallel_gain_masks=True,
     ):
         self.xs = xs
         self.ys = ys
@@ -138,6 +145,30 @@ class SurveyPlanner:
             raise ValueError(
                 "低收益测线位移搜索最大步数必须 >= 1："
                 f"{gain_relocation_max_steps}"
+            )
+        self.parallel_planning = bool(parallel_planning)
+        default_workers = min(4, os.cpu_count() or 1)
+        self.max_planning_workers = int(
+            max_planning_workers
+            if max_planning_workers is not None
+            else default_workers
+        )
+        if self.max_planning_workers < 1:
+            raise ValueError(
+                "规划线程 worker 数必须 >= 1："
+                f"{max_planning_workers}"
+            )
+        self.parallel_candidate_points = bool(parallel_candidate_points)
+        self.parallel_gain_masks = bool(parallel_gain_masks)
+        self._planning_executor = None
+        self._coverage_lock = RLock()
+        self._record_lock = RLock()
+        self._visualizer_lock = RLock()
+        self._log_lock = RLock()
+        if self.parallel_planning and self.max_planning_workers > 1:
+            self._planning_executor = ThreadPoolExecutor(
+                max_workers=self.max_planning_workers,
+                thread_name_prefix="survey-planner",
             )
         self.start_point_strategy = str(start_point_strategy).strip().lower()
         self.supported_start_point_strategies = {
@@ -217,6 +248,43 @@ class SurveyPlanner:
     # ------------------------------------------------------------------
     # 内部辅助方法
     # ------------------------------------------------------------------
+
+    def _parallel_enabled(self, feature_enabled=True, item_count=2) -> bool:
+        return (
+            self.parallel_planning
+            and bool(feature_enabled)
+            and self.max_planning_workers > 1
+            and self._planning_executor is not None
+            and int(item_count) > 1
+        )
+
+    def _parallel_map_ordered(self, func, items, *, feature_enabled=True):
+        items = list(items)
+        if not self._parallel_enabled(feature_enabled, len(items)):
+            return [func(item) for item in items]
+        return list(self._planning_executor.map(func, items))
+
+    def shutdown_parallel_resources(self):
+        if self._planning_executor is not None:
+            self._planning_executor.shutdown(wait=True, cancel_futures=False)
+            self._planning_executor = None
+
+    def __del__(self):
+        try:
+            self.shutdown_parallel_resources()
+        except Exception:
+            pass
+
+    def _describe_parallel_planning_rule(self):
+        if not self.parallel_planning or self.max_planning_workers <= 1:
+            return "serial"
+        enabled_units = []
+        if self.parallel_candidate_points:
+            enabled_units.append("candidate-points")
+        if self.parallel_gain_masks:
+            enabled_units.append("gain-masks")
+        unit_label = "+".join(enabled_units) if enabled_units else "locks-only"
+        return f"threads={self.max_planning_workers} | units={unit_label}"
 
     def _is_in_partition(self, x, y, partition_id):
         """判断点 (x, y) 是否属于指定分区"""
@@ -505,36 +573,38 @@ class SurveyPlanner:
         repeated_area=0.0,
     ):
         """测线生成完毕后立即计算并记录指标"""
-        pts = np.array(points)
-        if len(pts) < 2:
-            return None
-        length = figure_length(pts)
-        coverage = figure_width(pts)
+        with self._record_lock:
+            pts = np.array(points)
+            if len(pts) < 2:
+                return None
+            length = figure_length(pts)
+            coverage = figure_width(pts)
 
-        record = LineRecord(
-            line_id=self._line_counter,
-            partition_id=partition_id,
-            points=pts,
-            length=length,
-            coverage=coverage,
-            overlap_excess_length=float(overlap_excess_length),
-            max_overlap_eta=float(max_overlap_eta),
-            repeated_area=float(repeated_area),
-            terminated_by=terminated_by,
-        )
-        self.all_records.append(record)
-
-        if self.metrics_state_grid is not None:
-            contributions = self.metrics_state_grid.record_polyline_contribution(
-                pts,
-                line_id=record.line_id,
-                owner_partition_id=partition_id,
+            record = LineRecord(
+                line_id=self._line_counter,
+                partition_id=partition_id,
+                points=pts,
+                length=length,
+                coverage=coverage,
+                overlap_excess_length=float(overlap_excess_length),
+                max_overlap_eta=float(max_overlap_eta),
+                repeated_area=float(repeated_area),
+                terminated_by=terminated_by,
             )
-            self.line_partition_contributions.extend(contributions)
-            record.repeated_area = float(sum(c.repeated_area for c in contributions))
+            self.all_records.append(record)
 
-        self._line_counter += 1
-        return record
+            if self.metrics_state_grid is not None:
+                with self._coverage_lock:
+                    contributions = self.metrics_state_grid.record_polyline_contribution(
+                        pts,
+                        line_id=record.line_id,
+                        owner_partition_id=partition_id,
+                    )
+                self.line_partition_contributions.extend(contributions)
+                record.repeated_area = float(sum(c.repeated_area for c in contributions))
+
+            self._line_counter += 1
+            return record
 
     def _compute_parent_child_overlap_rate(self, parent_point, child_point) -> float:
         parent_arr = np.asarray(parent_point, dtype=float)
@@ -615,17 +685,20 @@ class SurveyPlanner:
     def _snapshot_global_metrics_state(self):
         if self.metrics_state_grid is None:
             return None
-        return self.metrics_state_grid.snapshot_state()
+        with self._coverage_lock:
+            return self.metrics_state_grid.snapshot_state()
 
     def _snapshot_global_covered_mask(self):
         if self.metrics_state_grid is None:
             return None
-        return np.array(self.metrics_state_grid.covered_sample_mask, copy=True)
+        with self._coverage_lock:
+            return np.array(self.metrics_state_grid.covered_sample_mask, copy=True)
 
     def _restore_global_metrics_state(self, snapshot) -> None:
         if self.metrics_state_grid is None or snapshot is None:
             return
-        self.metrics_state_grid.restore_state(snapshot)
+        with self._coverage_lock:
+            self.metrics_state_grid.restore_state(snapshot)
 
     def _point_with_width(self, x, y):
         """返回 [x, y, 覆盖宽度(w_total)]。"""
@@ -648,15 +721,17 @@ class SurveyPlanner:
         """规划期临时写入全局覆盖状态；不累计统计指标。"""
         if self.metrics_state_grid is None:
             return
-        self.metrics_state_grid.mark_segment_covered_for_planning(
-            np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
-        )
+        with self._coverage_lock:
+            self.metrics_state_grid.mark_segment_covered_for_planning(
+                np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
+            )
 
     def _mark_global_polyline_covered_for_planning(self, points):
         """规划期临时写入整条测线覆盖状态；不累计统计指标。"""
         if self.metrics_state_grid is None:
             return
-        self.metrics_state_grid.mark_polyline_covered_for_planning(points)
+        with self._coverage_lock:
+            self.metrics_state_grid.mark_polyline_covered_for_planning(points)
 
     # ------------------------------------------------------------------
     # 核心测线生成算法
@@ -849,16 +924,68 @@ class SurveyPlanner:
     def _compute_line_gain_ratio(self, line, prior_covered_mask):
         if self.metrics_state_grid is None or not self._line_has_enough_points(line):
             return 0.0, 0.0, 0.0
-        return self.metrics_state_grid.compute_polyline_gain(
-            line, prior_covered_mask=prior_covered_mask
+        with self._coverage_lock:
+            return self.metrics_state_grid.compute_polyline_gain(
+                line, prior_covered_mask=prior_covered_mask
+            )
+
+    def _compute_polyline_hit_masks_ordered(self, lines):
+        if self.metrics_state_grid is None:
+            return []
+
+        def compute_hit_mask(line):
+            return self.metrics_state_grid.compute_polyline_hit_mask(line)
+
+        return self._parallel_map_ordered(
+            compute_hit_mask,
+            lines,
+            feature_enabled=self.parallel_gain_masks,
+        )
+
+    def _compute_group_gain_ratio_from_hit_masks(
+        self, line_hit_masks, prior_covered_mask
+    ):
+        if self.metrics_state_grid is None:
+            return 0.0, 0.0, 0.0
+
+        if prior_covered_mask is None:
+            with self._coverage_lock:
+                simulated_prior = np.array(
+                    self.metrics_state_grid.covered_sample_mask, copy=True
+                )
+        else:
+            simulated_prior = np.array(prior_covered_mask, dtype=bool, copy=True)
+
+        total_new_area = 0.0
+        total_hit_area = 0.0
+        for line_hit_mask in line_hit_masks:
+            hit_area = self.metrics_state_grid._area_from_sample_mask(line_hit_mask)
+            if hit_area <= 1e-12:
+                continue
+            new_area = self.metrics_state_grid._area_from_sample_mask(
+                line_hit_mask & (~simulated_prior)
+            )
+            total_hit_area += hit_area
+            total_new_area += new_area
+            simulated_prior |= line_hit_mask
+
+        if total_hit_area <= 1e-12:
+            return 0.0, 0.0, total_hit_area
+        return (
+            float(total_new_area / total_hit_area),
+            float(total_new_area),
+            float(total_hit_area),
         )
 
     def _compute_group_gain_ratio(self, candidates, prior_covered_mask):
         lines = [candidate.line for candidate in candidates]
         if self.metrics_state_grid is None:
             return 0.0, 0.0, 0.0
-        return self.metrics_state_grid.compute_cumulative_polyline_group_gain(
-            lines, prior_covered_mask=prior_covered_mask
+        if not lines:
+            return 0.0, 0.0, 0.0
+        line_hit_masks = self._compute_polyline_hit_masks_ordered(lines)
+        return self._compute_group_gain_ratio_from_hit_masks(
+            line_hit_masks, prior_covered_mask
         )
 
     def _describe_child_line_gain_rule(self):
@@ -1033,6 +1160,52 @@ class SurveyPlanner:
             line=line.copy(), initial_line=line.copy(), overlap_rates=rates.copy()
         )
 
+    def _compute_candidate_point_task(self, task):
+        index, parent_point, direction, target_partition_id, relocation_mode = task
+        if relocation_mode:
+            candidate_point, overlap_rate, reject_reason, rejected_point = (
+                self._compute_gain_relocation_candidate_point(
+                    parent_point,
+                    direction,
+                    target_partition_id,
+                )
+            )
+        else:
+            candidate_point, overlap_rate, reject_reason, rejected_point = (
+                self._compute_perpendicular_candidate_point(
+                    parent_point,
+                    direction,
+                    target_partition_id,
+                )
+            )
+        return {
+            "index": int(index),
+            "parent_point": parent_point,
+            "candidate_point": candidate_point,
+            "overlap_rate": overlap_rate,
+            "reject_reason": reject_reason,
+            "rejected_point": rejected_point,
+        }
+
+    def _compute_candidate_points_ordered(
+        self, parent_arr, direction, target_partition_id, relocation_mode
+    ):
+        tasks = [
+            (
+                index,
+                np.asarray(parent_point, dtype=float),
+                direction,
+                target_partition_id,
+                relocation_mode,
+            )
+            for index, parent_point in enumerate(parent_arr)
+        ]
+        return self._parallel_map_ordered(
+            self._compute_candidate_point_task,
+            tasks,
+            feature_enabled=self.parallel_candidate_points,
+        )
+
     def _generate_initial_child_candidates(
         self,
         parent_segments,
@@ -1074,23 +1247,18 @@ class SurveyPlanner:
             if len(parent_arr) == 0:
                 continue
 
-            for parent_point in parent_arr:
-                if relocation_mode:
-                    candidate_point, overlap_rate, reject_reason, rejected_point = (
-                        self._compute_gain_relocation_candidate_point(
-                            parent_point,
-                            direction,
-                            target_partition_id,
-                        )
-                    )
-                else:
-                    candidate_point, overlap_rate, reject_reason, rejected_point = (
-                        self._compute_perpendicular_candidate_point(
-                            parent_point,
-                            direction,
-                            target_partition_id,
-                        )
-                    )
+            candidate_results = self._compute_candidate_points_ordered(
+                parent_arr,
+                direction,
+                target_partition_id,
+                relocation_mode,
+            )
+
+            for result in candidate_results:
+                candidate_point = result["candidate_point"]
+                overlap_rate = result["overlap_rate"]
+                reject_reason = result["reject_reason"]
+                rejected_point = result["rejected_point"]
                 if candidate_point is None:
                     if rejected_point is not None:
                         current_logical_points.append(rejected_point)
@@ -1619,14 +1787,13 @@ class SurveyPlanner:
                 if candidate.terminated_reason == TerminationReason.LOW_VALUE
                 else "purple"
             )
-            self.visualizer.draw_line(line, color, 1.5)
             total_points += len(line)
             line_counter += 1
-            suffix = (
-                f"_seg{segment_index:02d}" if len(candidates) > 1 else ""
-            )
+            suffix = f"_seg{segment_index:02d}" if len(candidates) > 1 else ""
             snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}{suffix}.png"
-            self.visualizer.save_snapshot(snap_path)
+            with self._visualizer_lock:
+                self.visualizer.draw_line(line, color, 1.5)
+                self.visualizer.save_snapshot(snap_path)
             print(f"  >> 已保存测线: {snap_path}")
             if candidate.selection_reason:
                 print(
@@ -1644,7 +1811,8 @@ class SurveyPlanner:
             return
         for segment in parent_segments:
             for line in self._iter_valid_point_runs(segment, min_points=2):
-                self.visualizer.draw_light_line(line)
+                with self._visualizer_lock:
+                    self.visualizer.draw_light_line(line)
 
     def _generate_perpendicular_lines(
         self,
@@ -1822,13 +1990,14 @@ class SurveyPlanner:
 
         try:
             # 设置画布
-            self.visualizer.setup_figure(partition_id)
-            self.visualizer.draw_seed_point(
-                start_x,
-                start_y,
-                label="Seed point",
-                annotation=f"S{partition_id}",
-            )
+            with self._visualizer_lock:
+                self.visualizer.setup_figure(partition_id)
+                self.visualizer.draw_seed_point(
+                    start_x,
+                    start_y,
+                    label="Seed point",
+                    annotation=f"S{partition_id}",
+                )
 
             line_counter = 0
 
@@ -1852,10 +2021,10 @@ class SurveyPlanner:
                 total_points = 0
             else:
                 line_counter += 1
-                self.visualizer.draw_line(line, "b", 1.5, "Main line")
-
                 snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
-                self.visualizer.save_snapshot(snap_path)
+                with self._visualizer_lock:
+                    self.visualizer.draw_line(line, "b", 1.5, "Main line")
+                    self.visualizer.save_snapshot(snap_path)
                 print(f"  >> 已保存测线: {snap_path}")
 
                 # 正向扩展
@@ -1871,14 +2040,15 @@ class SurveyPlanner:
                 total_points = len(line) + total_points1 + total_points2
 
             # 保存最终图
-            overlay_legend = self.visualizer.draw_fine_grid_overlay(
-                self.metrics_state_grid, show_legend=True, partition_id=partition_id
-            )
             final_path = lines_dir / "plan_line_final.png"
-            handles, labels = self.visualizer.ax.get_legend_handles_labels()
-            self.visualizer.ax.legend(handles=handles + overlay_legend)
-            self.visualizer.save_snapshot(final_path)
-            self.visualizer.close_figure()
+            with self._visualizer_lock:
+                overlay_legend = self.visualizer.draw_fine_grid_overlay(
+                    self.metrics_state_grid, show_legend=True, partition_id=partition_id
+                )
+                handles, labels = self.visualizer.ax.get_legend_handles_labels()
+                self.visualizer.ax.legend(handles=handles + overlay_legend)
+                self.visualizer.save_snapshot(final_path)
+                self.visualizer.close_figure()
 
             # 收集结果
             partition_records = [
@@ -1960,7 +2130,8 @@ class SurveyPlanner:
 
         print(
             f"[单分区规划] 仅规划分区 {target_partition_id} | "
-            f"测线取舍规则={self._describe_child_line_gain_rule()}"
+            f"测线取舍规则={self._describe_child_line_gain_rule()} | "
+            f"并行规划={self._describe_parallel_planning_rule()}"
         )
 
         pid_dir = lines_dir / str(target_partition_id)
@@ -1998,7 +2169,10 @@ class SurveyPlanner:
             for pid in sorted(np.unique(self.cluster_matrix).astype(int))
             if pid >= 0
         ]
-        print(f"[全局规划] 测线取舍规则={self._describe_child_line_gain_rule()}")
+        print(
+            f"[全局规划] 测线取舍规则={self._describe_child_line_gain_rule()} | "
+            f"并行规划={self._describe_parallel_planning_rule()}"
+        )
         partition_ids, mean_depth_by_pid = self._order_partition_ids_by_mean_depth(
             detected_partition_ids
         )
@@ -2021,12 +2195,13 @@ class SurveyPlanner:
         # 合并输出
         flat_all_lines = [line for r in all_results for line in r.lines]
         save_dot_csv(flat_all_lines, lines_dir)
-        self.visualizer.draw_merged_lines(
-            all_results,
-            lines_dir,
-            self.metrics_state_grid,
-            self.partition_start_points,
-        )
+        with self._visualizer_lock:
+            self.visualizer.draw_merged_lines(
+                all_results,
+                lines_dir,
+                self.metrics_state_grid,
+                self.partition_start_points,
+            )
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
         total_lines = sum(len(r.records) for r in all_results)

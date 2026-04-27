@@ -52,6 +52,8 @@ if __name__ == "__main__":
     SECONDARY_THRESHOLD_LABEL = "sec-adaptive-min0p1-area5pct"
     TARGET_LINE_GAIN_RATIO = 0.80
     GAIN_RELOCATION_MAX_STEPS = 5
+    PARALLEL_PLANNING = True
+    MAX_PLANNING_WORKERS = 4
     LINE_GAIN_RULE_LABEL = "gain-fixed80pct-relocate5"
     REFERENCE_POINT = (1000.0, 5000.0)
     PLANNING_SCOPE_LABEL = "point-1000-5000_partition-auto"
@@ -71,7 +73,8 @@ if __name__ == "__main__":
         f"起点策略={START_POINT_STRATEGY} | "
         "测线取舍规则=fixed-80pct-relocation | "
         f"目标收益率={TARGET_LINE_GAIN_RATIO:.0%} | "
-        f"低收益位移搜索≤{GAIN_RELOCATION_MAX_STEPS}步"
+        f"低收益位移搜索≤{GAIN_RELOCATION_MAX_STEPS}步 | "
+        f"规划并行={PARALLEL_PLANNING} | workers={MAX_PLANNING_WORKERS}"
     )
     print(f"[主流程] 输出目录: {output_base}")
 
@@ -128,6 +131,8 @@ if __name__ == "__main__":
         start_point_strategy=START_POINT_STRATEGY,
         target_line_gain_ratio=TARGET_LINE_GAIN_RATIO,
         gain_relocation_max_steps=GAIN_RELOCATION_MAX_STEPS,
+        parallel_planning=PARALLEL_PLANNING,
+        max_planning_workers=MAX_PLANNING_WORKERS,
     )
     planner.plan_line(REFERENCE_POINT[0], REFERENCE_POINT[1], output_dir=output_base)
     # planner.plan_all(output_dir=output_base)
