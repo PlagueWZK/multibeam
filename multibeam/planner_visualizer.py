@@ -16,6 +16,14 @@ from matplotlib.patches import Patch, Rectangle
 class SurveyVisualizer:
     """测线可视化器：封装所有绘图逻辑"""
 
+    SEED_STYLE = {
+        "marker": "*",
+        "size": 220,
+        "facecolor": "#FFD54F",
+        "edgecolor": "#D32F2F",
+        "linewidth": 1.5,
+    }
+
     FINE_GRID_STATE_STYLES = {
         "full": {"color": "#4CAF50", "alpha": 0.18, "label": "Fine grid - full"},
         "partial": {
@@ -100,8 +108,35 @@ class SurveyVisualizer:
         """绘制浅色背景线（用于中间过程显示）"""
         self.ax.plot(line[:, 0], line[:, 1], color="lightgray", linewidth=0.6)
 
+    def draw_seed_point(self, x: float, y: float, label: str = None, annotation: str = None):
+        """在当前图中绘制起始点标记。"""
+        self.ax.scatter(
+            [x],
+            [y],
+            marker=self.SEED_STYLE["marker"],
+            s=self.SEED_STYLE["size"],
+            c=self.SEED_STYLE["facecolor"],
+            edgecolors=self.SEED_STYLE["edgecolor"],
+            linewidths=self.SEED_STYLE["linewidth"],
+            zorder=4,
+            label=label,
+        )
+        if annotation:
+            self.ax.text(
+                x,
+                y,
+                annotation,
+                fontsize=9,
+                color=self.SEED_STYLE["edgecolor"],
+                fontweight="bold",
+                ha="left",
+                va="bottom",
+                zorder=4.2,
+            )
+
     def save_snapshot(self, path: Path):
         """保存当前画布"""
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.fig.savefig(path, dpi=200, bbox_inches="tight")
 
     def close_figure(self):
@@ -114,14 +149,21 @@ class SurveyVisualizer:
     def draw_partition_background(self):
         """绘制分区背景"""
         grid_x, grid_y = np.meshgrid(self.xs, self.ys)
-        partition_ids = sorted(np.unique(self.cluster_matrix).astype(int))
+        partition_ids = [
+            int(pid)
+            for pid in sorted(np.unique(self.cluster_matrix).astype(int))
+            if int(pid) >= 0
+        ]
+        display_matrix = np.ma.masked_where(
+            self.cluster_matrix < 0, self.cluster_matrix
+        )
 
         # 绘制底色
         cmap = plt.cm.get_cmap("Set3", len(partition_ids))
         self.ax.contourf(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids) + 1) - 0.5,
             cmap=cmap,
             alpha=0.25,
@@ -132,7 +174,7 @@ class SurveyVisualizer:
         self.ax.contour(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids)) + 0.5,
             colors="gray",
             linewidths=1.0,
@@ -140,9 +182,16 @@ class SurveyVisualizer:
             zorder=1,
         )
 
-    def _draw_fine_grid_overlay_on_ax(self, ax, state_grid, show_legend=False):
+    def _draw_fine_grid_overlay_on_ax(
+        self, ax, state_grid, show_legend=False, partition_id=None
+    ):
         """在指定坐标轴上叠加细网格状态。"""
-        for cell in state_grid.iter_render_cells():
+        if hasattr(state_grid, "iter_render_cells_for_partition"):
+            cells = state_grid.iter_render_cells_for_partition(partition_id)
+        else:
+            cells = state_grid.iter_render_cells()
+
+        for cell in cells:
             style = self.FINE_GRID_STATE_STYLES[cell["state"]]
             alpha = style["alpha"] * max(0.35, min(1.0, cell["partition_area_ratio"]))
             ax.add_patch(
@@ -169,11 +218,13 @@ class SurveyVisualizer:
             ]
         return []
 
-    def draw_fine_grid_overlay(self, state_grid, show_legend=False):
+    def draw_fine_grid_overlay(self, state_grid, show_legend=False, partition_id=None):
         """在当前分区图中叠加细网格状态。"""
         if self.ax is None:
             return []
-        return self._draw_fine_grid_overlay_on_ax(self.ax, state_grid, show_legend)
+        return self._draw_fine_grid_overlay_on_ax(
+            self.ax, state_grid, show_legend, partition_id=partition_id
+        )
 
     def _setup_global_ax(self, title: str):
         fig = plt.figure(figsize=(16, 12))
@@ -190,10 +241,13 @@ class SurveyVisualizer:
     def _draw_partition_background_on_ax(self, ax, partition_ids):
         grid_x, grid_y = np.meshgrid(self.xs, self.ys)
         cmap = plt.cm.get_cmap("Set3", len(partition_ids))
+        display_matrix = np.ma.masked_where(
+            self.cluster_matrix < 0, self.cluster_matrix
+        )
         ax.contourf(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids) + 1) - 0.5,
             cmap=cmap,
             alpha=0.25,
@@ -202,10 +256,13 @@ class SurveyVisualizer:
 
     def _draw_partition_boundaries_on_ax(self, ax, partition_ids):
         grid_x, grid_y = np.meshgrid(self.xs, self.ys)
+        display_matrix = np.ma.masked_where(
+            self.cluster_matrix < 0, self.cluster_matrix
+        )
         ax.contour(
             grid_x,
             grid_y,
-            self.cluster_matrix,
+            display_matrix,
             levels=np.arange(len(partition_ids)) + 0.5,
             colors="gray",
             linewidths=1.0,
@@ -226,6 +283,49 @@ class SurveyVisualizer:
                     zorder=2,
                 )
 
+    def _draw_seed_points_on_ax(self, ax, seed_points):
+        if not seed_points:
+            return []
+
+        for partition_id, seed in seed_points.items():
+            x = float(seed["x"])
+            y = float(seed["y"])
+            ax.scatter(
+                [x],
+                [y],
+                marker=self.SEED_STYLE["marker"],
+                s=self.SEED_STYLE["size"],
+                c=self.SEED_STYLE["facecolor"],
+                edgecolors=self.SEED_STYLE["edgecolor"],
+                linewidths=self.SEED_STYLE["linewidth"],
+                zorder=3.5,
+            )
+            ax.text(
+                x,
+                y,
+                f"S{int(partition_id)}",
+                fontsize=8,
+                color=self.SEED_STYLE["edgecolor"],
+                fontweight="bold",
+                ha="left",
+                va="bottom",
+                zorder=3.7,
+            )
+
+        return [
+            Line2D(
+                [0],
+                [0],
+                marker=self.SEED_STYLE["marker"],
+                color="none",
+                markerfacecolor=self.SEED_STYLE["facecolor"],
+                markeredgecolor=self.SEED_STYLE["edgecolor"],
+                markeredgewidth=self.SEED_STYLE["linewidth"],
+                markersize=12,
+                label="Seed point",
+            )
+        ]
+
     def _build_partition_line_legend(self, partition_ids, colors):
         return [
             Line2D(
@@ -239,7 +339,7 @@ class SurveyVisualizer:
         ]
 
     def draw_merged_lines(
-        self, all_results, lines_parent: Path, partition_state_grids=None
+        self, all_results, lines_parent: Path, partition_state_grids=None, seed_points=None
     ):
         """
         绘制所有分区合并的最终测线图
@@ -265,8 +365,11 @@ class SurveyVisualizer:
         self._draw_partition_background_on_ax(ax_partition, partition_ids)
         self._draw_partition_boundaries_on_ax(ax_partition, partition_ids)
         self._draw_lines_on_ax(ax_partition, all_results, colors)
+        seed_legend_elements = self._draw_seed_points_on_ax(ax_partition, seed_points)
         ax_partition.legend(
-            handles=self._build_partition_line_legend(partition_ids, colors), loc="best"
+            handles=self._build_partition_line_legend(partition_ids, colors)
+            + seed_legend_elements,
+            loc="best",
         )
         partition_view_path = lines_parent / "all_partitions_final_partition_view.png"
         fig_partition.savefig(partition_view_path, dpi=300, bbox_inches="tight")
@@ -280,15 +383,26 @@ class SurveyVisualizer:
         self._draw_partition_boundaries_on_ax(ax_fine, partition_ids)
         state_legend_elements = []
         if partition_state_grids:
-            for pid in partition_ids:
-                state_grid = partition_state_grids.get(int(pid))
-                if state_grid is not None:
+            if hasattr(partition_state_grids, "iter_render_cells_for_partition"):
+                for pid in partition_ids:
                     state_legend_elements = self._draw_fine_grid_overlay_on_ax(
-                        ax_fine, state_grid, show_legend=True
+                        ax_fine,
+                        partition_state_grids,
+                        show_legend=True,
+                        partition_id=int(pid),
                     )
+            else:
+                for pid in partition_ids:
+                    state_grid = partition_state_grids.get(int(pid))
+                    if state_grid is not None:
+                        state_legend_elements = self._draw_fine_grid_overlay_on_ax(
+                            ax_fine, state_grid, show_legend=True
+                        )
         self._draw_lines_on_ax(ax_fine, all_results, colors)
+        seed_legend_elements = self._draw_seed_points_on_ax(ax_fine, seed_points)
         ax_fine.legend(
             handles=self._build_partition_line_legend(partition_ids, colors)
+            + seed_legend_elements
             + state_legend_elements,
             loc="best",
         )

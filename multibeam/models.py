@@ -14,6 +14,7 @@ class TerminationReason(Enum):
 
     NONE = auto()  # 未终止
     BOUNDARY = auto()  # 超出分区边界
+    LOW_VALUE = auto()  # 全局网格收益不足
     SPIRAL = auto()  # 累计偏转角 > 360°
     INTERSECTION = auto()  # 与已有测线相交
     SATURATION = auto()  # 测线收缩至质心内侧覆盖范围内
@@ -30,10 +31,25 @@ class LineRecord:
     points: np.ndarray  # [N, 3] = [x, y, w_total]
     length: float
     coverage: float
-    terminated_by: str  # "boundary" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
-    unique_gain_area: float = 0.0
-    overlap_area: float = 0.0
-    score: float = 0.0
+    overlap_excess_length: float
+    max_overlap_eta: float
+    repeated_area: float
+    terminated_by: str  # "boundary" / "low_value" / "spiral" / "intersection" / "saturation" / "degradation" / "empty"
+
+
+@dataclass
+class LinePartitionContribution:
+    """保留测线对目标分区的统计贡献。"""
+
+    line_id: int
+    owner_partition_id: int
+    target_partition_id: int
+    hit_area: float
+    new_area: float
+    repeated_area: float
+    hit_samples: int
+    new_samples: int
+    repeated_samples: int
 
 
 @dataclass
@@ -45,26 +61,3 @@ class PartitionResult:
     records: list[LineRecord]  # 指标记录
     total_length: float
     total_coverage: float
-
-
-@dataclass
-class ScoreBreakdown:
-    """候选测线评分拆解"""
-
-    unique_gain_cells: int
-    overlap_cells: int
-    length: float
-    bend: float
-    score: float
-
-
-@dataclass
-class CoverageSummary:
-    """全局覆盖统计摘要"""
-
-    total_area: float
-    raw_coverage_area: float
-    unique_coverage_area: float
-    overlap_area: float
-    coverage_rate: float
-    leakage_rate: float

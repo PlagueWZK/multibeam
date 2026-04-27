@@ -17,6 +17,8 @@ def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
         xs: X 坐标数组 (间距严格等于 d)
         ys: Y 坐标数组 (间距严格等于 d)
         Z: 深度矩阵 (rows x cols)
+        gx_matrix: x方向梯度矩阵 (rows x cols)
+        gy_matrix: y方向梯度矩阵 (rows x cols)
         boundary_mask: 二维布尔掩码，True 表示网格与海域有正面积重叠
         cell_effective_area: 二维有效面积矩阵
         cell_area_ratio: 二维面积比例矩阵
@@ -29,7 +31,6 @@ def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
 
     rows = len(ys)
     cols = len(xs)
-    Z = np.zeros((rows, cols))
 
     print(f"正在使用模型生成重采样网格 (维度: {rows} x {cols}, 网格边长: {d:.2f}m)...")
     print(
@@ -39,12 +40,29 @@ def generate_resampled_grid(x_min, x_max, y_min, y_max, d):
         f"  Y 范围: [{ys[0]:.2f}, {ys[-1]:.2f}] (实际海域: [{y_min:.2f}, {y_max:.2f}])"
     )
 
-    # 遍历所有网格中心，预测深度
-    for i in range(rows):
-        for j in range(cols):
-            Z[i, j] = Data.get_height(xs[j], ys[i])
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    points = np.column_stack((grid_x.ravel(), grid_y.ravel()))
 
-    return xs, ys, Z, boundary_mask, cell_effective_area, cell_area_ratio
+    print(f"正在批量预测重采样网格深度与梯度，共 {len(points)} 个点...")
+    predictions = Data.predict_model_fields(
+        points,
+        include_height=True,
+        include_gradient=True,
+    )
+    Z = predictions["height"].reshape(rows, cols)
+    gx_matrix = predictions["gx"].reshape(rows, cols)
+    gy_matrix = predictions["gy"].reshape(rows, cols)
+
+    return (
+        xs,
+        ys,
+        Z,
+        gx_matrix,
+        gy_matrix,
+        boundary_mask,
+        cell_effective_area,
+        cell_area_ratio,
+    )
 
 
 def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
@@ -52,7 +70,7 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
     结合机器学习深度预测模型和最优网格 d，计算覆盖次数矩阵。
     """
     # 1. 调用模型重采样，获取全新的 Z 矩阵和边界掩码
-    xs, ys, Z, boundary_mask, cell_effective_area, cell_area_ratio = (
+    xs, ys, Z, gx_matrix, gy_matrix, boundary_mask, cell_effective_area, cell_area_ratio = (
         generate_resampled_grid(x_min, x_max, y_min, y_max, d)
     )
 
@@ -133,4 +151,14 @@ def calculate_coverage_matrix_with_ml(x_min, x_max, y_min, y_max, d, theta=120):
             times_mat[min_row : max_row + 1, min_col : max_col + 1] += valid_mask
 
     print("覆盖次数矩阵计算完成！")
-    return xs, ys, Z, times_mat, boundary_mask, cell_effective_area, cell_area_ratio
+    return (
+        xs,
+        ys,
+        Z,
+        times_mat,
+        boundary_mask,
+        cell_effective_area,
+        cell_area_ratio,
+        gx_matrix,
+        gy_matrix,
+    )
