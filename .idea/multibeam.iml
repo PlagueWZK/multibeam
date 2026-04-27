@@ -20,6 +20,13 @@
       <excludeFolder url="file://$MODULE_DIR$/multibeam/output/lines" />
       <excludeFolder url="file://$MODULE_DIR$/multibeam/output/metrics" />
       <excludeFolder url="file://$MODULE_DIR$/outputs" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260426_010805_cov-g_primary-xy-coverage-depth_secondary-gradient_start-geometric-center_secondary-threshold-0p2_gain-threshold-0p4" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/坐标深度覆盖次数-梯度方向-三种起始点-失败" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/旧" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/梯度方向-深度覆盖次数-仅分区" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/结果集" />
+      <excludeFolder url="file://$MODULE_DIR$/original/output" />
+      <excludeFolder url="file://$MODULE_DIR$/output" />
     </content>
     <orderEntry type="jdk" jdkName="uv (multibeam) (2)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
