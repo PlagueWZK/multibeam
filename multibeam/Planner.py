@@ -77,6 +77,7 @@ class SurveyPlanner:
         grid_cell_size=None,
         depth_matrix=None,
         start_point_strategy="deepest",
+        line_gain_threshold_mode="adaptive",
         jump_line_gain_threshold=0.75,
         child_line_parent_gain_factor=0.80,
         child_line_min_gain_threshold=0.30,
@@ -101,10 +102,17 @@ class SurveyPlanner:
         self.current_microstep = self.legacy_microstep
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
+        self.line_gain_threshold_mode = str(line_gain_threshold_mode).strip().lower()
+        self.supported_line_gain_threshold_modes = {"adaptive", "fixed"}
+        if self.line_gain_threshold_mode not in self.supported_line_gain_threshold_modes:
+            raise ValueError(
+                "不支持的测线取舍收益率阈值模式："
+                f"{line_gain_threshold_mode}，可选={sorted(self.supported_line_gain_threshold_modes)}"
+            )
         self.jump_line_gain_threshold = float(jump_line_gain_threshold)
         if not 0.0 <= self.jump_line_gain_threshold <= 1.0:
             raise ValueError(
-                "测线取舍收益率阈值必须位于 [0, 1] 区间："
+                "固定测线取舍收益率阈值必须位于 [0, 1] 区间："
                 f"{jump_line_gain_threshold}"
             )
         self.child_line_parent_gain_factor = float(child_line_parent_gain_factor)
@@ -850,11 +858,22 @@ class SurveyPlanner:
 
     def _resolve_child_line_gain_threshold(self, parent_gain_ratio):
         parent_gain_ratio = float(np.clip(parent_gain_ratio, 0.0, 1.0))
+        if self.line_gain_threshold_mode == "fixed":
+            return float(self.jump_line_gain_threshold)
         return float(
             max(
                 self.child_line_min_gain_threshold,
                 parent_gain_ratio * self.child_line_parent_gain_factor,
             )
+        )
+
+    def _describe_child_line_gain_rule(self):
+        if self.line_gain_threshold_mode == "fixed":
+            return f"fixed-threshold | 阈值={self.jump_line_gain_threshold:.0%}"
+        return (
+            "adaptive-parent-gain | "
+            f"父收益折减={self.child_line_parent_gain_factor:.0%} | "
+            f"最低阈值={self.child_line_min_gain_threshold:.0%}"
         )
 
     def _filter_child_candidates_by_segment_gain(
@@ -1760,9 +1779,7 @@ class SurveyPlanner:
 
         print(
             f"[单分区规划] 仅规划分区 {target_partition_id} | "
-            "测线取舍规则=adaptive-parent-gain | "
-            f"父收益折减={self.child_line_parent_gain_factor:.0%} | "
-            f"最低阈值={self.child_line_min_gain_threshold:.0%}"
+            f"测线取舍规则={self._describe_child_line_gain_rule()}"
         )
 
         pid_dir = lines_dir / str(target_partition_id)
@@ -1800,6 +1817,7 @@ class SurveyPlanner:
             for pid in sorted(np.unique(self.cluster_matrix).astype(int))
             if pid >= 0
         ]
+        print(f"[全局规划] 测线取舍规则={self._describe_child_line_gain_rule()}")
         partition_ids, mean_depth_by_pid = self._order_partition_ids_by_mean_depth(
             detected_partition_ids
         )

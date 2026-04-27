@@ -11,7 +11,7 @@ The script intentionally runs all combinations through the same frozen pipeline:
 
 - adaptive secondary partition trigger: max-gap, minimum 0.10, area >= 5%
 - start point strategy: geometric_center
-- line retention: max(30%, parent_gain * 80%)
+- line retention: adaptive max(30%, parent_gain * 80%) by default, or fixed threshold via CLI
 - planning scope: plan_all
 """
 
@@ -83,7 +83,6 @@ SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY = 0.05
 SECONDARY_RULE_LABEL = "sec-adaptive-min0p1-area5pct"
 CHILD_LINE_PARENT_GAIN_FACTOR = 0.80
 CHILD_LINE_MIN_GAIN_THRESHOLD = 0.30
-LINE_GAIN_RULE_LABEL = "gain-adaptive-parent80pct-floor30pct"
 PLANNING_SCOPE_LABEL = "plan-all"
 
 
@@ -123,7 +122,41 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_ROOT / "multibeam" / "output",
         help="Output root directory. Default: multibeam/output.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--line-gain-mode",
+        choices=("adaptive", "fixed"),
+        default="adaptive",
+        help=(
+            "Line-retention gain threshold mode. "
+            "adaptive keeps max(floor, parent_gain * factor); fixed uses --line-gain-threshold. "
+            "Default: adaptive."
+        ),
+    )
+    parser.add_argument(
+        "--line-gain-threshold",
+        type=float,
+        default=0.50,
+        help="Fixed line-retention gain threshold used when --line-gain-mode fixed. Default: 0.50.",
+    )
+    args = parser.parse_args()
+    if not 0.0 <= args.line_gain_threshold <= 1.0:
+        parser.error("--line-gain-threshold must be in [0, 1].")
+    return args
+
+
+def percent_label(value: float) -> str:
+    percent = float(value) * 100.0
+    if abs(percent - round(percent)) < 1e-9:
+        text = str(int(round(percent)))
+    else:
+        text = f"{percent:.2f}".rstrip("0").rstrip(".").replace(".", "p")
+    return f"{text}pct"
+
+
+def build_line_gain_rule_label(line_gain_mode: str, line_gain_threshold: float) -> str:
+    if line_gain_mode == "fixed":
+        return f"gain-fixed{percent_label(line_gain_threshold)}"
+    return "gain-adaptive-parent80pct-floor30pct"
 
 
 def select_combos(combo_arg: str) -> list[ComparisonCombo]:
@@ -132,10 +165,15 @@ def select_combos(combo_arg: str) -> list[ComparisonCombo]:
     return [combo for combo in COMBOS if combo.label == combo_arg]
 
 
-def build_output_dir(output_root: Path, run_timestamp: str, combo: ComparisonCombo) -> Path:
+def build_output_dir(
+    output_root: Path,
+    run_timestamp: str,
+    combo: ComparisonCombo,
+    line_gain_rule_label: str,
+) -> Path:
     output_name = (
         f"{run_timestamp}_comparison_{combo.label}_{START_POINT_LABEL}_"
-        f"{SECONDARY_RULE_LABEL}_{LINE_GAIN_RULE_LABEL}_{PLANNING_SCOPE_LABEL}"
+        f"{SECONDARY_RULE_LABEL}_{line_gain_rule_label}_{PLANNING_SCOPE_LABEL}"
     )
     return output_root / output_name
 
@@ -181,6 +219,9 @@ def main() -> None:
     output_root = args.output_root.resolve()
     data_path = PROJECT_ROOT / "data" / "data.xlsx"
     run_timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    line_gain_rule_label = build_line_gain_rule_label(
+        args.line_gain_mode, args.line_gain_threshold
+    )
 
     print("[对比实验] 冻结配置")
     print(f"  combos={[combo.display_name for combo in combos]}")
@@ -190,11 +231,17 @@ def main() -> None:
         f"min_dispersion={SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD:.2f} | "
         f"min_area_ratio={SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY:.0%}"
     )
-    print(
-        "  line_gain=adaptive-parent-gain | "
-        f"parent_factor={CHILD_LINE_PARENT_GAIN_FACTOR:.0%} | "
-        f"floor={CHILD_LINE_MIN_GAIN_THRESHOLD:.0%}"
-    )
+    if args.line_gain_mode == "fixed":
+        print(
+            "  line_gain=fixed-threshold | "
+            f"threshold={args.line_gain_threshold:.0%}"
+        )
+    else:
+        print(
+            "  line_gain=adaptive-parent-gain | "
+            f"parent_factor={CHILD_LINE_PARENT_GAIN_FACTOR:.0%} | "
+            f"floor={CHILD_LINE_MIN_GAIN_THRESHOLD:.0%}"
+        )
     print("  planning_scope=plan_all")
     print(f"  output_root={output_root}")
     print("  建议外部单组合超时: 2小时")
@@ -224,7 +271,9 @@ def main() -> None:
 
     summary_rows: list[dict[str, object]] = []
     for combo_index, combo in enumerate(combos, start=1):
-        combo_output_dir = build_output_dir(output_root, run_timestamp, combo)
+        combo_output_dir = build_output_dir(
+            output_root, run_timestamp, combo, line_gain_rule_label
+        )
         print("\n" + "=" * 80)
         print(
             f"[对比实验] 组合 {combo_index}/{len(combos)}: "
@@ -260,6 +309,8 @@ def main() -> None:
             cell_effective_area=coarse_cell_effective_area,
             grid_cell_size=d_optimal,
             start_point_strategy=START_POINT_STRATEGY,
+            line_gain_threshold_mode=args.line_gain_mode,
+            jump_line_gain_threshold=args.line_gain_threshold,
             child_line_parent_gain_factor=CHILD_LINE_PARENT_GAIN_FACTOR,
             child_line_min_gain_threshold=CHILD_LINE_MIN_GAIN_THRESHOLD,
         )
@@ -273,12 +324,26 @@ def main() -> None:
             "secondary_feature": "gradient-direction",
             "final_partition_u": int(final_u),
             "start_point_strategy": START_POINT_STRATEGY,
+            "line_gain_rule_label": line_gain_rule_label,
+            "line_gain_threshold_mode": args.line_gain_mode,
+            "line_gain_fixed_threshold": (
+                args.line_gain_threshold if args.line_gain_mode == "fixed" else ""
+            ),
+            "line_gain_parent_factor": (
+                CHILD_LINE_PARENT_GAIN_FACTOR if args.line_gain_mode == "adaptive" else ""
+            ),
+            "line_gain_floor": (
+                CHILD_LINE_MIN_GAIN_THRESHOLD if args.line_gain_mode == "adaptive" else ""
+            ),
             "output_dir": str(combo_output_dir),
         }
         summary_row.update(load_global_metrics(metrics_path))
         summary_rows.append(summary_row)
 
-    summary_path = output_root / f"{run_timestamp}_comparison_summary.csv"
+    summary_name = f"{run_timestamp}_comparison_summary.csv"
+    if args.line_gain_mode == "fixed":
+        summary_name = f"{run_timestamp}_comparison_{line_gain_rule_label}_summary.csv"
+    summary_path = output_root / summary_name
     write_summary(summary_rows, summary_path)
     print("\n" + "=" * 80)
     print(f"[对比实验] 完成。汇总文件: {summary_path}")
