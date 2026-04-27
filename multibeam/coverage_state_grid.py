@@ -856,7 +856,7 @@ class GlobalCoverageMetricsGrid:
         )
 
     def snapshot_state(self) -> dict:
-        """复制全局统计网格状态，用于规划期事务/跳板回滚。"""
+        """复制全局统计网格状态，用于规划期事务回滚。"""
 
         return {
             "covered_sample_mask": np.array(self.covered_sample_mask, copy=True),

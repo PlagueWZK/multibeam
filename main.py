@@ -50,9 +50,9 @@ if __name__ == "__main__":
     SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD = 0.10
     SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY = 0.05
     SECONDARY_THRESHOLD_LABEL = "sec-adaptive-min0p1-area5pct"
-    CHILD_LINE_PARENT_GAIN_FACTOR = 0.80
-    CHILD_LINE_MIN_GAIN_THRESHOLD = 0.30
-    LINE_GAIN_RULE_LABEL = "gain-adaptive-parent80pct-floor30pct"
+    TARGET_LINE_GAIN_RATIO = 0.80
+    GAIN_RELOCATION_MAX_STEPS = 5
+    LINE_GAIN_RULE_LABEL = "gain-fixed80pct-relocate5"
     REFERENCE_POINT = (1000.0, 5000.0)
     PLANNING_SCOPE_LABEL = "point-1000-5000_partition-auto"
     output_base = (
@@ -69,9 +69,9 @@ if __name__ == "__main__":
         f"最低有效离散阈值={SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD:.2f} | "
         f"候选最小面积占比={SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY:.0%} | "
         f"起点策略={START_POINT_STRATEGY} | "
-        "测线取舍规则=adaptive-parent-gain | "
-        f"父收益折减={CHILD_LINE_PARENT_GAIN_FACTOR:.0%} | "
-        f"最低阈值={CHILD_LINE_MIN_GAIN_THRESHOLD:.0%}"
+        "测线取舍规则=fixed-80pct-relocation | "
+        f"目标收益率={TARGET_LINE_GAIN_RATIO:.0%} | "
+        f"低收益位移搜索≤{GAIN_RELOCATION_MAX_STEPS}步"
     )
     print(f"[主流程] 输出目录: {output_base}")
 
@@ -126,8 +126,8 @@ if __name__ == "__main__":
         cell_effective_area=coarse_cell_effective_area,
         grid_cell_size=d_optimal,
         start_point_strategy=START_POINT_STRATEGY,
-        child_line_parent_gain_factor=CHILD_LINE_PARENT_GAIN_FACTOR,
-        child_line_min_gain_threshold=CHILD_LINE_MIN_GAIN_THRESHOLD,
+        target_line_gain_ratio=TARGET_LINE_GAIN_RATIO,
+        gain_relocation_max_steps=GAIN_RELOCATION_MAX_STEPS,
     )
     planner.plan_line(REFERENCE_POINT[0], REFERENCE_POINT[1], output_dir=output_base)
     # planner.plan_all(output_dir=output_base)
