@@ -44,12 +44,12 @@ if __name__ == "__main__":
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     PRIMARY_FEATURE_MODE = "xy_coverage_depth"
     PRIMARY_FEATURE_LABEL = "xycovdepth"
-    SECONDARY_FEATURE_LABEL = "grad"
+    SECONDARY_FEATURE_LABEL = "rawgrad"
     START_POINT_STRATEGY = "geometric_center"
     START_POINT_LABEL = "geocenter"
-    SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD = 0.10
+    SECONDARY_GRADIENT_STD_THRESHOLD_FLOOR = 0.0
     SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY = 0.05
-    SECONDARY_THRESHOLD_LABEL = "sec-adaptive-min0p1-area5pct"
+    SECONDARY_THRESHOLD_LABEL = "sec-std-adaptive-area5pct"
     TARGET_LINE_GAIN_RATIO = 0.80
     GAIN_RELOCATION_MAX_STEPS = 5
     PARALLEL_PLANNING = True
@@ -66,9 +66,9 @@ if __name__ == "__main__":
     print(
         "[主流程] 当前配置 | "
         f"一级分区特征={PRIMARY_FEATURE_MODE} | "
-        f"二级分区特征=gradient-direction | "
-        "二次触发规则=adaptive-maxgap | "
-        f"最低有效离散阈值={SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD:.2f} | "
+        f"二级分区特征=raw-gradient | "
+        "二次触发规则=std-adaptive-maxgap | "
+        f"梯度标准差阈值下限={SECONDARY_GRADIENT_STD_THRESHOLD_FLOOR:.2f} | "
         f"候选最小面积占比={SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY:.0%} | "
         f"起点策略={START_POINT_STRATEGY} | "
         "测线取舍规则=fixed-80pct-relocation | "
@@ -89,7 +89,7 @@ if __name__ == "__main__":
         gy_matrix=gy_matrix,
         depth_matrix=depth_matrix,
         primary_feature_mode=PRIMARY_FEATURE_MODE,
-        direction_dispersion_threshold=SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD,
+        gradient_std_threshold_floor=SECONDARY_GRADIENT_STD_THRESHOLD_FLOOR,
         min_partition_area_ratio_for_secondary=SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY,
         cell_effective_area=coarse_cell_effective_area,
     )

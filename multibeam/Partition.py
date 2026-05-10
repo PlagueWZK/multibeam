@@ -14,7 +14,7 @@ PRIMARY_FEATURES_BY_MODE = {
     "coverage_depth": ("coverage_count", "depth"),
     "coverage_only": ("coverage_count",),
 }
-SECONDARY_FEATURE_NAMES = ("ux", "uy")
+SECONDARY_FEATURE_NAMES = ("gx", "gy")
 
 
 def find_optimal_k_elbow(features, k_min=2, k_max=10, output_dir=None):
@@ -138,16 +138,7 @@ def _build_feature_stacks(
 
     gx_matrix = gx_flat.reshape(rows, cols)
     gy_matrix = gy_flat.reshape(rows, cols)
-    gradient_magnitude = np.hypot(gx_matrix, gy_matrix)
-    direction_valid_mask = np.isfinite(gradient_magnitude) & (gradient_magnitude > 1e-8)
-    unit_gx_matrix = np.zeros_like(gx_matrix, dtype=float)
-    unit_gy_matrix = np.zeros_like(gy_matrix, dtype=float)
-    unit_gx_matrix[direction_valid_mask] = (
-        gx_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
-    )
-    unit_gy_matrix[direction_valid_mask] = (
-        gy_matrix[direction_valid_mask] / gradient_magnitude[direction_valid_mask]
-    )
+    finite_gradient_mask = np.isfinite(gx_matrix) & np.isfinite(gy_matrix)
 
     if primary_feature_mode == "xy_coverage":
         feature_x = grid_x.flatten().reshape(-1, 1)
@@ -166,8 +157,8 @@ def _build_feature_stacks(
 
     secondary_features = np.hstack(
         (
-            unit_gx_matrix.reshape(-1, 1),
-            unit_gy_matrix.reshape(-1, 1),
+            gx_matrix.reshape(-1, 1),
+            gy_matrix.reshape(-1, 1),
         )
     )
 
@@ -178,10 +169,7 @@ def _build_feature_stacks(
         "grid_y": grid_y,
         "gx_matrix": gx_matrix,
         "gy_matrix": gy_matrix,
-        "gradient_magnitude": gradient_magnitude,
-        "direction_valid_mask": direction_valid_mask,
-        "unit_gx_matrix": unit_gx_matrix,
-        "unit_gy_matrix": unit_gy_matrix,
+        "finite_gradient_mask": finite_gradient_mask,
         "primary_feature_names": PRIMARY_FEATURES_BY_MODE[primary_feature_mode],
         "primary_features": primary_features,
         "secondary_features": secondary_features,
@@ -819,14 +807,19 @@ def _merge_boundary_dominant_partitions(
     return renumbered_matrix, final_u, diagnostics
 
 
-def _summarize_partition_gradient_complexity(
+def _sample_std(values):
+    values = np.asarray(values, dtype=float)
+    if values.size < 2:
+        return 0.0
+    return float(np.std(values, ddof=1))
+
+
+def _summarize_partition_gradient_std(
     partition_id,
     partition_mask,
     gx_matrix,
     gy_matrix,
-    unit_gx_matrix,
-    unit_gy_matrix,
-    direction_valid_mask,
+    finite_gradient_mask,
     min_partition_size_for_secondary=12,
     partition_area=0.0,
     total_area=0.0,
@@ -837,29 +830,21 @@ def _summarize_partition_gradient_complexity(
     total_area = float(total_area)
     area_ratio = float(partition_area / total_area) if total_area > 0 else 0.0
 
-    gx_values = gx_matrix[partition_mask]
-    gy_values = gy_matrix[partition_mask]
-    magnitudes = np.hypot(gx_values, gy_values)
-    finite_magnitudes = magnitudes[np.isfinite(magnitudes)]
-    mean_magnitude = float(np.mean(finite_magnitudes)) if finite_magnitudes.size else 0.0
-    std_magnitude = float(np.std(finite_magnitudes)) if finite_magnitudes.size else 0.0
-    unit_like_gradient = bool(
-        finite_magnitudes.size > 0
-        and np.allclose(finite_magnitudes, 1.0, atol=0.05, rtol=0.05)
-    )
-
-    direction_points = int(np.count_nonzero(partition_mask & direction_valid_mask))
-    direction_dispersion = 0.0
-    mean_resultant_length = 1.0
-    if direction_points > 0:
-        ux = unit_gx_matrix[partition_mask & direction_valid_mask]
-        uy = unit_gy_matrix[partition_mask & direction_valid_mask]
-        mean_resultant_length = float(np.hypot(np.mean(ux), np.mean(uy)))
-        direction_dispersion = float(max(0.0, 1.0 - mean_resultant_length))
+    valid_gradient_mask = partition_mask & finite_gradient_mask
+    gradient_sample_count = int(np.count_nonzero(valid_gradient_mask))
+    gx_values = gx_matrix[valid_gradient_mask]
+    gy_values = gy_matrix[valid_gradient_mask]
+    mean_gx = float(np.mean(gx_values)) if gradient_sample_count else 0.0
+    mean_gy = float(np.mean(gy_values)) if gradient_sample_count else 0.0
+    sigma_gx = _sample_std(gx_values)
+    sigma_gy = _sample_std(gy_values)
+    gradient_std_metric = float(max(sigma_gx, sigma_gy))
 
     candidate_reject_reasons = []
     if cell_count < min_partition_size_for_secondary:
         candidate_reject_reasons.append("too_small_for_secondary")
+    if gradient_sample_count < 2:
+        candidate_reject_reasons.append("insufficient_finite_gradient_samples")
     if total_area <= 0:
         candidate_reject_reasons.append("invalid_total_area_for_secondary")
     elif area_ratio < min_partition_area_ratio_for_secondary:
@@ -872,16 +857,16 @@ def _summarize_partition_gradient_complexity(
         "cell_count": cell_count,
         "area": partition_area,
         "area_ratio": area_ratio,
-        "direction_points": direction_points,
-        "mean_gradient_magnitude": mean_magnitude,
-        "std_gradient_magnitude": std_magnitude,
-        "unit_like_gradient": unit_like_gradient,
-        "mean_resultant_length": mean_resultant_length,
-        "direction_dispersion": direction_dispersion,
+        "gradient_sample_count": gradient_sample_count,
+        "mean_gx": mean_gx,
+        "mean_gy": mean_gy,
+        "sigma_gx": sigma_gx,
+        "sigma_gy": sigma_gy,
+        "gradient_std_metric": gradient_std_metric,
         "secondary_candidate": bool(secondary_candidate),
         "candidate_reject_reasons": candidate_reject_reasons,
-        "effective_direction_dispersion_threshold": None,
-        "trigger_comparison": "direction_dispersion > effective_direction_dispersion_threshold",
+        "effective_gradient_std_threshold": None,
+        "trigger_comparison": "gradient_std_metric > effective_gradient_std_threshold",
         "triggered_secondary_partition": False,
         "trigger_reasons": list(candidate_reject_reasons),
     }
@@ -889,16 +874,14 @@ def _summarize_partition_gradient_complexity(
 
 def _resolve_adaptive_secondary_trigger_rule(
     diagnostics,
-    minimum_direction_dispersion_threshold=0.10,
+    gradient_std_threshold_floor=0.0,
 ):
-    """基于候选分区离散度最大间隔，计算本轮二次分区自适应阈值。"""
-    minimum_direction_dispersion_threshold = float(
-        minimum_direction_dispersion_threshold
-    )
-    if minimum_direction_dispersion_threshold < 0:
+    """基于候选分区梯度标准差指标最大间隔，计算本轮二次分区自适应阈值。"""
+    gradient_std_threshold_floor = float(gradient_std_threshold_floor)
+    if gradient_std_threshold_floor < 0:
         raise ValueError(
-            "minimum_direction_dispersion_threshold 必须 >= 0，当前为 "
-            f"{minimum_direction_dispersion_threshold}"
+            "gradient_std_threshold_floor 必须 >= 0，当前为 "
+            f"{gradient_std_threshold_floor}"
         )
 
     candidate_diagnostics = [
@@ -909,48 +892,44 @@ def _resolve_adaptive_secondary_trigger_rule(
     sorted_candidates = sorted(
         candidate_diagnostics,
         key=lambda diagnostic: (
-            float(diagnostic["direction_dispersion"]),
+            float(diagnostic["gradient_std_metric"]),
             int(diagnostic["partition_id"]),
         ),
     )
-    sorted_dispersions = [
-        float(diagnostic["direction_dispersion"])
+    sorted_metrics = [
+        float(diagnostic["gradient_std_metric"])
         for diagnostic in sorted_candidates
     ]
 
-    effective_threshold = minimum_direction_dispersion_threshold
-    threshold_source = "minimum_direction_dispersion_threshold"
+    effective_threshold = gradient_std_threshold_floor
+    threshold_source = "gradient_std_threshold_floor"
     max_gap = None
     gap_lower_value = None
     gap_upper_value = None
     gap_midpoint = None
 
-    if len(sorted_dispersions) == 0:
+    if len(sorted_metrics) == 0:
         threshold_method = "no_secondary_candidate"
-    elif len(sorted_dispersions) == 1:
-        threshold_method = "single_candidate_minimum_threshold"
+    elif len(sorted_metrics) == 1:
+        threshold_method = "single_candidate_threshold_floor"
     else:
-        gaps = np.diff(np.asarray(sorted_dispersions, dtype=float))
+        gaps = np.diff(np.asarray(sorted_metrics, dtype=float))
         max_gap_index = int(np.argmax(gaps))
         max_gap = float(gaps[max_gap_index])
-        gap_lower_value = float(sorted_dispersions[max_gap_index])
-        gap_upper_value = float(sorted_dispersions[max_gap_index + 1])
+        gap_lower_value = float(sorted_metrics[max_gap_index])
+        gap_upper_value = float(sorted_metrics[max_gap_index + 1])
         gap_midpoint = float((gap_lower_value + gap_upper_value) / 2.0)
-        effective_threshold = float(
-            max(minimum_direction_dispersion_threshold, gap_midpoint)
-        )
+        effective_threshold = float(max(gradient_std_threshold_floor, gap_midpoint))
         threshold_source = (
             "max_gap_midpoint"
-            if gap_midpoint >= minimum_direction_dispersion_threshold
-            else "minimum_direction_dispersion_threshold"
+            if gap_midpoint >= gradient_std_threshold_floor
+            else "gradient_std_threshold_floor"
         )
         threshold_method = "adaptive_max_gap_midpoint"
 
     triggered_partition_ids = []
     for diagnostic in diagnostics:
-        diagnostic["effective_direction_dispersion_threshold"] = float(
-            effective_threshold
-        )
+        diagnostic["effective_gradient_std_threshold"] = float(effective_threshold)
         if not diagnostic.get("secondary_candidate", False):
             diagnostic["triggered_secondary_partition"] = False
             diagnostic["trigger_reasons"] = list(
@@ -958,32 +937,31 @@ def _resolve_adaptive_secondary_trigger_rule(
             )
             continue
 
-        if float(diagnostic["direction_dispersion"]) > effective_threshold:
+        if float(diagnostic["gradient_std_metric"]) > effective_threshold:
             diagnostic["triggered_secondary_partition"] = True
-            diagnostic["trigger_reasons"] = ["direction_dispersion_adaptive"]
+            diagnostic["trigger_reasons"] = ["gradient_std_adaptive"]
             triggered_partition_ids.append(int(diagnostic["partition_id"]))
         else:
             diagnostic["triggered_secondary_partition"] = False
-            diagnostic["trigger_reasons"] = [
-                "direction_dispersion_below_adaptive_threshold"
-            ]
+            diagnostic["trigger_reasons"] = ["gradient_std_below_adaptive_threshold"]
 
     return {
         "threshold_mode": "adaptive_max_gap",
+        "threshold_metric": "max_sigma_gx_sigma_gy",
         "threshold_method": threshold_method,
         "threshold_source": threshold_source,
-        "minimum_direction_dispersion_threshold": float(
-            minimum_direction_dispersion_threshold
-        ),
-        "effective_direction_dispersion_threshold": float(effective_threshold),
+        "gradient_std_threshold_floor": float(gradient_std_threshold_floor),
+        "effective_gradient_std_threshold": float(effective_threshold),
         "candidate_count": int(len(sorted_candidates)),
         "candidate_partition_ids": [
             int(diagnostic["partition_id"]) for diagnostic in sorted_candidates
         ],
-        "sorted_candidate_dispersions": [
+        "sorted_candidate_gradient_std_metrics": [
             {
                 "partition_id": int(diagnostic["partition_id"]),
-                "direction_dispersion": float(diagnostic["direction_dispersion"]),
+                "sigma_gx": float(diagnostic["sigma_gx"]),
+                "sigma_gy": float(diagnostic["sigma_gy"]),
+                "gradient_std_metric": float(diagnostic["gradient_std_metric"]),
                 "area_ratio": float(diagnostic["area_ratio"]),
             }
             for diagnostic in sorted_candidates
@@ -992,7 +970,7 @@ def _resolve_adaptive_secondary_trigger_rule(
         "gap_lower_value": gap_lower_value,
         "gap_upper_value": gap_upper_value,
         "gap_midpoint": gap_midpoint,
-        "trigger_comparison": "direction_dispersion > effective_direction_dispersion_threshold",
+        "trigger_comparison": "gradient_std_metric > effective_gradient_std_threshold",
         "triggered_partition_ids": triggered_partition_ids,
     }
 
@@ -1003,7 +981,7 @@ def _write_secondary_partition_diagnostics(
     final_u,
     primary_feature_names,
     diagnostics,
-    direction_dispersion_threshold,
+    gradient_std_threshold_floor,
     min_partition_size_for_secondary,
     min_partition_area_ratio_for_secondary,
     secondary_k_max,
@@ -1024,21 +1002,16 @@ def _write_secondary_partition_diagnostics(
             "threshold_mode": secondary_trigger_rule.get(
                 "threshold_mode", "adaptive_max_gap"
             ),
+            "threshold_metric": secondary_trigger_rule.get(
+                "threshold_metric", "max_sigma_gx_sigma_gy"
+            ),
             "threshold_method": secondary_trigger_rule.get("threshold_method"),
             "threshold_source": secondary_trigger_rule.get("threshold_source"),
-            "direction_dispersion_threshold": float(
+            "gradient_std_threshold_floor": float(gradient_std_threshold_floor),
+            "effective_gradient_std_threshold": float(
                 secondary_trigger_rule.get(
-                    "effective_direction_dispersion_threshold",
-                    direction_dispersion_threshold,
-                )
-            ),
-            "minimum_direction_dispersion_threshold": float(
-                direction_dispersion_threshold
-            ),
-            "effective_direction_dispersion_threshold": float(
-                secondary_trigger_rule.get(
-                    "effective_direction_dispersion_threshold",
-                    direction_dispersion_threshold,
+                    "effective_gradient_std_threshold",
+                    gradient_std_threshold_floor,
                 )
             ),
             "min_partition_area_ratio_for_secondary": float(
@@ -1050,8 +1023,8 @@ def _write_secondary_partition_diagnostics(
             "candidate_partition_ids": secondary_trigger_rule.get(
                 "candidate_partition_ids", []
             ),
-            "sorted_candidate_dispersions": secondary_trigger_rule.get(
-                "sorted_candidate_dispersions", []
+            "sorted_candidate_gradient_std_metrics": secondary_trigger_rule.get(
+                "sorted_candidate_gradient_std_metrics", []
             ),
             "max_gap": secondary_trigger_rule.get("max_gap"),
             "gap_lower_value": secondary_trigger_rule.get("gap_lower_value"),
@@ -1059,7 +1032,7 @@ def _write_secondary_partition_diagnostics(
             "gap_midpoint": secondary_trigger_rule.get("gap_midpoint"),
             "trigger_comparison": secondary_trigger_rule.get(
                 "trigger_comparison",
-                "direction_dispersion > effective_direction_dispersion_threshold",
+                "gradient_std_metric > effective_gradient_std_threshold",
             ),
             "triggered_partition_ids": secondary_trigger_rule.get(
                 "triggered_partition_ids", []
@@ -1139,7 +1112,7 @@ def partition_coverage_matrix(
     primary_feature_mode="coverage_only",
     secondary_k_max=6,
     min_partition_size_for_secondary=12,
-    direction_dispersion_threshold=0.10,
+    gradient_std_threshold_floor=0.0,
     min_partition_area_ratio_for_secondary=0.05,
     connectivity=4,
     cell_effective_area=None,
@@ -1163,7 +1136,7 @@ def partition_coverage_matrix(
         gx_matrix, gy_matrix: 梯度矩阵；若提供则复用 Coverage 阶段预计算结果
         primary_feature_mode: 一级分区特征模式。xy_coverage_depth 表示 X/Y/覆盖次数/深度
         depth_matrix: 深度矩阵；primary_feature_mode=xy_coverage_depth 时必须提供
-        direction_dispersion_threshold: 自适应二次分区触发的最低有效方向离散度阈值
+        gradient_std_threshold_floor: 自适应二次分区触发的梯度标准差指标阈值下限
         min_partition_area_ratio_for_secondary: 二次分区候选最小面积占比，默认 0.05 表示总待测海域的 5%
         connectivity: 分区后处理的连通性定义。默认 4 表示边连通；8 表示边或角连通
         cell_effective_area: 每个网格在待测海域内的真实有效面积；提供时用于小面积分区合并
@@ -1186,10 +1159,7 @@ def partition_coverage_matrix(
     cols = feature_bundle["cols"]
     gx_matrix = feature_bundle["gx_matrix"]
     gy_matrix = feature_bundle["gy_matrix"]
-    gradient_magnitude = feature_bundle["gradient_magnitude"]
-    direction_valid_mask = feature_bundle["direction_valid_mask"]
-    unit_gx_matrix = feature_bundle["unit_gx_matrix"]
-    unit_gy_matrix = feature_bundle["unit_gy_matrix"]
+    finite_gradient_mask = feature_bundle["finite_gradient_mask"]
     primary_feature_names = feature_bundle["primary_feature_names"]
     primary_features = feature_bundle["primary_features"]
     secondary_features = feature_bundle["secondary_features"]
@@ -1262,14 +1232,12 @@ def partition_coverage_matrix(
     ]
     for partition_id in partition_ids:
         partition_mask = first_stage_cluster_matrix == partition_id
-        diagnostic = _summarize_partition_gradient_complexity(
+        diagnostic = _summarize_partition_gradient_std(
             partition_id,
             partition_mask,
             gx_matrix,
             gy_matrix,
-            unit_gx_matrix,
-            unit_gy_matrix,
-            direction_valid_mask,
+            finite_gradient_mask,
             min_partition_size_for_secondary=min_partition_size_for_secondary,
             partition_area=first_stage_partition_areas.get(partition_id, 0.0),
             total_area=secondary_total_area,
@@ -1281,14 +1249,14 @@ def partition_coverage_matrix(
 
     secondary_trigger_rule = _resolve_adaptive_secondary_trigger_rule(
         diagnostics,
-        minimum_direction_dispersion_threshold=direction_dispersion_threshold,
+        gradient_std_threshold_floor=gradient_std_threshold_floor,
     )
 
     print(
         "[分区检测] 自适应二次触发 | "
         f"面积口径={secondary_area_source} | "
-        f"最低有效离散阈值={direction_dispersion_threshold:.3f} | "
-        f"有效阈值={secondary_trigger_rule['effective_direction_dispersion_threshold']:.3f} | "
+        f"梯度标准差阈值下限={gradient_std_threshold_floor:.3f} | "
+        f"有效阈值={secondary_trigger_rule['effective_gradient_std_threshold']:.3f} | "
         f"候选最小面积={secondary_min_area:.2f} "
         f"({min_partition_area_ratio_for_secondary:.2%}) | "
         f"候选数={secondary_trigger_rule['candidate_count']} | "
@@ -1302,10 +1270,12 @@ def partition_coverage_matrix(
         print(
             f"[分区检测] 一级分区{partition_id} | cells={diagnostic['cell_count']} | "
             f"area_ratio={diagnostic['area_ratio']:.2%} | "
-            f"dispersion={diagnostic['direction_dispersion']:.3f} | "
-            f"effective_threshold={diagnostic['effective_direction_dispersion_threshold']:.3f} | "
+            f"gradient_samples={diagnostic['gradient_sample_count']} | "
+            f"sigma_gx={diagnostic['sigma_gx']:.3f} | "
+            f"sigma_gy={diagnostic['sigma_gy']:.3f} | "
+            f"std_metric={diagnostic['gradient_std_metric']:.3f} | "
+            f"effective_threshold={diagnostic['effective_gradient_std_threshold']:.3f} | "
             f"candidate={diagnostic['secondary_candidate']} | "
-            f"unit_like={diagnostic['unit_like_gradient']} | "
             f"二次分区={diagnostic['triggered_secondary_partition']} | "
             f"reasons={diagnostic['trigger_reasons']}"
         )
@@ -1456,7 +1426,7 @@ def partition_coverage_matrix(
         post_secondary_u,
         primary_feature_names,
         diagnostics,
-        direction_dispersion_threshold,
+        gradient_std_threshold_floor,
         min_partition_size_for_secondary,
         min_partition_area_ratio_for_secondary,
         secondary_k_max,
