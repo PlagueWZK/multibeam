@@ -3,12 +3,32 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/local" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_174811" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_175409" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_180350" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_180839" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_181153" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_205754" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_211404" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260406_224346" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_010719" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_014313" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_015442" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260407_015837" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/dot" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/lines" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/metrics" />
+      <excludeFolder url="file://$MODULE_DIR$/outputs" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/20260426_010805_cov-g_primary-xy-coverage-depth_secondary-gradient_start-geometric-center_secondary-threshold-0p2_gain-threshold-0p4" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/坐标深度覆盖次数-梯度方向-三种起始点-失败" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/旧" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/梯度方向-深度覆盖次数-仅分区" />
+      <excludeFolder url="file://$MODULE_DIR$/multibeam/output/结果集" />
+      <excludeFolder url="file://$MODULE_DIR$/original/output" />
+      <excludeFolder url="file://$MODULE_DIR$/output" />
     </content>
-    <orderEntry type="jdk" jdkName="uv (multibeam) (3)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="uv (multibeam) (2)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
-  </component>
-  <component name="PyDocumentationSettings">
-    <option name="format" value="PLAIN" />
-    <option name="myDocStringFormat" value="Plain" />
   </component>
 </module>

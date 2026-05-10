@@ -9,7 +9,7 @@ Usage from the project root on Windows PowerShell:
 
 The script intentionally runs all combinations through the same frozen pipeline:
 
-- adaptive secondary partition trigger: max-gap, minimum 0.10, area >= 5%
+- adaptive secondary partition trigger: max-gap on max(sigma_gx, sigma_gy), floor 0.0, area >= 5%
 - start point strategy: geometric_center
 - line retention: adaptive max(30%, parent_gain * 80%) by default, or fixed threshold via CLI
 - planning scope: plan_all
@@ -78,9 +78,9 @@ Y_MIN, Y_MAX = 0, 5 * 1852
 
 START_POINT_STRATEGY = "geometric_center"
 START_POINT_LABEL = "geocenter"
-SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD = 0.10
+SECONDARY_GRADIENT_STD_THRESHOLD_FLOOR = 0.0
 SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY = 0.05
-SECONDARY_RULE_LABEL = "sec-adaptive-min0p1-area5pct"
+SECONDARY_RULE_LABEL = "sec-std-adaptive-area5pct"
 CHILD_LINE_PARENT_GAIN_FACTOR = 0.80
 CHILD_LINE_MIN_GAIN_THRESHOLD = 0.30
 PLANNING_SCOPE_LABEL = "plan-all"
@@ -227,8 +227,8 @@ def main() -> None:
     print(f"  combos={[combo.display_name for combo in combos]}")
     print(f"  start_point_strategy={START_POINT_STRATEGY}")
     print(
-        "  secondary_trigger=adaptive-maxgap | "
-        f"min_dispersion={SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD:.2f} | "
+        "  secondary_trigger=std-adaptive-maxgap | "
+        f"gradient_std_floor={SECONDARY_GRADIENT_STD_THRESHOLD_FLOOR:.2f} | "
         f"min_area_ratio={SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY:.0%}"
     )
     if args.line_gain_mode == "fixed":
@@ -291,7 +291,7 @@ def main() -> None:
             gy_matrix=gy_matrix,
             depth_matrix=depth_matrix,
             primary_feature_mode=combo.primary_feature_mode,
-            direction_dispersion_threshold=SECONDARY_DIRECTION_DISPERSION_MIN_THRESHOLD,
+            gradient_std_threshold_floor=SECONDARY_GRADIENT_STD_THRESHOLD_FLOOR,
             min_partition_area_ratio_for_secondary=SECONDARY_MIN_AREA_RATIO_FOR_SECONDARY,
             cell_effective_area=coarse_cell_effective_area,
         )

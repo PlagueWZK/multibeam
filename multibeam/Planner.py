@@ -6,9 +6,12 @@
 """
 
 import datetime
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import RLock
 
 import numpy as np
 
@@ -53,8 +56,26 @@ class _ChildLineCandidate:
     gain_ratio: float = 0.0
     new_area: float = 0.0
     hit_area: float = 0.0
-    parent_gain_ratio: float = 1.0
-    gain_threshold: float = 0.0
+    target_gain_ratio: float = 0.80
+    selection_reason: str = ""
+    relocation_step_index: int = 0
+
+
+@dataclass
+class _GainRelocationState:
+    """低收益候选组位移搜索中的一个临时状态。"""
+
+    step_index: int
+    candidates: list[_ChildLineCandidate]
+    logical_segments: list[np.ndarray]
+    gain_ratio: float
+    new_area: float
+    hit_area: float
+    valid_points: int
+    boundary_rejects: int
+    low_value_rejects: int
+    all_out_of_partition: bool = False
+    selection_reason: str = ""
 
 
 class SurveyPlanner:
@@ -77,11 +98,17 @@ class SurveyPlanner:
         grid_cell_size=None,
         depth_matrix=None,
         start_point_strategy="deepest",
-        line_gain_threshold_mode="adaptive",
-        jump_line_gain_threshold=0.75,
-        child_line_parent_gain_factor=0.80,
-        child_line_min_gain_threshold=0.30,
-        main_line_parent_gain_ratio=1.0,
+        line_gain_threshold_mode=None,
+        jump_line_gain_threshold=None,
+        child_line_parent_gain_factor=None,
+        child_line_min_gain_threshold=None,
+        main_line_parent_gain_ratio=None,
+        target_line_gain_ratio=0.80,
+        gain_relocation_max_steps=5,
+        parallel_planning=True,
+        max_planning_workers=None,
+        parallel_candidate_points=True,
+        parallel_gain_masks=True,
     ):
         self.xs = xs
         self.ys = ys
@@ -102,38 +129,47 @@ class SurveyPlanner:
         self.current_microstep = self.legacy_microstep
         self.partition_coverage_summaries = {}
         self.partition_start_points = {}
-        self.line_gain_threshold_mode = str(line_gain_threshold_mode).strip().lower()
-        self.supported_line_gain_threshold_modes = {"adaptive", "fixed"}
-        if self.line_gain_threshold_mode not in self.supported_line_gain_threshold_modes:
+        self.legacy_line_gain_threshold_mode = line_gain_threshold_mode
+        self.legacy_jump_line_gain_threshold = jump_line_gain_threshold
+        self.legacy_child_line_parent_gain_factor = child_line_parent_gain_factor
+        self.legacy_child_line_min_gain_threshold = child_line_min_gain_threshold
+        self.legacy_main_line_parent_gain_ratio = main_line_parent_gain_ratio
+        self.target_line_gain_ratio = float(target_line_gain_ratio)
+        if not 0.0 <= self.target_line_gain_ratio <= 1.0:
             raise ValueError(
-                "不支持的测线取舍收益率阈值模式："
-                f"{line_gain_threshold_mode}，可选={sorted(self.supported_line_gain_threshold_modes)}"
+                "目标测线收益率必须位于 [0, 1] 区间："
+                f"{target_line_gain_ratio}"
             )
-        self.jump_line_gain_threshold = float(jump_line_gain_threshold)
-        if not 0.0 <= self.jump_line_gain_threshold <= 1.0:
+        self.gain_relocation_max_steps = int(gain_relocation_max_steps)
+        if self.gain_relocation_max_steps < 1:
             raise ValueError(
-                "固定测线取舍收益率阈值必须位于 [0, 1] 区间："
-                f"{jump_line_gain_threshold}"
+                "低收益测线位移搜索最大步数必须 >= 1："
+                f"{gain_relocation_max_steps}"
             )
-        self.child_line_parent_gain_factor = float(child_line_parent_gain_factor)
-        if not 0.0 <= self.child_line_parent_gain_factor <= 1.0:
+        self.parallel_planning = bool(parallel_planning)
+        default_workers = min(4, os.cpu_count() or 1)
+        self.max_planning_workers = int(
+            max_planning_workers
+            if max_planning_workers is not None
+            else default_workers
+        )
+        if self.max_planning_workers < 1:
             raise ValueError(
-                "子测线父收益折减系数必须位于 [0, 1] 区间："
-                f"{child_line_parent_gain_factor}"
+                "规划线程 worker 数必须 >= 1："
+                f"{max_planning_workers}"
             )
-        self.child_line_min_gain_threshold = float(child_line_min_gain_threshold)
-        if not 0.0 <= self.child_line_min_gain_threshold <= 1.0:
-            raise ValueError(
-                "子测线最低收益率阈值必须位于 [0, 1] 区间："
-                f"{child_line_min_gain_threshold}"
+        self.parallel_candidate_points = bool(parallel_candidate_points)
+        self.parallel_gain_masks = bool(parallel_gain_masks)
+        self._planning_executor = None
+        self._coverage_lock = RLock()
+        self._record_lock = RLock()
+        self._visualizer_lock = RLock()
+        self._log_lock = RLock()
+        if self.parallel_planning and self.max_planning_workers > 1:
+            self._planning_executor = ThreadPoolExecutor(
+                max_workers=self.max_planning_workers,
+                thread_name_prefix="survey-planner",
             )
-        self.main_line_parent_gain_ratio = float(main_line_parent_gain_ratio)
-        if not 0.0 <= self.main_line_parent_gain_ratio <= 1.0:
-            raise ValueError(
-                "主测线参考父收益率必须位于 [0, 1] 区间："
-                f"{main_line_parent_gain_ratio}"
-            )
-        self.max_consecutive_jump_lines = 3
         self.start_point_strategy = str(start_point_strategy).strip().lower()
         self.supported_start_point_strategies = {
             "deepest",
@@ -212,6 +248,43 @@ class SurveyPlanner:
     # ------------------------------------------------------------------
     # 内部辅助方法
     # ------------------------------------------------------------------
+
+    def _parallel_enabled(self, feature_enabled=True, item_count=2) -> bool:
+        return (
+            self.parallel_planning
+            and bool(feature_enabled)
+            and self.max_planning_workers > 1
+            and self._planning_executor is not None
+            and int(item_count) > 1
+        )
+
+    def _parallel_map_ordered(self, func, items, *, feature_enabled=True):
+        items = list(items)
+        if not self._parallel_enabled(feature_enabled, len(items)):
+            return [func(item) for item in items]
+        return list(self._planning_executor.map(func, items))
+
+    def shutdown_parallel_resources(self):
+        if self._planning_executor is not None:
+            self._planning_executor.shutdown(wait=True, cancel_futures=False)
+            self._planning_executor = None
+
+    def __del__(self):
+        try:
+            self.shutdown_parallel_resources()
+        except Exception:
+            pass
+
+    def _describe_parallel_planning_rule(self):
+        if not self.parallel_planning or self.max_planning_workers <= 1:
+            return "serial"
+        enabled_units = []
+        if self.parallel_candidate_points:
+            enabled_units.append("candidate-points")
+        if self.parallel_gain_masks:
+            enabled_units.append("gain-masks")
+        unit_label = "+".join(enabled_units) if enabled_units else "locks-only"
+        return f"threads={self.max_planning_workers} | units={unit_label}"
 
     def _is_in_partition(self, x, y, partition_id):
         """判断点 (x, y) 是否属于指定分区"""
@@ -500,36 +573,38 @@ class SurveyPlanner:
         repeated_area=0.0,
     ):
         """测线生成完毕后立即计算并记录指标"""
-        pts = np.array(points)
-        if len(pts) < 2:
-            return None
-        length = figure_length(pts)
-        coverage = figure_width(pts)
+        with self._record_lock:
+            pts = np.array(points)
+            if len(pts) < 2:
+                return None
+            length = figure_length(pts)
+            coverage = figure_width(pts)
 
-        record = LineRecord(
-            line_id=self._line_counter,
-            partition_id=partition_id,
-            points=pts,
-            length=length,
-            coverage=coverage,
-            overlap_excess_length=float(overlap_excess_length),
-            max_overlap_eta=float(max_overlap_eta),
-            repeated_area=float(repeated_area),
-            terminated_by=terminated_by,
-        )
-        self.all_records.append(record)
-
-        if self.metrics_state_grid is not None:
-            contributions = self.metrics_state_grid.record_polyline_contribution(
-                pts,
-                line_id=record.line_id,
-                owner_partition_id=partition_id,
+            record = LineRecord(
+                line_id=self._line_counter,
+                partition_id=partition_id,
+                points=pts,
+                length=length,
+                coverage=coverage,
+                overlap_excess_length=float(overlap_excess_length),
+                max_overlap_eta=float(max_overlap_eta),
+                repeated_area=float(repeated_area),
+                terminated_by=terminated_by,
             )
-            self.line_partition_contributions.extend(contributions)
-            record.repeated_area = float(sum(c.repeated_area for c in contributions))
+            self.all_records.append(record)
 
-        self._line_counter += 1
-        return record
+            if self.metrics_state_grid is not None:
+                with self._coverage_lock:
+                    contributions = self.metrics_state_grid.record_polyline_contribution(
+                        pts,
+                        line_id=record.line_id,
+                        owner_partition_id=partition_id,
+                    )
+                self.line_partition_contributions.extend(contributions)
+                record.repeated_area = float(sum(c.repeated_area for c in contributions))
+
+            self._line_counter += 1
+            return record
 
     def _compute_parent_child_overlap_rate(self, parent_point, child_point) -> float:
         parent_arr = np.asarray(parent_point, dtype=float)
@@ -610,17 +685,20 @@ class SurveyPlanner:
     def _snapshot_global_metrics_state(self):
         if self.metrics_state_grid is None:
             return None
-        return self.metrics_state_grid.snapshot_state()
+        with self._coverage_lock:
+            return self.metrics_state_grid.snapshot_state()
 
     def _snapshot_global_covered_mask(self):
         if self.metrics_state_grid is None:
             return None
-        return np.array(self.metrics_state_grid.covered_sample_mask, copy=True)
+        with self._coverage_lock:
+            return np.array(self.metrics_state_grid.covered_sample_mask, copy=True)
 
     def _restore_global_metrics_state(self, snapshot) -> None:
         if self.metrics_state_grid is None or snapshot is None:
             return
-        self.metrics_state_grid.restore_state(snapshot)
+        with self._coverage_lock:
+            self.metrics_state_grid.restore_state(snapshot)
 
     def _point_with_width(self, x, y):
         """返回 [x, y, 覆盖宽度(w_total)]。"""
@@ -643,15 +721,17 @@ class SurveyPlanner:
         """规划期临时写入全局覆盖状态；不累计统计指标。"""
         if self.metrics_state_grid is None:
             return
-        self.metrics_state_grid.mark_segment_covered_for_planning(
-            np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
-        )
+        with self._coverage_lock:
+            self.metrics_state_grid.mark_segment_covered_for_planning(
+                np.asarray(start_point, dtype=float), np.asarray(end_point, dtype=float)
+            )
 
     def _mark_global_polyline_covered_for_planning(self, points):
         """规划期临时写入整条测线覆盖状态；不累计统计指标。"""
         if self.metrics_state_grid is None:
             return
-        self.metrics_state_grid.mark_polyline_covered_for_planning(points)
+        with self._coverage_lock:
+            self.metrics_state_grid.mark_polyline_covered_for_planning(points)
 
     # ------------------------------------------------------------------
     # 核心测线生成算法
@@ -844,86 +924,136 @@ class SurveyPlanner:
     def _compute_line_gain_ratio(self, line, prior_covered_mask):
         if self.metrics_state_grid is None or not self._line_has_enough_points(line):
             return 0.0, 0.0, 0.0
-        return self.metrics_state_grid.compute_polyline_gain(
-            line, prior_covered_mask=prior_covered_mask
+        with self._coverage_lock:
+            return self.metrics_state_grid.compute_polyline_gain(
+                line, prior_covered_mask=prior_covered_mask
+            )
+
+    def _compute_polyline_hit_masks_ordered(self, lines):
+        if self.metrics_state_grid is None:
+            return []
+
+        def compute_hit_mask(line):
+            return self.metrics_state_grid.compute_polyline_hit_mask(line)
+
+        return self._parallel_map_ordered(
+            compute_hit_mask,
+            lines,
+            feature_enabled=self.parallel_gain_masks,
+        )
+
+    def _compute_group_gain_ratio_from_hit_masks(
+        self, line_hit_masks, prior_covered_mask
+    ):
+        if self.metrics_state_grid is None:
+            return 0.0, 0.0, 0.0
+
+        if prior_covered_mask is None:
+            with self._coverage_lock:
+                simulated_prior = np.array(
+                    self.metrics_state_grid.covered_sample_mask, copy=True
+                )
+        else:
+            simulated_prior = np.array(prior_covered_mask, dtype=bool, copy=True)
+
+        total_new_area = 0.0
+        total_hit_area = 0.0
+        for line_hit_mask in line_hit_masks:
+            hit_area = self.metrics_state_grid._area_from_sample_mask(line_hit_mask)
+            if hit_area <= 1e-12:
+                continue
+            new_area = self.metrics_state_grid._area_from_sample_mask(
+                line_hit_mask & (~simulated_prior)
+            )
+            total_hit_area += hit_area
+            total_new_area += new_area
+            simulated_prior |= line_hit_mask
+
+        if total_hit_area <= 1e-12:
+            return 0.0, 0.0, total_hit_area
+        return (
+            float(total_new_area / total_hit_area),
+            float(total_new_area),
+            float(total_hit_area),
         )
 
     def _compute_group_gain_ratio(self, candidates, prior_covered_mask):
         lines = [candidate.line for candidate in candidates]
         if self.metrics_state_grid is None:
             return 0.0, 0.0, 0.0
-        return self.metrics_state_grid.compute_cumulative_polyline_group_gain(
-            lines, prior_covered_mask=prior_covered_mask
-        )
-
-    def _resolve_child_line_gain_threshold(self, parent_gain_ratio):
-        parent_gain_ratio = float(np.clip(parent_gain_ratio, 0.0, 1.0))
-        if self.line_gain_threshold_mode == "fixed":
-            return float(self.jump_line_gain_threshold)
-        return float(
-            max(
-                self.child_line_min_gain_threshold,
-                parent_gain_ratio * self.child_line_parent_gain_factor,
-            )
+        if not lines:
+            return 0.0, 0.0, 0.0
+        line_hit_masks = self._compute_polyline_hit_masks_ordered(lines)
+        return self._compute_group_gain_ratio_from_hit_masks(
+            line_hit_masks, prior_covered_mask
         )
 
     def _describe_child_line_gain_rule(self):
-        if self.line_gain_threshold_mode == "fixed":
-            return f"fixed-threshold | 阈值={self.jump_line_gain_threshold:.0%}"
         return (
-            "adaptive-parent-gain | "
-            f"父收益折减={self.child_line_parent_gain_factor:.0%} | "
-            f"最低阈值={self.child_line_min_gain_threshold:.0%}"
+            "fixed-80pct-relocation | "
+            f"目标收益率={self.target_line_gain_ratio:.0%} | "
+            f"低收益位移搜索≤{self.gain_relocation_max_steps}步"
         )
 
-    def _filter_child_candidates_by_segment_gain(
-        self, candidates, prior_covered_mask, parent_gain_ratio
-    ):
-        retained = []
-        filtered = []
-        gain_threshold = self._resolve_child_line_gain_threshold(parent_gain_ratio)
-        if self.metrics_state_grid is None:
-            for candidate in candidates:
-                candidate.parent_gain_ratio = float(parent_gain_ratio)
-                candidate.gain_threshold = float(gain_threshold)
-                candidate.gain_ratio = 1.0
-                candidate.new_area = 0.0
-                candidate.hit_area = 0.0
-                retained.append(candidate)
-            return retained, filtered, gain_threshold
-
-        if prior_covered_mask is None:
-            simulated_prior = np.array(
-                self.metrics_state_grid.covered_sample_mask, copy=True
-            )
-        else:
-            simulated_prior = np.array(prior_covered_mask, dtype=bool, copy=True)
-
+    def _make_gain_relocation_state(
+        self,
+        step_index,
+        candidates,
+        logical_segments,
+        valid_points,
+        boundary_rejects,
+        low_value_rejects,
+        prior_covered_mask,
+        *,
+        all_out_of_partition=False,
+    ) -> _GainRelocationState:
+        gain_ratio, new_area, hit_area = self._compute_group_gain_ratio(
+            candidates, prior_covered_mask
+        )
         for candidate in candidates:
-            line_hit_mask = self.metrics_state_grid.compute_polyline_hit_mask(
-                candidate.line
-            )
-            hit_area = self.metrics_state_grid._area_from_sample_mask(line_hit_mask)
-            if hit_area > 1e-12:
-                new_area = self.metrics_state_grid._area_from_sample_mask(
-                    line_hit_mask & (~simulated_prior)
-                )
-                gain_ratio = float(new_area / hit_area)
-            else:
-                new_area = 0.0
-                gain_ratio = 0.0
-
-            candidate.parent_gain_ratio = float(parent_gain_ratio)
-            candidate.gain_threshold = float(gain_threshold)
             candidate.gain_ratio = float(gain_ratio)
             candidate.new_area = float(new_area)
             candidate.hit_area = float(hit_area)
-            if hit_area > 1e-12 and gain_ratio >= gain_threshold:
-                retained.append(candidate)
-                simulated_prior |= line_hit_mask
-            else:
-                filtered.append(candidate)
-        return retained, filtered, gain_threshold
+            candidate.target_gain_ratio = float(self.target_line_gain_ratio)
+            candidate.relocation_step_index = int(step_index)
+        return _GainRelocationState(
+            step_index=int(step_index),
+            candidates=list(candidates),
+            logical_segments=[np.asarray(seg, dtype=float).copy() for seg in logical_segments],
+            gain_ratio=float(gain_ratio),
+            new_area=float(new_area),
+            hit_area=float(hit_area),
+            valid_points=int(valid_points),
+            boundary_rejects=int(boundary_rejects),
+            low_value_rejects=int(low_value_rejects),
+            all_out_of_partition=bool(all_out_of_partition),
+        )
+
+    @staticmethod
+    def _gain_state_score(state: _GainRelocationState):
+        return (
+            float(state.gain_ratio),
+            float(state.new_area),
+            float(state.hit_area),
+            -int(state.step_index),
+        )
+
+    def _is_better_gain_state(self, candidate, current_best) -> bool:
+        if candidate is None:
+            return False
+        if len(candidate.candidates) == 0 or candidate.hit_area <= 1e-12:
+            return False
+        if current_best is None:
+            return True
+        return self._gain_state_score(candidate) > self._gain_state_score(current_best)
+
+    def _apply_gain_state_selection_reason(
+        self, state: _GainRelocationState, reason: str
+    ) -> _GainRelocationState:
+        state.selection_reason = str(reason)
+        for candidate in state.candidates:
+            candidate.selection_reason = str(reason)
+        return state
 
     @staticmethod
     def _is_finite_candidate_point(point) -> bool:
@@ -976,7 +1106,41 @@ class SurveyPlanner:
             return None, None, "low_value", None
         invalid_iteration_point = self._make_invalid_iteration_point(new_x, new_y)
         if not self._is_in_partition(new_x, new_y, target_partition_id):
-            return None, None, "boundary", invalid_iteration_point
+            return None, None, "boundary", None
+
+        candidate_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
+        if not self._is_finite_candidate_point(candidate_point):
+            return None, None, "low_value", invalid_iteration_point
+        candidate_point = self._with_iteration_validity(candidate_point, True)
+
+        overlap_rate = self._compute_parent_child_overlap_rate(
+            parent_point, candidate_point
+        )
+        return candidate_point, overlap_rate, None, None
+
+    def _compute_gain_relocation_candidate_point(
+        self, parent_point, direction, target_partition_id
+    ):
+        """低收益搜索：沿梯度方向按一个细网格边长生成下一候选点。"""
+
+        x, y = float(parent_point[0]), float(parent_point[1])
+        gx = float(get_gx(x, y))
+        gy = float(get_gy(x, y))
+        grad_norm = float(np.hypot(gx, gy))
+        if not np.isfinite(grad_norm) or grad_norm <= 1e-12:
+            return None, None, "low_value", None
+
+        relocation_step = float(self.step)
+        unit_x = gx / grad_norm
+        unit_y = gy / grad_norm
+        new_x = x - direction * relocation_step * unit_x
+        new_y = y - direction * relocation_step * unit_y
+        if not np.isfinite(new_x) or not np.isfinite(new_y):
+            return None, None, "low_value", None
+
+        invalid_iteration_point = self._make_invalid_iteration_point(new_x, new_y)
+        if not self._is_in_partition(new_x, new_y, target_partition_id):
+            return None, None, "boundary", None
 
         candidate_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
         if not self._is_finite_candidate_point(candidate_point):
@@ -996,8 +1160,59 @@ class SurveyPlanner:
             line=line.copy(), initial_line=line.copy(), overlap_rates=rates.copy()
         )
 
+    def _compute_candidate_point_task(self, task):
+        index, parent_point, direction, target_partition_id, relocation_mode = task
+        if relocation_mode:
+            candidate_point, overlap_rate, reject_reason, rejected_point = (
+                self._compute_gain_relocation_candidate_point(
+                    parent_point,
+                    direction,
+                    target_partition_id,
+                )
+            )
+        else:
+            candidate_point, overlap_rate, reject_reason, rejected_point = (
+                self._compute_perpendicular_candidate_point(
+                    parent_point,
+                    direction,
+                    target_partition_id,
+                )
+            )
+        return {
+            "index": int(index),
+            "parent_point": parent_point,
+            "candidate_point": candidate_point,
+            "overlap_rate": overlap_rate,
+            "reject_reason": reject_reason,
+            "rejected_point": rejected_point,
+        }
+
+    def _compute_candidate_points_ordered(
+        self, parent_arr, direction, target_partition_id, relocation_mode
+    ):
+        tasks = [
+            (
+                index,
+                np.asarray(parent_point, dtype=float),
+                direction,
+                target_partition_id,
+                relocation_mode,
+            )
+            for index, parent_point in enumerate(parent_arr)
+        ]
+        return self._parallel_map_ordered(
+            self._compute_candidate_point_task,
+            tasks,
+            feature_enabled=self.parallel_candidate_points,
+        )
+
     def _generate_initial_child_candidates(
-        self, parent_segments, direction, target_partition_id, prior_covered_mask=None
+        self,
+        parent_segments,
+        direction,
+        target_partition_id,
+        prior_covered_mask=None,
+        relocation_mode=False,
     ):
         candidates: list[_ChildLineCandidate] = []
         logical_segments = []
@@ -1032,22 +1247,28 @@ class SurveyPlanner:
             if len(parent_arr) == 0:
                 continue
 
-            for parent_point in parent_arr:
-                candidate_point, overlap_rate, reject_reason, rejected_point = (
-                    self._compute_perpendicular_candidate_point(
-                        parent_point,
-                        direction,
-                        target_partition_id,
-                    )
-                )
+            candidate_results = self._compute_candidate_points_ordered(
+                parent_arr,
+                direction,
+                target_partition_id,
+                relocation_mode,
+            )
+
+            for result in candidate_results:
+                candidate_point = result["candidate_point"]
+                overlap_rate = result["overlap_rate"]
+                reject_reason = result["reject_reason"]
+                rejected_point = result["rejected_point"]
                 if candidate_point is None:
                     if rejected_point is not None:
                         current_logical_points.append(rejected_point)
                     if reject_reason == "boundary":
                         boundary_rejects += 1
+                        flush_current_run()
+                        flush_current_logical_segment()
                     else:
                         low_value_rejects += 1
-                    flush_current_run()
+                        flush_current_run()
                     continue
 
                 if len(current_points) == 0:
@@ -1264,7 +1485,7 @@ class SurveyPlanner:
                 invalid_stop_point = None
             elif not self._is_in_partition(new_x, new_y, target_partition_id):
                 stop_reason = TerminationReason.BOUNDARY
-                invalid_stop_point = self._make_invalid_iteration_point(new_x, new_y)
+                invalid_stop_point = None
             else:
                 new_point = np.asarray(self._point_with_width(new_x, new_y), dtype=float)
                 if not self._is_finite_candidate_point(new_point):
@@ -1342,6 +1563,7 @@ class SurveyPlanner:
         target_partition_id,
         direction_name,
         prior_covered_mask=None,
+        relocation_mode=False,
     ):
         candidates, logical_segments, valid_points, boundary_rejects, low_value_rejects = (
             self._generate_initial_child_candidates(
@@ -1349,6 +1571,7 @@ class SurveyPlanner:
                 direction,
                 target_partition_id,
                 prior_covered_mask=prior_covered_mask,
+                relocation_mode=relocation_mode,
             )
         )
         extended_candidates, logical_segments = self._extend_child_group_external_ends(
@@ -1365,6 +1588,159 @@ class SurveyPlanner:
             boundary_rejects,
             low_value_rejects,
         )
+
+    def _select_child_group_with_gain_relocation(
+        self,
+        initial_candidates,
+        initial_logical_segments,
+        initial_valid_points,
+        initial_boundary_rejects,
+        initial_low_value_rejects,
+        direction,
+        target_partition_id,
+        direction_name,
+        prior_covered_mask=None,
+    ) -> _GainRelocationState | None:
+        """按 80% 目标收益率选择候选组；低收益时执行最多 5 次重迭代搜索。"""
+
+        initial_state = self._make_gain_relocation_state(
+            0,
+            initial_candidates,
+            initial_logical_segments,
+            initial_valid_points,
+            initial_boundary_rejects,
+            initial_low_value_rejects,
+            prior_covered_mask,
+        )
+        if initial_state.hit_area <= 1e-12:
+            print(
+                f"[{direction_name}扩展] 候选组全局扫中面积为0，无法进入收益位移搜索"
+            )
+            return None
+
+        print(
+            f"[{direction_name}扩展] 候选组累计收益率={initial_state.gain_ratio:.2%} "
+            f"(新增={initial_state.new_area:.2f}m² / 扫中={initial_state.hit_area:.2f}m²) | "
+            f"目标={self.target_line_gain_ratio:.2%}"
+        )
+        if initial_state.gain_ratio >= self.target_line_gain_ratio:
+            return self._apply_gain_state_selection_reason(
+                initial_state, "gain_reached_80"
+            )
+
+        parent_segments = (
+            [np.asarray(seg, dtype=float).copy() for seg in initial_logical_segments]
+            if initial_logical_segments
+            else [candidate.line.copy() for candidate in initial_candidates]
+        )
+        best_state = None
+        terminal_reason = "best_gain_after_5_steps"
+        print(
+            f"[{direction_name}扩展] 候选组低于目标收益率，开始最多"
+            f"{self.gain_relocation_max_steps}次细网格步长重迭代搜索"
+        )
+
+        for relocation_step in range(1, self.gain_relocation_max_steps + 1):
+            (
+                relocated_candidates,
+                relocated_logical_segments,
+                valid_points,
+                boundary_rejects,
+                low_value_rejects,
+            ) = self._generate_candidate_group(
+                parent_segments,
+                direction,
+                target_partition_id,
+                direction_name,
+                prior_covered_mask=prior_covered_mask,
+                relocation_mode=True,
+            )
+
+            all_out_of_partition = (
+                len(relocated_candidates) == 0
+                and valid_points == 0
+                and boundary_rejects > 0
+                and low_value_rejects == 0
+            )
+            if len(relocated_candidates) == 0:
+                terminal_reason = (
+                    "all_out_of_partition_best_gain"
+                    if all_out_of_partition
+                    else "boundary_best_gain"
+                    if boundary_rejects > 0
+                    else "best_gain_after_5_steps"
+                )
+                print(
+                    f"[{direction_name}扩展 位移{relocation_step}] 未形成有效候选组 | "
+                    f"边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects} | "
+                    f"原因={terminal_reason}"
+                )
+                break
+
+            state = self._make_gain_relocation_state(
+                relocation_step,
+                relocated_candidates,
+                relocated_logical_segments,
+                valid_points,
+                boundary_rejects,
+                low_value_rejects,
+                prior_covered_mask,
+                all_out_of_partition=all_out_of_partition,
+            )
+            if self._is_better_gain_state(state, best_state):
+                best_state = state
+
+            print(
+                f"[{direction_name}扩展 位移{relocation_step}] "
+                f"累计收益率={state.gain_ratio:.2%} "
+                f"(新增={state.new_area:.2f}m² / 扫中={state.hit_area:.2f}m²) | "
+                f"有效点={valid_points} | 子测线={len(relocated_candidates)} | "
+                f"边界拒绝={boundary_rejects} | 低收益拒绝={low_value_rejects}"
+            )
+
+            if state.gain_ratio >= self.target_line_gain_ratio:
+                print(
+                    f"[{direction_name}扩展 位移{relocation_step}] 达到目标收益率，选择该状态落地"
+                )
+                return self._apply_gain_state_selection_reason(
+                    state, "gain_reached_80"
+                )
+
+            if all_out_of_partition:
+                terminal_reason = "all_out_of_partition_best_gain"
+                print(
+                    f"[{direction_name}扩展 位移{relocation_step}] 测线组全部出界，快速结束搜索"
+                )
+                break
+            if boundary_rejects > 0:
+                terminal_reason = "boundary_best_gain"
+                print(
+                    f"[{direction_name}扩展 位移{relocation_step}] 已触及边界，选择历史最佳状态"
+                )
+                break
+
+            parent_segments = (
+                [
+                    np.asarray(segment, dtype=float).copy()
+                    for segment in relocated_logical_segments
+                ]
+                if relocated_logical_segments
+                else [candidate.line.copy() for candidate in relocated_candidates]
+            )
+
+        if best_state is None:
+            best_state = initial_state
+            print(
+                f"[{direction_name}扩展] 位移搜索未产生可落地状态，回退到初始低收益候选组"
+            )
+
+        print(
+            f"[{direction_name}扩展] 位移搜索结束，选择历史最佳状态 | "
+            f"原因={terminal_reason} | 位移步={best_state.step_index} | "
+            f"收益率={best_state.gain_ratio:.2%} | 新增={best_state.new_area:.2f}m² | "
+            f"扫中={best_state.hit_area:.2f}m²"
+        )
+        return self._apply_gain_state_selection_reason(best_state, terminal_reason)
 
     def _record_retained_child_group(
         self,
@@ -1390,7 +1766,9 @@ class SurveyPlanner:
                 else 0.0
             )
             terminated_by = (
-                candidate.terminated_reason.name.lower()
+                candidate.selection_reason
+                if candidate.selection_reason
+                else candidate.terminated_reason.name.lower()
                 if candidate.terminated_reason != TerminationReason.NONE
                 else "boundary"
             )
@@ -1409,15 +1787,20 @@ class SurveyPlanner:
                 if candidate.terminated_reason == TerminationReason.LOW_VALUE
                 else "purple"
             )
-            self.visualizer.draw_line(line, color, 1.5)
             total_points += len(line)
             line_counter += 1
-            suffix = (
-                f"_seg{segment_index:02d}" if len(candidates) > 1 else ""
-            )
+            suffix = f"_seg{segment_index:02d}" if len(candidates) > 1 else ""
             snap_path = lines_dir / f"line_{line_counter:04d}_iter{perp_iter}{suffix}.png"
-            self.visualizer.save_snapshot(snap_path)
+            with self._visualizer_lock:
+                self.visualizer.draw_line(line, color, 1.5)
+                self.visualizer.save_snapshot(snap_path)
             print(f"  >> 已保存测线: {snap_path}")
+            if candidate.selection_reason:
+                print(
+                    f"     落地原因={candidate.selection_reason} | "
+                    f"组收益率={candidate.gain_ratio:.2%} | "
+                    f"位移步={candidate.relocation_step_index}"
+                )
 
         return total_points, line_counter
 
@@ -1428,7 +1811,8 @@ class SurveyPlanner:
             return
         for segment in parent_segments:
             for line in self._iter_valid_point_runs(segment, min_points=2):
-                self.visualizer.draw_light_line(line)
+                with self._visualizer_lock:
+                    self.visualizer.draw_light_line(line)
 
     def _generate_perpendicular_lines(
         self,
@@ -1447,15 +1831,14 @@ class SurveyPlanner:
 
         parent_segments = [np.asarray(main_line, dtype=float)]
         parent_draw_allowed = True
-        consecutive_jump_groups = 0
         perp_iter = 0
         total_points = 0
-        parent_gain_ratio = self.main_line_parent_gain_ratio
 
         direction_name = "正向" if direction == 1 else "反向"
         print(
             f"\n[{direction_name}扩展] 开始从主测线扩展... | "
-            f"初始父收益率={parent_gain_ratio:.2%}"
+            f"目标收益率={self.target_line_gain_ratio:.2%} | "
+            f"低收益位移搜索≤{self.gain_relocation_max_steps}步"
         )
 
         while True:
@@ -1501,65 +1884,32 @@ class SurveyPlanner:
                 )
                 break
 
-            all_gain_ratio, all_new_area, all_hit_area = self._compute_group_gain_ratio(
-                candidates, prior_covered_mask
+            selected_state = self._select_child_group_with_gain_relocation(
+                candidates,
+                logical_parent_segments,
+                valid_points,
+                boundary_rejects,
+                low_value_rejects,
+                direction,
+                target_partition_id,
+                direction_name,
+                prior_covered_mask=prior_covered_mask,
             )
-            if all_hit_area <= 1e-12:
+            if selected_state is None or len(selected_state.candidates) == 0:
                 self._restore_global_metrics_state(transaction_snapshot)
                 print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮候选组全局扫中面积为0，结束规划"
+                    f"[{direction_name}扩展] 第{perp_iter}轮无可落地候选组，结束规划"
                 )
                 break
 
-            retained_candidates, filtered_candidates, gain_threshold = (
-                self._filter_child_candidates_by_segment_gain(
-                    candidates, prior_covered_mask, parent_gain_ratio
-                )
-            )
-            if len(filtered_candidates) > 0:
-                print(
-                    f"[{direction_name}扩展 第{perp_iter}轮] 累计过滤低收益子段"
-                    f"{len(filtered_candidates)}段 | 保留候选{len(retained_candidates)}段 | "
-                    f"父收益率={parent_gain_ratio:.2%} | 阈值={gain_threshold:.2%}"
-                )
-
-            if len(retained_candidates) == 0:
-                print(
-                    f"[{direction_name}扩展 第{perp_iter}轮] 无子段达到累计收益阈值"
-                    f"{gain_threshold:.2%}，候选组仅作为跳板评估"
-                )
-                consecutive_jump_groups += 1
-                self._restore_global_metrics_state(transaction_snapshot)
-                if consecutive_jump_groups > self.max_consecutive_jump_lines:
-                    print(
-                        f"[{direction_name}扩展] 连续第{consecutive_jump_groups}个跳板组仍无子段达标，"
-                        "终止该方向测线生成"
-                    )
-                    break
-
-                parent_segments = self._mark_logical_parent_validity(
-                    logical_parent_segments,
-                    [],
-                ) or [candidate.line.copy() for candidate in candidates]
-                parent_draw_allowed = False
-                print(
-                    f"[{direction_name}扩展] 第{perp_iter}轮作为跳板组继续迭代 | "
-                    f"连续跳板={consecutive_jump_groups}/{self.max_consecutive_jump_lines} | "
-                    f"父收益率保持={parent_gain_ratio:.2%}"
-                )
-                continue
-
-            decision_candidates = retained_candidates
-            gain_ratio, new_area, hit_area = self._compute_group_gain_ratio(
-                decision_candidates, prior_covered_mask
-            )
+            decision_candidates = selected_state.candidates
             print(
-                f"[{direction_name}扩展 第{perp_iter}轮] 保留组累计收益率={gain_ratio:.2%} "
-                f"(新增={new_area:.2f}m² / 扫中={hit_area:.2f}m²) | "
-                "仅用于下一轮父收益率"
+                f"[{direction_name}扩展 第{perp_iter}轮] 选择候选组落地 | "
+                f"原因={selected_state.selection_reason} | 位移步={selected_state.step_index} | "
+                f"收益率={selected_state.gain_ratio:.2%} "
+                f"(新增={selected_state.new_area:.2f}m² / 扫中={selected_state.hit_area:.2f}m²)"
             )
 
-            consecutive_jump_groups = 0
             self._restore_global_metrics_state(transaction_snapshot)
             added_points, line_counter = self._record_retained_child_group(
                 decision_candidates,
@@ -1570,10 +1920,9 @@ class SurveyPlanner:
             )
             total_points += added_points
             parent_segments = self._mark_logical_parent_validity(
-                logical_parent_segments,
+                selected_state.logical_segments,
                 decision_candidates,
             ) or [candidate.line.copy() for candidate in decision_candidates]
-            parent_gain_ratio = gain_ratio if hit_area > 1e-12 else parent_gain_ratio
             parent_draw_allowed = True
 
         print(f"[{direction_name}扩展] 完成 | 共{perp_iter}轮 | 保留{total_points}点")
@@ -1641,13 +1990,14 @@ class SurveyPlanner:
 
         try:
             # 设置画布
-            self.visualizer.setup_figure(partition_id)
-            self.visualizer.draw_seed_point(
-                start_x,
-                start_y,
-                label="Seed point",
-                annotation=f"S{partition_id}",
-            )
+            with self._visualizer_lock:
+                self.visualizer.setup_figure(partition_id)
+                self.visualizer.draw_seed_point(
+                    start_x,
+                    start_y,
+                    label="Seed point",
+                    annotation=f"S{partition_id}",
+                )
 
             line_counter = 0
 
@@ -1671,10 +2021,10 @@ class SurveyPlanner:
                 total_points = 0
             else:
                 line_counter += 1
-                self.visualizer.draw_line(line, "b", 1.5, "Main line")
-
                 snap_path = lines_dir / f"line_{line_counter:04d}_main.png"
-                self.visualizer.save_snapshot(snap_path)
+                with self._visualizer_lock:
+                    self.visualizer.draw_line(line, "b", 1.5, "Main line")
+                    self.visualizer.save_snapshot(snap_path)
                 print(f"  >> 已保存测线: {snap_path}")
 
                 # 正向扩展
@@ -1690,14 +2040,15 @@ class SurveyPlanner:
                 total_points = len(line) + total_points1 + total_points2
 
             # 保存最终图
-            overlay_legend = self.visualizer.draw_fine_grid_overlay(
-                self.metrics_state_grid, show_legend=True, partition_id=partition_id
-            )
             final_path = lines_dir / "plan_line_final.png"
-            handles, labels = self.visualizer.ax.get_legend_handles_labels()
-            self.visualizer.ax.legend(handles=handles + overlay_legend)
-            self.visualizer.save_snapshot(final_path)
-            self.visualizer.close_figure()
+            with self._visualizer_lock:
+                overlay_legend = self.visualizer.draw_fine_grid_overlay(
+                    self.metrics_state_grid, show_legend=True, partition_id=partition_id
+                )
+                handles, labels = self.visualizer.ax.get_legend_handles_labels()
+                self.visualizer.ax.legend(handles=handles + overlay_legend)
+                self.visualizer.save_snapshot(final_path)
+                self.visualizer.close_figure()
 
             # 收集结果
             partition_records = [
@@ -1779,7 +2130,8 @@ class SurveyPlanner:
 
         print(
             f"[单分区规划] 仅规划分区 {target_partition_id} | "
-            f"测线取舍规则={self._describe_child_line_gain_rule()}"
+            f"测线取舍规则={self._describe_child_line_gain_rule()} | "
+            f"并行规划={self._describe_parallel_planning_rule()}"
         )
 
         pid_dir = lines_dir / str(target_partition_id)
@@ -1817,7 +2169,10 @@ class SurveyPlanner:
             for pid in sorted(np.unique(self.cluster_matrix).astype(int))
             if pid >= 0
         ]
-        print(f"[全局规划] 测线取舍规则={self._describe_child_line_gain_rule()}")
+        print(
+            f"[全局规划] 测线取舍规则={self._describe_child_line_gain_rule()} | "
+            f"并行规划={self._describe_parallel_planning_rule()}"
+        )
         partition_ids, mean_depth_by_pid = self._order_partition_ids_by_mean_depth(
             detected_partition_ids
         )
@@ -1840,12 +2195,13 @@ class SurveyPlanner:
         # 合并输出
         flat_all_lines = [line for r in all_results for line in r.lines]
         save_dot_csv(flat_all_lines, lines_dir)
-        self.visualizer.draw_merged_lines(
-            all_results,
-            lines_dir,
-            self.metrics_state_grid,
-            self.partition_start_points,
-        )
+        with self._visualizer_lock:
+            self.visualizer.draw_merged_lines(
+                all_results,
+                lines_dir,
+                self.metrics_state_grid,
+                self.partition_start_points,
+            )
         self.save_metrics_excel(metrics_dir=metrics_dir)
 
         total_lines = sum(len(r.records) for r in all_results)
@@ -2022,7 +2378,7 @@ class SurveyPlanner:
             {"指标": "细网格漏测率-新口径", "值": f"{new_miss_rate:.4%}"},
             {
                 "指标": "新口径统计说明",
-                "值": "全局统计网格记录所有已保留测线对所有分区的贡献；测线取舍使用全局网格收益，测线端点仍受当前分区边界约束；跳板测线不绘制、不统计、不提交覆盖。",
+                "值": "全局统计网格记录所有已保留测线对所有分区的贡献；测线取舍使用80%目标收益率与最多5次细网格步长位移搜索，测线端点仍受当前分区边界约束；低收益无效点仅参与逻辑迭代，不绘制、不统计。",
             },
             {
                 "指标": "跨分区贡献记录数",
